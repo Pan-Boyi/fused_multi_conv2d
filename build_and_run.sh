@@ -68,7 +68,17 @@ grep -q "^int main()" "$HERE/fused_conv2d_int8_golden.h" || {
 # 用真正的 .cpp 入口，不用 `-x c++ header.h`：后者依赖编译器把 .h 当源文件处理，
 # gcc 11 和 gcc 13 的行为并不一致，不一致时就报上面那句 undefined reference to `main'。
 g++ -std=c++17 -O2 "$HERE/golden_selfcheck.cpp" -o "$HERE/golden_selfcheck" -I"$HERE"
+# 显式接住退出码。直接 `prog | sed` 在 set -e + pipefail 下会让脚本静默退出，
+# 你只会看到 golden 的输出然后什么都没有。
+set +e
 "$HERE/golden_selfcheck" | sed 's/^/    /'
+GRC=${PIPESTATUS[0]}
+set -e
+if [ "$GRC" != 0 ]; then
+    echo "    golden 自检返回 $GRC（SELF-CHECK: FAIL 或 layout round-trip 失败）"
+    echo "    先解决它 —— golden 不可信的话，后面比对出来的任何结论都没有意义。"
+    exit 1
+fi
 
 # ---- 4) 编译验证程序 ------------------------------------------------------
 echo "[4] 编译验证程序："

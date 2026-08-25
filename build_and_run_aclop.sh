@@ -41,17 +41,32 @@ grep -q "^int main()" "$HERE/fused_conv2d_int8_golden.h" || {
 # 用真正的 .cpp 入口，不用 `-x c++ header.h`：后者依赖编译器把 .h 当源文件处理，
 # gcc 11 和 gcc 13 的行为并不一致，不一致时就报上面那句 undefined reference to `main'。
 g++ -std=c++17 -O2 "$HERE/golden_selfcheck.cpp" -o "$HERE/golden_selfcheck" -I"$HERE"
+# 显式接住退出码。直接 `prog | sed` 在 set -e + pipefail 下会让脚本静默退出，
+# 你只会看到 golden 的输出然后什么都没有。
+set +e
 "$HERE/golden_selfcheck" | sed 's/^/    /'
+GRC=${PIPESTATUS[0]}
+set -e
+if [ "$GRC" != 0 ]; then
+    echo "    golden 自检返回 $GRC（SELF-CHECK: FAIL 或 layout round-trip 失败）"
+    echo "    先解决它 —— golden 不可信的话，后面比对出来的任何结论都没有意义。"
+    exit 1
+fi
 
 # ---- 3) 编译 --------------------------------------------------------------
 # libascendcl 会拉进 libascend_dump.so，后者依赖**驱动**库 libascend_hal.so。
 # 有卡的机器上它在 /usr/local/Ascend/driver/lib64 下，把这些目录喂给 -rpath-link，
 # 否则链接会报一堆 "undefined reference to drvXxx / halXxx" —— 那不是代码问题。
+# 注意这里要用 if，不能写成 `[ -d "$d" ] && DRVFLAGS+=(...)`：
+# 在 set -e 下，最后一次循环如果目录不存在，整个 for 的退出码就是 1，
+# 脚本会**一声不吭地退出** —— 上一版就栽在这儿。
 DRVFLAGS=()
 for d in /usr/local/Ascend/driver/lib64 \
          /usr/local/Ascend/driver/lib64/driver \
          /usr/local/Ascend/driver/lib64/common; do
-    [ -d "$d" ] && DRVFLAGS+=(-L"$d" -Wl,-rpath-link,"$d" -Wl,-rpath,"$d")
+    if [ -d "$d" ]; then
+        DRVFLAGS+=(-L"$d" -Wl,-rpath-link,"$d" -Wl,-rpath,"$d")
+    fi
 done
 echo "[3] 编译（驱动库目录: ${DRVFLAGS[*]:-<无，机器上没装驱动？>}）："
 g++ -std=c++17 -O2 "$HERE/test_aclop_fused_conv2d.cpp" -o "$HERE/test_aclop_fused_conv2d" \
