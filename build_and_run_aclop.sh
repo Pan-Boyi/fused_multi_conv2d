@@ -31,8 +31,16 @@ fi
 
 # ---- 2) golden 自检（纯 host，不碰设备）-----------------------------------
 echo "[2] golden 自检："
-g++ -std=c++17 -O2 -DFUSED_CONV2D_GOLDEN_MAIN -DFUSED_CONV2D_GOLDEN_INT8_OUT=1 \
-    -x c++ "$HERE/fused_conv2d_int8_golden.h" -o "$HERE/golden_selfcheck"
+# 先做个完整性检查：header 少了尾巴(比如传输被截断)会表现成一句和 golden
+# 毫无关系的 "undefined reference to `main'"。
+GLINES=$(grep -c "" "$HERE/fused_conv2d_int8_golden.h")
+grep -q "^int main()" "$HERE/fused_conv2d_int8_golden.h" || {
+    echo "    FAIL: fused_conv2d_int8_golden.h 只有 $GLINES 行且没有 main() —— 文件不完整，重新拿一份"
+    exit 1
+}
+# 用真正的 .cpp 入口，不用 `-x c++ header.h`：后者依赖编译器把 .h 当源文件处理，
+# gcc 11 和 gcc 13 的行为并不一致，不一致时就报上面那句 undefined reference to `main'。
+g++ -std=c++17 -O2 "$HERE/golden_selfcheck.cpp" -o "$HERE/golden_selfcheck" -I"$HERE"
 "$HERE/golden_selfcheck" | sed 's/^/    /'
 
 # ---- 3) 编译 --------------------------------------------------------------
