@@ -12,8 +12,12 @@
 gen_case 生成的 .bin。所以这台机器只要有 python3 + CANN 就够了，不需要 g++、
 不需要 aclnn 头、不需要 numpy。
 
-    python3 run_fused_conv2d.py [case.bin] [op_type] [device_id]
-    默认  fused_conv2d_case.bin  FusedConv2d  0
+    python3 run_fused_conv2d.py [case.bin] [op_type] [device_id] [om_dir]
+    默认  fused_conv2d_case.bin  FusedConv2d  0  (无 om_dir)
+
+设备上没装带 FusedConv2d 的算子包时，传第 4 个参数 om_dir：那是在有算子包的机器上
+用 build_om.sh 编出来的单算子离线模型目录。脚本会先 aclopSetModelDir(om_dir)，
+运行时就从那里找算子，不再要求本机的算子信息库里有它。
 
 判据和 C++ 版完全一致，输出行可以逐字对比。
 """
@@ -121,6 +125,7 @@ def load_acl():
         ("aclDestroyTensorDesc", [c_vp], None),
         ("aclCreateDataBuffer", [c_vp, c_sz], c_vp),
         ("aclDestroyDataBuffer", [c_vp], c_i),
+        ("aclopSetModelDir", [c_cp], c_i),
         ("aclopCreateAttr", [], c_vp),
         ("aclopDestroyAttr", [c_vp], None),
         ("aclopExecuteV2", [c_cp, c_i, ctypes.POINTER(c_vp), ctypes.POINTER(c_vp),
@@ -172,9 +177,19 @@ def main():
     case_path = sys.argv[1] if len(sys.argv) > 1 else "fused_conv2d_case.bin"
     op_type = sys.argv[2] if len(sys.argv) > 2 else "FusedConv2d"
     device_id = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+    om_dir = sys.argv[4] if len(sys.argv) > 4 else None
 
     print('FusedConv2d @ 5102 单算子验证 —— ctypes + aclopExecuteV2（目标机不需要编译器）')
-    print('  case = "%s"   opType = "%s"   device = %d\n' % (case_path, op_type, device_id))
+    print('  case = "%s"   opType = "%s"   device = %d' % (case_path, op_type, device_id))
+    print('  om_dir = %s\n' % (om_dir if om_dir else "(不用离线模型，走本机算子信息库)"))
+
+    if om_dir is not None:
+        if not os.path.isdir(om_dir):
+            die("om_dir %s 不是目录" % om_dir)
+        oms = [f for f in os.listdir(om_dir) if f.endswith(".om")]
+        if not oms:
+            die("%s 下没有 .om —— 在有算子包的机器上跑 build_om.sh 生成，整个目录拷过来" % om_dir)
+        print("  离线模型: %s" % ", ".join(sorted(oms)))
 
     tensors, gold_nonzero, ties, sat, y_elems = load_case(case_path)
     want = tensors["y_expect"][2]
@@ -195,6 +210,11 @@ def main():
             die(msg % ret if "%d" in msg else "%s (ret=%d)" % (msg, ret))
 
     check(acl.aclInit(None), "aclInit = %d")
+    if om_dir is not None:
+        # 必须在 aclrtSetDevice 之前/之后都可以，但要在 aclopExecuteV2 之前。
+        check(acl.aclopSetModelDir(os.path.abspath(om_dir).encode()),
+              "aclopSetModelDir(%s) = " % om_dir + "%d")
+        print("  aclopSetModelDir OK")
     check(acl.aclrtSetDevice(device_id), "aclrtSetDevice(" + str(device_id) + ") = %d —— 芯片被占？")
     stream = ctypes.c_void_p()
     check(acl.aclrtCreateStream(ctypes.byref(stream)), "aclrtCreateStream = %d")
@@ -242,8 +262,10 @@ def main():
     ret = acl.aclopExecuteV2(op_type.encode(), 7, in_desc, in_buf, 1, out_desc, out_buf, attr, stream)
     if ret != ACL_SUCCESS:
         die('aclopExecuteV2("%s") = %d\n'
-            "        算子没找到 -> 类型名拼错，或者包里根本没这个 op\n"
+            "        算子没找到(161001) -> 本机的算子信息库里没有它，或者类型名拼错\n"
             "                      查: grep -ri '\"%s\"' $ASCEND_OPP_PATH/built-in/op_impl/ai_core/tbe/config/\n"
+            "                      这台机器没装带 FusedConv2d 的算子包的话，先在有包的机器上\n"
+            "                      跑 build_om.sh 编出 .om，把目录拷过来当第 4 个参数传进来\n"
             "        找到但选不出 kernel -> shape/dtype 和 binary.json 里登记的组合对不上"
             % (op_type, ret, op_type))
     check(acl.aclrtSynchronizeStream(stream),
