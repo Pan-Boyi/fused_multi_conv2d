@@ -13,6 +13,12 @@
 
 OPTYPE="${1:-FusedConv2d}"
 DEV="${2:-0}"
+
+# 交叉编译用（在 x86 开发机上编、拿到 aarch64 板子上跑）：
+#   CXX=aarch64-linux-gnu-g++ CANN_ARCH=aarch64 ./build_and_run_aclop.sh
+# 不设就是本机编本机跑。
+CXX="${CXX:-g++}"
+CANN_ARCH="${CANN_ARCH:-$(uname -m)}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 [ -n "$HERE" ] || HERE="$PWD"
 
@@ -23,13 +29,18 @@ step() { echo; echo "==== $* ===="; }
 step "0) 环境"
 [ -n "$ASCEND_HOME_PATH" ] || die "ASCEND_HOME_PATH 没设。先 source <CANN安装路径>/set_env.sh"
 ARCH="$ASCEND_HOME_PATH"
-[ -d "$ARCH/include" ] || ARCH="$ASCEND_HOME_PATH/$(uname -m)-linux"
+[ -d "$ARCH/include" ] || ARCH="$ASCEND_HOME_PATH/$CANN_ARCH-linux"
 [ -d "$ARCH/include" ] || die "在 $ASCEND_HOME_PATH 下找不到 include/，ASCEND_HOME_PATH 指错了？"
 OPP="${ASCEND_OPP_PATH:-$ARCH/opp}"
 echo "  脚本目录 HERE = $HERE"
 echo "  ARCH          = $ARCH"
 echo "  OPP           = $OPP"
-echo "  g++           = $(g++ --version 2>/dev/null | head -1)"
+echo "  本机 uname -m  = $(uname -m)"
+echo "  目标 CANN_ARCH = $CANN_ARCH"
+echo "  CXX           = $CXX  ($($CXX --version 2>/dev/null | head -1))"
+if ! command -v "$CXX" >/dev/null 2>&1; then
+    die "找不到编译器 $CXX"
+fi
 
 # ---------------------------------------------------------------- 1) 文件齐不齐
 step "1) 检查所需文件"
@@ -66,8 +77,10 @@ fi
 
 # ---------------------------------------------------------------- 3) golden 自检
 step "3) golden 自检（纯 host，不碰设备）"
+# 这一步固定用**本机** g++：它只是在开发机上验证 golden 自己算得对，
+# 和目标板子的架构无关，别跟着 CXX 走。
 rm -f "$HERE/golden_selfcheck"
-g++ -std=c++17 -O2 "$HERE/golden_selfcheck.cpp" -o "$HERE/golden_selfcheck" -I"$HERE"
+g++ -std=c++17 -O2 -ffp-contract=off "$HERE/golden_selfcheck.cpp" -o "$HERE/golden_selfcheck" -I"$HERE"
 [ $? -eq 0 ] || die "golden 自检编译失败（上面是编译器的话）"
 [ -x "$HERE/golden_selfcheck" ] || die "编译报告成功但没产出可执行文件？"
 
@@ -81,6 +94,9 @@ echo "  golden 自检通过"
 
 # ---------------------------------------------------------------- 4) 编译
 step "4) 编译验证程序"
+# -ffp-contract=off: aarch64 上 gcc 默认允许把 a*b+c 融成 fmadd,结果和分开算不一样。
+# golden 里目前没有可融的表达式(唯一的浮点乘是 (float)acc*scale,后面没有加法),
+# 所以这只是把"换个架构 golden 会不会变"这个疑问彻底钉死,不改变 x86 上的行为。
 # libascendcl 会拉进 libascend_dump.so，后者依赖**驱动**库 libascend_hal.so。
 # 有卡的机器上它在 /usr/local/Ascend/driver/lib64 下。少了这个路径，链接会吐一堆
 # "undefined reference to drvXxx / halXxx" —— 那不是代码问题。
@@ -97,15 +113,37 @@ done
 [ ${#DRVFLAGS[@]} -gt 0 ] || echo "  (没找到 /usr/local/Ascend/driver/lib64，如果链接报 drvXxx 未定义就是缺它)"
 
 rm -f "$HERE/test_aclop_fused_conv2d"
-g++ -std=c++17 -O2 "$HERE/test_aclop_fused_conv2d.cpp" -o "$HERE/test_aclop_fused_conv2d" \
+"$CXX" -std=c++17 -O2 -ffp-contract=off "$HERE/test_aclop_fused_conv2d.cpp" -o "$HERE/test_aclop_fused_conv2d" \
     -I"$HERE" -I"$ARCH/include" \
     -L"$ARCH/lib64" "${DRVFLAGS[@]}" -lascendcl \
     -Wl,-rpath,"$ARCH/lib64"
 [ $? -eq 0 ] || die "编译/链接失败（上面是编译器的话）"
 echo "  built $HERE/test_aclop_fused_conv2d"
 
+# 产物到底是给哪个架构的？这一条能挡掉"编译过了，一跑 Exec format error"。
+BINMACH=$(readelf -h "$HERE/test_aclop_fused_conv2d" 2>/dev/null | sed -n 's/^ *Machine: *//p')
+BINSIZE=$(wc -c < "$HERE/test_aclop_fused_conv2d" 2>/dev/null)
+echo "  ELF Machine   = ${BINMACH:-<readelf 不可用>}   size = ${BINSIZE:-?} 字节"
+case "$(uname -m)" in
+    x86_64)  HOSTMACH="X86-64" ;;
+    aarch64) HOSTMACH="AArch64" ;;
+    *)       HOSTMACH="" ;;
+esac
+RUNNABLE_HERE=1
+if [ -n "$BINMACH" ] && [ -n "$HOSTMACH" ] && ! echo "$BINMACH" | grep -qi "$HOSTMACH"; then
+    RUNNABLE_HERE=0
+    echo
+    echo "  [!] 这个可执行文件不是给本机（$(uname -m)）的，本机跑会报"
+    echo "      \"cannot execute binary file: Exec format error\"。"
+    echo "      把**源码**（4 个文件）拷到目标机器上，在目标机器上重跑本脚本；"
+    echo "      拷可执行文件是没用的。"
+fi
+
 # ---------------------------------------------------------------- 5) 跑
 step "5) 真机运行  opType=$OPTYPE  device=$DEV"
+if [ "$RUNNABLE_HERE" = 0 ]; then
+    die "产物架构和本机不一致，跳过运行（原因见上一步）。"
+fi
 timeout 300 "$HERE/test_aclop_fused_conv2d" "$OPTYPE" "$DEV"
 RC=$?
 echo
