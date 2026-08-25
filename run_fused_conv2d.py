@@ -15,6 +15,11 @@ gen_case 生成的 .bin。所以这台机器只要有 python3 + CANN 就够了�
     python3 run_fused_conv2d.py [case.bin] [op_type] [device_id] [om_dir]
     默认  fused_conv2d_case.bin  FusedConv2d  0  (无 om_dir)
 
+环境变量：
+    REL_TOL=1e-3     相对误差判据（默认 1e-3）
+    RATIO_MIN=1.0    达标比例的下限，低于它算 FAIL（默认 1.0，即要求 100%）
+    REPEAT=0         正确性比对之后再下发多少次，用于性能测量（默认 0，不测）
+
 设备上没装带 FusedConv2d 的算子包时，传第 4 个参数 om_dir：那是在有算子包的机器上
 用 build_om.sh 编出来的单算子离线模型目录。脚本会先 aclopSetModelDir(om_dir)，
 运行时就从那里找算子，不再要求本机的算子信息库里有它。
@@ -26,6 +31,7 @@ import ctypes
 import os
 import struct
 import sys
+import time
 
 # ---------------------------------------------------------------- ACL 常量
 ACL_SUCCESS = 0
@@ -147,29 +153,78 @@ def as_i8(b):
     return b - 256 if b > 127 else b
 
 
-def compare(got, want):
-    """返回 (nonzero, unwritten, mismatches, first_bad, off_by_one)。
+def evaluate(got, want, rel_tol):
+    """一趟扫完所有判据。返回 dict。
 
-    三个判据各挡一类失败，缺一不可：
+    三个"写没写对"的判据，各挡一类失败，缺一不可：
       unwritten  kernel 一个字节都没写（哨兵 127 还在）
       nonzero    kernel 只写了一部分（前一半对、后一半空白）
       mismatches 数值错
+
+    外加精度判据：逐元素相对误差 <= rel_tol 的比例。
+      golden 非 0: |got-want| / |want|
+      golden 为 0: 退化成绝对误差 |got-want|（int8 下即要求 got 也为 0）
     """
-    nonzero = len(got) - got.count(0)
+    n = len(got)
+    buckets = ["=0", "(0,1e-3]", "(1e-3,1e-2]", "(1e-2,1e-1]", "(1e-1,1]", ">1", "inf(golden=0)"]
+    r = {
+        "n": n,
+        "nonzero": n - got.count(0),
+        "unwritten": 0,
+        "mismatches": 0,
+        "first_bad": -1,
+        "off_by_one": 0,
+        "prec_ok": n,
+        "max_rel": 0.0,
+        "max_rel_idx": -1,
+        "zero_golden": 0,
+        "hist": dict.fromkeys(buckets, 0),
+    }
     if got == want:
-        return nonzero, 0, 0, -1, 0
-    unwritten = mismatches = off_by_one = 0
-    first_bad = -1
-    for i, (g, w) in enumerate(zip(got, want)):
-        if g == Y_SENTINEL and w != Y_SENTINEL:
-            unwritten += 1
-        if g != w:
-            if first_bad < 0:
-                first_bad = i
-            mismatches += 1
-            if abs(as_i8(g) - as_i8(w)) == 1:
-                off_by_one += 1
-    return nonzero, unwritten, mismatches, first_bad, off_by_one
+        # 完全一致：不用逐元素算，相对误差全是 0
+        r["hist"]["=0"] = n
+        r["zero_golden"] = want.count(0)
+        return r
+
+    zero_golden = 0
+    prec_ok = 0
+    for i, (g8, w8) in enumerate(zip(got, want)):
+        g, w = as_i8(g8), as_i8(w8)
+        if g8 == Y_SENTINEL and w8 != Y_SENTINEL:
+            r["unwritten"] += 1
+        if g8 != w8:
+            if r["first_bad"] < 0:
+                r["first_bad"] = i
+            r["mismatches"] += 1
+            if abs(g - w) == 1:
+                r["off_by_one"] += 1
+        if w == 0:
+            zero_golden += 1
+            err = 0.0 if g == 0 else float("inf")
+        else:
+            err = abs(g - w) / float(abs(w))
+        if err <= rel_tol:
+            prec_ok += 1
+        if err > r["max_rel"]:
+            r["max_rel"] = err
+            r["max_rel_idx"] = i
+        if err == 0.0:
+            r["hist"]["=0"] += 1
+        elif err == float("inf"):
+            r["hist"]["inf(golden=0)"] += 1
+        elif err <= 1e-3:
+            r["hist"]["(0,1e-3]"] += 1
+        elif err <= 1e-2:
+            r["hist"]["(1e-3,1e-2]"] += 1
+        elif err <= 1e-1:
+            r["hist"]["(1e-2,1e-1]"] += 1
+        elif err <= 1.0:
+            r["hist"]["(1e-1,1]"] += 1
+        else:
+            r["hist"][">1"] += 1
+    r["prec_ok"] = prec_ok
+    r["zero_golden"] = zero_golden
+    return r
 
 
 # ---------------------------------------------------------------- main
@@ -179,9 +234,29 @@ def main():
     device_id = int(sys.argv[3]) if len(sys.argv) > 3 else 0
     om_dir = sys.argv[4] if len(sys.argv) > 4 else None
 
+    def env_num(name, default, cast):
+        v = os.environ.get(name)
+        if v is None or v == "":
+            return default
+        try:
+            return cast(v)
+        except ValueError:
+            die("环境变量 %s=%r 不是合法数字" % (name, v))
+
+    rel_tol = env_num("REL_TOL", 1e-3, float)
+    ratio_min = env_num("RATIO_MIN", 1.0, float)
+    repeat = env_num("REPEAT", 0, int)
+    if rel_tol < 0:
+        die("REL_TOL 不能为负")
+    if not (0.0 <= ratio_min <= 1.0):
+        die("RATIO_MIN 要在 [0,1] 之间，传的是 %g" % ratio_min)
+    if repeat < 0:
+        die("REPEAT 不能为负")
+
     print('FusedConv2d @ 5102 单算子验证 —— ctypes + aclopExecuteV2（目标机不需要编译器）')
     print('  case = "%s"   opType = "%s"   device = %d' % (case_path, op_type, device_id))
-    print('  om_dir = %s\n' % (om_dir if om_dir else "(不用离线模型，走本机算子信息库)"))
+    print('  om_dir = %s' % (om_dir if om_dir else "(不用离线模型，走本机算子信息库)"))
+    print('  REL_TOL = %g   RATIO_MIN = %g   REPEAT = %d\n' % (rel_tol, ratio_min, repeat))
 
     if om_dir is not None:
         if not os.path.isdir(om_dir):
@@ -259,7 +334,11 @@ def main():
     # 本算子没有属性。传空 attr 而不是 null：有些版本按 attr 指针参与 kernel 选择的哈希。
     attr = acl.aclopCreateAttr()
 
-    ret = acl.aclopExecuteV2(op_type.encode(), 7, in_desc, in_buf, 1, out_desc, out_buf, attr, stream)
+    def launch():
+        return acl.aclopExecuteV2(op_type.encode(), 7, in_desc, in_buf,
+                                  1, out_desc, out_buf, attr, stream)
+
+    ret = launch()
     if ret != ACL_SUCCESS:
         die('aclopExecuteV2("%s") = %d\n'
             "        算子没找到(161001) -> 本机的算子信息库里没有它，或者类型名拼错\n"
@@ -277,16 +356,62 @@ def main():
     got = out.raw[:y_elems]
 
     # ------------------------------------------------------------ 比对
-    nonzero, unwritten, mismatches, first_bad, off_by_one = compare(got, want)
+    r = evaluate(got, want, rel_tol)
+    nonzero, unwritten, mismatches = r["nonzero"], r["unwritten"], r["mismatches"]
+    ratio = r["prec_ok"] / float(r["n"])
 
     print("\n[fused-conv2d-5102-device] out_elems=%d nonzero=%d golden_nonzero=%d "
           "unwritten=%d mismatches=%d" % (y_elems, nonzero, gold_nonzero, unwritten, mismatches))
 
+    cout2 = y_dims[1]
     if mismatches:
-        cout2 = y_dims[1]
+        fb = r["first_bad"]
         print("first mismatch @ %d: got %d, want %d (row %d, cout %d)；差 ±1 的 %d / 共 %d"
-              % (first_bad, as_i8(got[first_bad]), as_i8(want[first_bad]),
-                 first_bad // cout2, first_bad % cout2, off_by_one, mismatches))
+              % (fb, as_i8(got[fb]), as_i8(want[fb]), fb // cout2, fb % cout2,
+                 r["off_by_one"], mismatches))
+
+    # ------------------------------------------------------------ 精度
+    print("\n[精度] 相对误差 <= %g 的比例: %d / %d = %.6f%%   (下限 %.6f%%)"
+          % (rel_tol, r["prec_ok"], r["n"], ratio * 100.0, ratio_min * 100.0))
+    mr = r["max_rel"]
+    if r["max_rel_idx"] >= 0:
+        mi = r["max_rel_idx"]
+        print("       最大相对误差 %s @ %d (row %d, cout %d): got %d, want %d"
+              % ("inf" if mr == float("inf") else "%.6e" % mr, mi, mi // cout2, mi % cout2,
+                 as_i8(got[mi]), as_i8(want[mi])))
+    else:
+        print("       最大相对误差 0")
+    print("       golden 为 0 的 %d 个元素按绝对误差判" % r["zero_golden"])
+    print("       相对误差分布:")
+    for k in ["=0", "(0,1e-3]", "(1e-3,1e-2]", "(1e-2,1e-1]", "(1e-1,1]", ">1", "inf(golden=0)"]:
+        v = r["hist"][k]
+        if v:
+            print("         %-14s %9d  (%.6f%%)" % (k, v, v * 100.0 / r["n"]))
+    # 这个提醒值得常驻：int8 输出下 |golden| <= 100，最小的非零差值是 1，
+    # 所以任何一个 LSB 的偏差相对误差都 >= 1/100 = 1e-2，早就越过 1e-3 了。
+    # 也就是说在这个算子上，1e-3 的相对误差判据**等价于逐位相等**，
+    # 达标比例只会是 100% 或者恰好等于逐位相等的比例。
+    print("       注: 输出是 int8 且 |golden| <= 100，最小非零差值 1 对应相对误差 >= 1e-2，")
+    print("           所以 %g 的判据在这里等价于逐位相等。" % rel_tol)
+
+    # ------------------------------------------------------------ 性能
+    if repeat > 0:
+        print("\n[性能] 再下发 %d 次（host 侧计时，含下发开销；设备侧以 msprof 为准）" % repeat)
+        durs = []
+        for i in range(repeat):
+            t0 = time.perf_counter()
+            rc = launch()
+            if rc != ACL_SUCCESS:
+                die("性能循环第 %d 次 aclopExecuteV2 = %d" % (i, rc))
+            rc = acl.aclrtSynchronizeStream(stream)
+            if rc != ACL_SUCCESS:
+                die("性能循环第 %d 次 aclrtSynchronizeStream = %d" % (i, rc))
+            durs.append((time.perf_counter() - t0) * 1e6)
+        durs_sorted = sorted(durs)
+        print("       n=%d  min=%.3f us  p50=%.3f us  max=%.3f us  first=%.3f us"
+              % (len(durs), durs_sorted[0], durs_sorted[len(durs_sorted) // 2],
+                 durs_sorted[-1], durs[0]))
+        print("       这是 host 侧的墙钟，包含下发和同步；真正的 kernel 时间用 ./run_prof.sh 拿。")
 
     acl.aclopDestroyAttr(attr)
     for i in range(8):
@@ -297,18 +422,25 @@ def main():
     acl.aclrtResetDevice(device_id)
     acl.aclFinalize()
 
+    print()
     if unwritten:
         print("[FAIL] %d 个输出从来没被写过 —— kernel 没跑，或只跑了一部分核" % unwritten)
         return 1
     if nonzero != gold_nonzero:
         print("[FAIL] 非零个数 %d != golden 的 %d —— 写的分布不对" % (nonzero, gold_nonzero))
         return 1
-    if mismatches:
-        print("[FAIL] %d 个元素数值不一致" % mismatches)
+    if ratio < ratio_min:
+        print("[FAIL] 达标比例 %.6f%% < 下限 %.6f%%（%d 个元素超出相对误差 %g）"
+              % (ratio * 100.0, ratio_min * 100.0, r["n"] - r["prec_ok"], rel_tol))
         return 1
-    print("[PASS] %d 个输出全部写过，且与 CPU golden 逐位相等" % y_elems)
+    if mismatches:
+        # 比例过了但仍有不一致：说明 RATIO_MIN 被放宽过。不当失败，但要说清楚。
+        print("[PASS*] 达标比例 %.6f%% 满足下限，但仍有 %d 个元素与 golden 不逐位相等"
+              % (ratio * 100.0, mismatches))
+        return 0
+    print("[PASS] %d 个输出全部写过，与 CPU golden 逐位相等，相对误差达标比例 %.6f%%"
+          % (y_elems, ratio * 100.0))
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
