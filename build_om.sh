@@ -32,66 +32,86 @@ echo "  OPP  = $OPP"
 [ -f "$JSON" ] || die "缺 $JSON"
 
 # ---------------------------------------------------------------------------
-# ld.lld 必须是**昇腾自带的那份**。
+# ld.lld 必须是**认识 aicorelinux 的那份**。
 #
-# 编 AI Core kernel 的最后一步是 `ld.lld -m aicorelinux`，aicorelinux 这个 emulation
-# 只有 CANN 里 ccec_compiler/bishengir 带的那份 lld 认识。PATH 上要是先撞见系统的
-# /usr/bin/ld.lld、或者 conda 环境里 llvm 带的那个，就会报
+# 编 AI Core kernel 的最后一步是 `ld.lld -m aicorelinux`。这个 emulation 只有毕昇
+# 编译器带的那份 lld 认识；系统的 /usr/bin/ld.lld、conda 里 llvm 带的、乃至 CANN
+# 自己 tools/llvm/ 下那份通用 lld，都不认，撞上就是
 #     ld.lld: error: unknown emulation: aicorelinux
-# 这不是算子的问题，是 PATH 顺序的问题。
+#
+# 各版本的目录布局不一样（ccec_compiler / bisheng_compiler / tools/llvm / <arch>-linux/bin
+# 都见过），而且 ld.lld 通常是**符号链接**。所以这里不按目录名猜，直接把找得到的每一个
+# 都探一遍：喂一个空输入让它走到 emulation 解析那一步，看它抱怨的是不是 aicorelinux。
 # ---------------------------------------------------------------------------
-step "0.5) ld.lld 是不是昇腾那份"
-ASC_LLD=""
-for d in "$ASCEND_HOME_PATH/compiler/ccec_compiler/bin" \
-         "$ASCEND_HOME_PATH/compiler/bishengir/bin" \
-         "$ASCEND_HOME_PATH/toolkit/toolchain/hcc/bin"; do
-    if [ -x "$d/ld.lld" ]; then
-        ASC_LLD="$d/ld.lld"
-        echo "  昇腾的: $ASC_LLD"
-        break
-    fi
-done
-if [ -z "$ASC_LLD" ]; then
-    ASC_LLD=$(find "$ASCEND_HOME_PATH" -maxdepth 6 -type f -name ld.lld -perm -u+x 2>/dev/null | head -1)
-    [ -n "$ASC_LLD" ] && echo "  昇腾的: $ASC_LLD  (在非标准位置找到)"
-fi
-[ -n "$ASC_LLD" ] || die "在 $ASCEND_HOME_PATH 下一个 ld.lld 都找不到。
-    CANN 的编译器组件(ccec_compiler / bishengir)没装全，或者 ASCEND_HOME_PATH 指错了。"
+step "0.5) 哪个 ld.lld 认识 aicorelinux"
 
-# 手动走一遍 PATH。`type -a` 在不同 shell 下行为不一致，这样最稳，
-# 而且能把"谁排在谁前面"直接摆出来 —— 这正是要看的东西。
-echo "  PATH 上的 ld.lld（按先后顺序）:"
-NFOUND=0
+# 返回 0 = 认识；1 = 不认识；2 = 这个二进制根本跑不起来
+probe_lld() {
+    _tmp=$(mktemp 2>/dev/null) || _tmp="/tmp/.lldprobe.$$"
+    _out=$("$1" -m aicorelinux /dev/null -o "$_tmp" 2>&1)
+    _rc=$?
+    rm -f "$_tmp"
+    case "$_out" in
+        *"error while loading shared libraries"*|*"cannot open shared object"*) return 2 ;;
+    esac
+    if [ "$_rc" -eq 126 ] || [ "$_rc" -eq 127 ]; then
+        return 2
+    fi
+    case "$_out" in
+        *"nknown emulation"*|*"nsupported emulation"*|*"nvalid emulation"*) return 1 ;;
+    esac
+    return 0
+}
+
+# 候选：ASCEND_HOME_PATH 下所有的 ld.lld（不加 -type f，它们多半是符号链接）+ PATH 上的
+CANDS=$(find "$ASCEND_HOME_PATH" -maxdepth 7 -name ld.lld 2>/dev/null)
 OLDIFS="$IFS"; IFS=:
 for d in $PATH; do
     [ -n "$d" ] || d="."
-    if [ -x "$d/ld.lld" ]; then
-        NFOUND=$((NFOUND + 1))
-        if [ "$d/ld.lld" = "$ASC_LLD" ]; then
-            echo "    $NFOUND. $d/ld.lld   <- 昇腾的"
-        else
-            echo "    $NFOUND. $d/ld.lld"
-        fi
-    fi
+    [ -x "$d/ld.lld" ] && CANDS="$CANDS
+$d/ld.lld"
 done
 IFS="$OLDIFS"
-[ "$NFOUND" -gt 0 ] || echo "    (PATH 上一个都没有)"
 
+[ -n "$CANDS" ] || die "$ASCEND_HOME_PATH 下和 PATH 上都找不到 ld.lld。
+    CANN 的编译器组件没装全，或者 ASCEND_HOME_PATH 指错了。"
+
+GOOD_LLD=""
+SEEN=""
+# 注意：用 for 而不是 `... | while read`，管道会开子 shell，GOOD_LLD 出不来。
+# 代价是路径里不能有空格 —— CANN 的安装路径不会有。
+for f in $(echo "$CANDS" | sed '/^$/d' | sort -u); do
+    [ -x "$f" ] || { printf '  %-58s %s\n' "$f" "(不可执行，跳过)"; continue; }
+    real=$(readlink -f "$f" 2>/dev/null || echo "$f")
+    case " $SEEN " in *" $real "*) dup=" (同 $real)" ;; *) dup=""; SEEN="$SEEN $real" ;; esac
+    probe_lld "$f"
+    case $? in
+        0) printf '  %-58s [认识 aicorelinux]%s\n' "$f" "$dup"
+           [ -n "$GOOD_LLD" ] || GOOD_LLD="$f" ;;
+        1) printf '  %-58s  不认识%s\n' "$f" "$dup" ;;
+        2) printf '  %-58s  跑不起来（缺依赖库）%s\n' "$f" "$dup" ;;
+    esac
+done
+
+[ -n "$GOOD_LLD" ] || die "找到的 ld.lld 没有一个认识 aicorelinux。
+    毕昇编译器组件(bisheng_compiler / ccec_compiler)没装，或者装的版本不对。
+    上面列出的路径可以贴给我。"
+
+GOOD_BIN=$(dirname "$GOOD_LLD")
 CUR_LLD=$(command -v ld.lld 2>/dev/null)
-ASC_BIN=$(dirname "$ASC_LLD")
-if [ "$CUR_LLD" != "$ASC_LLD" ]; then
-    echo
-    echo "  [!] PATH 上第一个 ld.lld 是 ${CUR_LLD:-<没有>}，不是昇腾那份。"
-    echo "      这正是 \"unknown emulation: aicorelinux\" 的原因。已在本次运行内把"
-    echo "      $ASC_BIN 提到 PATH 最前面。"
-    echo "      要永久生效，在 source set_env.sh **之后**（注意顺序，conda activate"
-    echo "      之类会重新往前插路径）加上："
-    echo "          export PATH=\$ASCEND_HOME_PATH/$(echo "$ASC_BIN" | sed "s|^$ASCEND_HOME_PATH/||"):\$PATH"
-    PATH="$ASC_BIN:$PATH"
+echo
+echo "  PATH 上第一个 ld.lld: ${CUR_LLD:-<没有>}"
+if [ "$CUR_LLD" = "$GOOD_LLD" ]; then
+    echo "  OK，正是认识 aicorelinux 的那个"
+else
+    echo "  [!] 不是认识 aicorelinux 的那个 —— 这就是报错的原因。"
+    echo "      已在本次运行内把 $GOOD_BIN 提到 PATH 最前面。"
+    echo "      要永久生效，在 source set_env.sh **之后**（conda activate / module load"
+    echo "      之类会重新往前插路径，所以顺序很重要）加上："
+    echo "          export PATH=$GOOD_BIN:\$PATH"
+    PATH="$GOOD_BIN:$PATH"
     export PATH
     echo "      现在: $(command -v ld.lld)"
-else
-    echo "  OK，PATH 上第一个就是它"
 fi
 
 step "1) 这台机器的包里到底有没有 FusedConv2d"
