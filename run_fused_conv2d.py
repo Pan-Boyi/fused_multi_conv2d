@@ -12,8 +12,12 @@
 gen_case 生成的 .bin。所以这台机器只要有 python3 + CANN 就够了，不需要 g++、
 不需要 aclnn 头、不需要 numpy。
 
-    python3 run_fused_conv2d.py [case.bin] [op_type] [device_id] [om_dir]
-    默认  fused_conv2d_case.bin  FusedConv2d  0  (无 om_dir)
+    python3 run_fused_conv2d.py [case.bin] [op_type] [device_id] [om]
+    默认  fused_conv2d_case.bin  FusedConv2d  0  (无 om)
+
+第 4 个参数 om 可以是**单个 .om 文件**，也可以是装着 .om 的目录：
+    ... 0 om_out/0_FusedConv2d_1.om     只加载这一个（走 aclopLoad）
+    ... 0 om_out                        加载这个目录下所有 .om（走 aclopSetModelDir）
 
 环境变量：
     REL_TOL=1e-3     相对误差判据（默认 1e-3）
@@ -21,9 +25,14 @@ gen_case 生成的 .bin。所以这台机器只要有 python3 + CANN 就够了�
     REPEAT=1         计时的下发次数。想避开冷启动就调大，比如 REPEAT=10
     WARMUP=0         正式计时前先空跑多少次（不计入统计）。总次数 = WARMUP + REPEAT
 
-设备上没装带 FusedConv2d 的算子包时，传第 4 个参数 om_dir：那是在有算子包的机器上
-用 build_om.sh 编出来的单算子离线模型目录。脚本会先 aclopSetModelDir(om_dir)，
-运行时就从那里找算子，不再要求本机的算子信息库里有它。
+设备上没装带 FusedConv2d 的算子包时，传第 4 个参数：那是在有算子包的机器上用
+build_om.sh 编出来的单算子离线模型。运行时就从它里面找算子，不再要求本机的算子
+信息库里有这个算子。
+
+注意 aclopSetModelDir 只吃**目录**，而且会把目录下所有 .om 都加载进来。所以给单个
+文件时走的是 aclopLoad(把文件读进内存再注册)，只注册你指定的这一个 —— 目录里有多个
+.om 时这条更干净。老版本的 CANN 没有 aclopLoad 的话，会退回"取所在目录 +
+aclopSetModelDir"，并明确告诉你。
 
 判据和 C++ 版完全一致，输出行可以逐字对比。
 """
@@ -133,17 +142,29 @@ def load_acl():
         ("aclDestroyTensorDesc", [c_vp], None),
         ("aclCreateDataBuffer", [c_vp, c_sz], c_vp),
         ("aclDestroyDataBuffer", [c_vp], c_i),
-        ("aclopSetModelDir", [c_cp], c_i),
         ("aclopCreateAttr", [], c_vp),
         ("aclopDestroyAttr", [c_vp], None),
         ("aclopExecuteV2", [c_cp, c_i, ctypes.POINTER(c_vp), ctypes.POINTER(c_vp),
                             c_i, ctypes.POINTER(c_vp), ctypes.POINTER(c_vp), c_vp, c_vp], c_i),
+    ]
+    # 这两个只有用离线模型时才需要，缺了不该在这里就把脚本打死 ——
+    # 用到的时候再报，那时的报错还能顺带说清楚该退回哪条路。
+    opt = [
+        ("aclopSetModelDir", [c_cp], c_i),
+        ("aclopLoad", [c_vp, c_sz], c_i),
     ]
     for name, argtypes, restype in sig:
         try:
             fn = getattr(acl, name)
         except AttributeError:
             die("libascendcl.so 里没有 %s —— CANN 版本太老？" % name)
+        fn.argtypes = argtypes
+        fn.restype = restype
+    for name, argtypes, restype in opt:
+        try:
+            fn = getattr(acl, name)
+        except AttributeError:
+            continue
         fn.argtypes = argtypes
         fn.restype = restype
     return acl
@@ -253,7 +274,7 @@ def main():
     case_path = sys.argv[1] if len(sys.argv) > 1 else "fused_conv2d_case.bin"
     op_type = sys.argv[2] if len(sys.argv) > 2 else "FusedConv2d"
     device_id = int(sys.argv[3]) if len(sys.argv) > 3 else 0
-    om_dir = sys.argv[4] if len(sys.argv) > 4 else None
+    om_arg = sys.argv[4] if len(sys.argv) > 4 else None
 
     def env_num(name, default, cast):
         v = os.environ.get(name)
@@ -281,17 +302,31 @@ def main():
 
     print('FusedConv2d @ 5102 单算子验证 —— ctypes + aclopExecuteV2（目标机不需要编译器）')
     print('  case = "%s"   opType = "%s"   device = %d' % (case_path, op_type, device_id))
-    print('  om_dir = %s' % (om_dir if om_dir else "(不用离线模型，走本机算子信息库)"))
+    print('  om     = %s' % (om_arg if om_arg else "(不用离线模型，走本机算子信息库)"))
     print('  REL_TOL = %g   RATIO_MIN = %g   repeat = %d   warmup = %d\n'
           % (rel_tol, ratio_min, repeat, warmup))
 
-    if om_dir is not None:
-        if not os.path.isdir(om_dir):
-            die("om_dir %s 不是目录" % om_dir)
-        oms = [f for f in os.listdir(om_dir) if f.endswith(".om")]
-        if not oms:
-            die("%s 下没有 .om —— 在有算子包的机器上跑 build_om.sh 生成，整个目录拷过来" % om_dir)
-        print("  离线模型: %s" % ", ".join(sorted(oms)))
+    om_file = om_dir = None
+    if om_arg is not None:
+        if os.path.isfile(om_arg):
+            om_file = os.path.abspath(om_arg)
+            if os.path.getsize(om_file) == 0:
+                die("%s 是空文件" % om_file)
+            if not om_file.endswith(".om"):
+                print("  [!] %s 不是 .om 结尾，确认没传错文件" % os.path.basename(om_file))
+            print("  离线模型: %s (%d 字节，只加载这一个)"
+                  % (os.path.basename(om_file), os.path.getsize(om_file)))
+        elif os.path.isdir(om_arg):
+            om_dir = os.path.abspath(om_arg)
+            oms = [f for f in os.listdir(om_dir) if f.endswith(".om")]
+            if not oms:
+                die("%s 下没有 .om —— 在有算子包的机器上跑 build_om.sh 生成，拷过来" % om_dir)
+            print("  离线模型目录: %s，共 %d 个 .om: %s"
+                  % (om_dir, len(oms), ", ".join(sorted(oms))))
+            if len(oms) > 1:
+                print("     (目录形式会把这些全部加载。只想用其中一个就直接传那个文件)")
+        else:
+            die("%s 既不是文件也不是目录" % om_arg)
 
     tensors, gold_nonzero, ties, sat, y_elems = load_case(case_path)
     want = tensors["y_expect"][2]
@@ -312,10 +347,33 @@ def main():
             die(msg % ret if "%d" in msg else "%s (ret=%d)" % (msg, ret))
 
     check(acl.aclInit(None), "aclInit = %d")
-    if om_dir is not None:
-        # 必须在 aclrtSetDevice 之前/之后都可以，但要在 aclopExecuteV2 之前。
-        check(acl.aclopSetModelDir(os.path.abspath(om_dir).encode()),
-              "aclopSetModelDir(%s) = " % om_dir + "%d")
+    # 离线模型的注册。要在 aclopExecuteV2 之前，和 aclrtSetDevice 的先后无所谓。
+    om_keep = []
+    if om_file is not None:
+        fn = getattr(acl, "aclopLoad", None)
+        if fn is not None:
+            with open(om_file, "rb") as f:
+                blob = f.read()
+            buf = ctypes.create_string_buffer(blob, len(blob))
+            om_keep.append(buf)  # 挡住 GC，ACL 可能还引用着这块内存
+            check(fn(ctypes.cast(buf, ctypes.c_void_p), len(blob)),
+                  "aclopLoad(%s) = " % os.path.basename(om_file) + "%d")
+            print("  aclopLoad OK (%d 字节)" % len(blob))
+        else:
+            d = os.path.dirname(om_file)
+            smd = getattr(acl, "aclopSetModelDir", None)
+            if smd is None:
+                die("这个 CANN 的 libascendcl.so 里既没有 aclopLoad 也没有 aclopSetModelDir，\n"
+                    "    用不了离线模型。只能在设备上装带这个算子的算子包。")
+            print("  [!] 这个 CANN 没有 aclopLoad，退回 aclopSetModelDir(%s)。" % d)
+            print("      注意这会把该目录下**所有** .om 都加载进来。")
+            check(smd(d.encode()), "aclopSetModelDir = %d")
+            print("  aclopSetModelDir OK")
+    elif om_dir is not None:
+        fn = getattr(acl, "aclopSetModelDir", None)
+        if fn is None:
+            die("这个 CANN 的 libascendcl.so 里没有 aclopSetModelDir，用不了离线模型目录")
+        check(fn(om_dir.encode()), "aclopSetModelDir(%s) = " % om_dir + "%d")
         print("  aclopSetModelDir OK")
     check(acl.aclrtSetDevice(device_id), "aclrtSetDevice(" + str(device_id) + ") = %d —— 芯片被占？")
     stream = ctypes.c_void_p()
@@ -376,7 +434,7 @@ def main():
                     "        算子没找到(161001) -> 本机的算子信息库里没有它，或者类型名拼错\n"
                     "                      查: grep -ri '\"%s\"' $ASCEND_OPP_PATH/built-in/op_impl/ai_core/tbe/config/\n"
                     "                      这台机器没装带 FusedConv2d 的算子包的话，先在有包的机器上\n"
-                    "                      跑 build_om.sh 编出 .om，把目录拷过来当第 4 个参数传进来\n"
+                    "                      跑 build_om.sh 编出 .om，把它当第 4 个参数传进来\n"
                     "        找到但选不出 kernel -> shape/dtype 和 binary.json 里登记的组合对不上"
                     % (op_type, ret, op_type))
             die("第 %d 次 aclopExecuteV2 = %d" % (k + 1, ret))

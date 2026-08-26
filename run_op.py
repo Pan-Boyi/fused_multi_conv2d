@@ -17,7 +17,7 @@ case.json:
 
     {
       "op": "Conv2D",
-      "om_dir": "om_out",                     // 可选。有 .om 就传，否则走本机算子信息库
+      "om_dir": "om_out/0_Conv2D_1.om",       // 可选。单个 .om 文件或装着 .om 的目录
       "device": 0,                            // 可选，命令行第 2 个参数优先
       "inputs": [
         {"file": "x.bin",      "dtype": "float16", "shape": [1,3,224,224], "format": "NCHW"},
@@ -301,6 +301,7 @@ def load_acl():
     ]
     opt = [
         ("aclopSetModelDir", [cp], i),
+        ("aclopLoad", [vp, sz], i),
         ("aclopSetAttrBool", [vp, cp, ctypes.c_ubyte], i),
         ("aclopSetAttrInt", [vp, cp, ctypes.c_int64], i),
         ("aclopSetAttrFloat", [vp, cp, ctypes.c_float], i),
@@ -421,14 +422,27 @@ def main():
     print("  repeat = %d   warmup = %d   REL_TOL = %g   RATIO_MIN = %g\n"
           % (repeat, warmup, rel_tol, ratio_min))
 
+    om_file = om_path = None
     if om_dir:
         omp = om_dir if os.path.isabs(om_dir) else os.path.join(base, om_dir)
-        if not os.path.isdir(omp):
-            die("om_dir %s 不是目录" % omp)
-        oms = [f for f in os.listdir(omp) if f.endswith(".om")]
-        if not oms:
-            die("%s 下没有 .om" % omp)
-        print("  离线模型: %s" % ", ".join(sorted(oms)))
+        if os.path.isfile(omp):
+            om_file = os.path.abspath(omp)
+            if os.path.getsize(om_file) == 0:
+                die("%s 是空文件" % om_file)
+            if not om_file.endswith(".om"):
+                print("  [!] %s 不是 .om 结尾，确认没传错文件" % os.path.basename(om_file))
+            print("  离线模型: %s (%d 字节，只加载这一个)"
+                  % (os.path.basename(om_file), os.path.getsize(om_file)))
+        elif os.path.isdir(omp):
+            om_path = os.path.abspath(omp)
+            oms = [f for f in os.listdir(om_path) if f.endswith(".om")]
+            if not oms:
+                die("%s 下没有 .om" % om_path)
+            print("  离线模型目录: %s，共 %d 个: %s" % (om_path, len(oms), ", ".join(sorted(oms))))
+            if len(oms) > 1:
+                print("     (目录形式会把这些全部加载。只想用其中一个就直接写那个文件路径)")
+        else:
+            die("om_dir %s 既不是文件也不是目录" % omp)
 
     check_attrs(case.get("attrs") or [])
 
@@ -471,11 +485,33 @@ def main():
             die(msg % rc if "%d" in msg else "%s (ret=%d)" % (msg, rc))
 
     check(acl.aclInit(None), "aclInit = %d")
-    if om_dir:
+    om_keep = []
+    if om_file is not None:
+        # aclopSetModelDir 只吃目录，而且会加载目录下所有 .om。给单个文件时走
+        # aclopLoad(读进内存再注册)，只注册指定的这一个。
+        fn = getattr(acl, "aclopLoad", None)
+        if fn is not None:
+            with open(om_file, "rb") as fh:
+                blob = fh.read()
+            buf = ctypes.create_string_buffer(blob, len(blob))
+            om_keep.append(buf)
+            check(fn(ctypes.cast(buf, ctypes.c_void_p), len(blob)),
+                  "aclopLoad(%s) = " % os.path.basename(om_file) + "%d")
+            print("\n  aclopLoad OK (%d 字节)" % len(blob))
+        else:
+            d = os.path.dirname(om_file)
+            smd = getattr(acl, "aclopSetModelDir", None)
+            if smd is None:
+                die("这个 CANN 既没有 aclopLoad 也没有 aclopSetModelDir，用不了离线模型")
+            print("\n  [!] 这个 CANN 没有 aclopLoad，退回 aclopSetModelDir(%s)，" % d)
+            print("      这会把该目录下**所有** .om 都加载进来。")
+            check(smd(d.encode()), "aclopSetModelDir = %d")
+            print("  aclopSetModelDir OK")
+    elif om_path is not None:
         f = getattr(acl, "aclopSetModelDir", None)
         if f is None:
-            die("libascendcl.so 里没有 aclopSetModelDir，用不了离线模型")
-        check(f(os.path.abspath(omp).encode()), "aclopSetModelDir = %d")
+            die("libascendcl.so 里没有 aclopSetModelDir，用不了离线模型目录")
+        check(f(om_path.encode()), "aclopSetModelDir = %d")
         print("\n  aclopSetModelDir OK")
     check(acl.aclrtSetDevice(device_id), "aclrtSetDevice(" + str(device_id) + ") = %d —— 芯片被占？")
     stream = ctypes.c_void_p()
