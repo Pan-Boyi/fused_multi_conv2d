@@ -21,18 +21,23 @@
 
 选项:
     --device=N        用哪颗芯片，默认 0
+    --repeat=N        **总共**执行多少次，默认 1。想避开冷启动就调大，比如 --repeat=10
+    --warmup=N        正式计时之前先空跑多少次（不计入统计），默认 0
     --out=前缀        输出落盘成 <前缀>N.bin，默认 om_out_
     --goldenN=文件    第 N 个输出的 golden，给了才比精度
     --no-write        不写输出文件
 
-环境变量:
-    REPEAT=0          执行完再跑多少次，用于性能测量（配合 run_prof.sh）
-    REL_TOL=1e-3      有 golden 时的相对误差判据
-    RATIO_MIN=1.0     达标比例下限
+环境变量（和同名选项等价，选项优先）:
+    REPEAT / WARMUP / REL_TOL / RATIO_MIN
+
+关于冷启动:第 1 次执行含 kernel 加载和各种一次性开销，通常显著偏大。--repeat 会把
+每次的耗时都记下来，单独报第 1 次、并给出"去掉第 1 次"之后的统计，冷启动多贵一眼可见。
+真正的设备侧时间还是以 msprof 为准（./run_prof.sh）。
 """
 
 import ctypes
 import os
+import statistics
 import struct
 import sys
 import time
@@ -62,6 +67,25 @@ FMT = {
 def die(msg):
     print("\n[X] %s" % msg)
     sys.exit(1)
+
+
+def report_times(durs):
+    """把一组耗时报出来，并把第 1 次（冷启动）单独拎出来。"""
+    def line(tag, v):
+        v = sorted(v)
+        print("  %-14s n=%-4d min=%9.3f  p50=%9.3f  mean=%9.3f  max=%9.3f  stdev=%8.3f  us"
+              % (tag, len(v), v[0], statistics.median(v), sum(v) / len(v), v[-1],
+                 statistics.pstdev(v) if len(v) > 1 else 0.0))
+
+    line("全部", durs)
+    if len(durs) < 2:
+        return
+    print("  %-14s %.3f us" % ("第 1 次", durs[0]))
+    rest = durs[1:]
+    line("去掉第 1 次", rest)
+    warm = statistics.median(sorted(rest))
+    print("  %-14s %.3f us  (第 1 次 %.3f - 稳态中位数 %.3f)"
+          % ("冷启动开销≈", durs[0] - warm, durs[0], warm))
 
 
 def unpack(data, code, n):
@@ -261,13 +285,26 @@ def main():
         except ValueError:
             die("环境变量 %s=%r 不是合法数字" % (name, v))
 
-    repeat = env_num("REPEAT", 0, int)
-    rel_tol = env_num("REL_TOL", 1e-3, float)
-    ratio_min = env_num("RATIO_MIN", 1.0, float)
+    def opt_num(name, envname, default, cast):
+        if name in opts:
+            try:
+                return cast(opts[name])
+            except ValueError:
+                die("--%s=%r 不是合法数字" % (name, opts[name]))
+        return env_num(envname, default, cast)
+
+    repeat = opt_num("repeat", "REPEAT", 1, int)
+    warmup = opt_num("warmup", "WARMUP", 0, int)
+    rel_tol = opt_num("rel-tol", "REL_TOL", 1e-3, float)
+    ratio_min = opt_num("ratio-min", "RATIO_MIN", 1.0, float)
+    if repeat < 1:
+        die("--repeat 至少是 1（传的是 %d）" % repeat)
+    if warmup < 0:
+        die("--warmup 不能为负")
 
     print("直接跑 .om —— aclmdlLoadFromFile + aclmdlExecute（不需要任何描述文件）")
     print("  om     = %s  (%d 字节)" % (om, os.path.getsize(om)))
-    print("  device = %d   REPEAT = %d\n" % (device_id, repeat))
+    print("  device = %d   repeat = %d   warmup = %d\n" % (device_id, repeat, warmup))
 
     acl = load_acl()
 
@@ -374,8 +411,26 @@ def main():
     n_in_bufs = len(data_in)
 
     print("\n==== 执行 ====")
-    check(acl.aclmdlExecute(model_id, ds_in, ds_out), "aclmdlExecute = %d")
-    print("  aclmdlExecute OK")
+    for k in range(warmup):
+        rc = acl.aclmdlExecute(model_id, ds_in, ds_out)
+        if rc != ACL_SUCCESS:
+            die("warmup 第 %d 次 aclmdlExecute = %d" % (k + 1, rc))
+    if warmup:
+        print("  warmup %d 次完成（不计入统计）" % warmup)
+
+    durs = []
+    for k in range(repeat):
+        t0 = time.perf_counter()
+        rc = acl.aclmdlExecute(model_id, ds_in, ds_out)
+        if rc != ACL_SUCCESS:
+            die("第 %d 次 aclmdlExecute = %d" % (k + 1, rc))
+        durs.append((time.perf_counter() - t0) * 1e6)
+    print("  aclmdlExecute x %d OK" % repeat)
+
+    # 判据看的是**最后一次**的结果。连跑多次时这也顺带验了稳态下依然写对。
+    if repeat > 1 or warmup:
+        print("\n==== 耗时（host 侧墙钟，含下发和同步；设备侧以 msprof 为准）====")
+        report_times(durs)
 
     rcode = 0
     for i, (nm, nb, dt, dtname, isz, code, fmt, dims) in enumerate(outs):
@@ -422,19 +477,6 @@ def main():
         if ratio < ratio_min:
             print("  [FAIL] 达标比例 %.6f%% < 下限 %.6f%%" % (ratio * 100.0, ratio_min * 100.0))
             rcode = 1
-
-    if repeat > 0:
-        print("\n==== 性能 ====")
-        print("  再执行 %d 次（host 侧墙钟，含下发开销；设备侧以 msprof 为准）" % repeat)
-        durs = []
-        for k in range(repeat):
-            t0 = time.perf_counter()
-            if acl.aclmdlExecute(model_id, ds_in, ds_out) != ACL_SUCCESS:
-                die("性能循环第 %d 次 aclmdlExecute 失败" % k)
-            durs.append((time.perf_counter() - t0) * 1e6)
-        d = sorted(durs)
-        print("  n=%d  min=%.3f us  p50=%.3f us  max=%.3f us  first=%.3f us"
-              % (len(d), d[0], d[len(d) // 2], d[-1], durs[0]))
 
     acl.aclmdlDestroyDataset(ds_in)
     acl.aclmdlDestroyDataset(ds_out)

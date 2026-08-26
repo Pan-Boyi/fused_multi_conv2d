@@ -18,7 +18,8 @@ gen_case 生成的 .bin。所以这台机器只要有 python3 + CANN 就够了�
 环境变量：
     REL_TOL=1e-3     相对误差判据（默认 1e-3）
     RATIO_MIN=1.0    达标比例的下限，低于它算 FAIL（默认 1.0，即要求 100%）
-    REPEAT=0         正确性比对之后再下发多少次，用于性能测量（默认 0，不测）
+    REPEAT=1         计时的下发次数。想避开冷启动就调大，比如 REPEAT=10
+    WARMUP=0         正式计时前先空跑多少次（不计入统计）。总次数 = WARMUP + REPEAT
 
 设备上没装带 FusedConv2d 的算子包时，传第 4 个参数 om_dir：那是在有算子包的机器上
 用 build_om.sh 编出来的单算子离线模型目录。脚本会先 aclopSetModelDir(om_dir)，
@@ -29,6 +30,7 @@ gen_case 生成的 .bin。所以这台机器只要有 python3 + CANN 就够了�
 
 import ctypes
 import os
+import statistics
 import struct
 import sys
 import time
@@ -148,6 +150,25 @@ def load_acl():
 
 
 # ---------------------------------------------------------------- 比对
+def report_times(durs):
+    """把一组耗时报出来，并把第 1 次（冷启动）单独拎出来。"""
+    def line(tag, v):
+        v = sorted(v)
+        print("  %-14s n=%-4d min=%9.3f  p50=%9.3f  mean=%9.3f  max=%9.3f  stdev=%8.3f  us"
+              % (tag, len(v), v[0], statistics.median(v), sum(v) / len(v), v[-1],
+                 statistics.pstdev(v) if len(v) > 1 else 0.0))
+
+    line("全部", durs)
+    if len(durs) < 2:
+        return
+    print("  %-14s %.3f us" % ("第 1 次", durs[0]))
+    rest = durs[1:]
+    line("去掉第 1 次", rest)
+    warm = statistics.median(sorted(rest))
+    print("  %-14s %.3f us  (第 1 次 %.3f - 稳态中位数 %.3f)"
+          % ("冷启动开销≈", durs[0] - warm, durs[0], warm))
+
+
 def as_i8(b):
     """.bin 和 memcpy 回来的都是无符号字节；判据全按 int8 解释。"""
     return b - 256 if b > 127 else b
@@ -245,7 +266,12 @@ def main():
 
     rel_tol = env_num("REL_TOL", 1e-3, float)
     ratio_min = env_num("RATIO_MIN", 1.0, float)
-    repeat = env_num("REPEAT", 0, int)
+    repeat = env_num("REPEAT", 1, int)
+    warmup = env_num("WARMUP", 0, int)
+    if repeat < 1:
+        die("REPEAT 至少是 1")
+    if warmup < 0:
+        die("WARMUP 不能为负")
     if rel_tol < 0:
         die("REL_TOL 不能为负")
     if not (0.0 <= ratio_min <= 1.0):
@@ -256,7 +282,8 @@ def main():
     print('FusedConv2d @ 5102 单算子验证 —— ctypes + aclopExecuteV2（目标机不需要编译器）')
     print('  case = "%s"   opType = "%s"   device = %d' % (case_path, op_type, device_id))
     print('  om_dir = %s' % (om_dir if om_dir else "(不用离线模型，走本机算子信息库)"))
-    print('  REL_TOL = %g   RATIO_MIN = %g   REPEAT = %d\n' % (rel_tol, ratio_min, repeat))
+    print('  REL_TOL = %g   RATIO_MIN = %g   repeat = %d   warmup = %d\n'
+          % (rel_tol, ratio_min, repeat, warmup))
 
     if om_dir is not None:
         if not os.path.isdir(om_dir):
@@ -338,17 +365,31 @@ def main():
         return acl.aclopExecuteV2(op_type.encode(), 7, in_desc, in_buf,
                                   1, out_desc, out_buf, attr, stream)
 
-    ret = launch()
-    if ret != ACL_SUCCESS:
-        die('aclopExecuteV2("%s") = %d\n'
-            "        算子没找到(161001) -> 本机的算子信息库里没有它，或者类型名拼错\n"
-            "                      查: grep -ri '\"%s\"' $ASCEND_OPP_PATH/built-in/op_impl/ai_core/tbe/config/\n"
-            "                      这台机器没装带 FusedConv2d 的算子包的话，先在有包的机器上\n"
-            "                      跑 build_om.sh 编出 .om，把目录拷过来当第 4 个参数传进来\n"
-            "        找到但选不出 kernel -> shape/dtype 和 binary.json 里登记的组合对不上"
-            % (op_type, ret, op_type))
-    check(acl.aclrtSynchronizeStream(stream),
-          "aclrtSynchronizeStream = %d —— kernel 可能 abort 了，查 device 日志")
+    # 总共下发 warmup + repeat 次；只有后 repeat 次计入统计。
+    durs = []
+    for k in range(warmup + repeat):
+        t0 = time.perf_counter()
+        ret = launch()
+        if ret != ACL_SUCCESS:
+            if k == 0:
+                die('aclopExecuteV2("%s") = %d\n'
+                    "        算子没找到(161001) -> 本机的算子信息库里没有它，或者类型名拼错\n"
+                    "                      查: grep -ri '\"%s\"' $ASCEND_OPP_PATH/built-in/op_impl/ai_core/tbe/config/\n"
+                    "                      这台机器没装带 FusedConv2d 的算子包的话，先在有包的机器上\n"
+                    "                      跑 build_om.sh 编出 .om，把目录拷过来当第 4 个参数传进来\n"
+                    "        找到但选不出 kernel -> shape/dtype 和 binary.json 里登记的组合对不上"
+                    % (op_type, ret, op_type))
+            die("第 %d 次 aclopExecuteV2 = %d" % (k + 1, ret))
+        ret = acl.aclrtSynchronizeStream(stream)
+        if ret != ACL_SUCCESS:
+            die("第 %d 次 aclrtSynchronizeStream = %d —— kernel 可能 abort 了，查 device 日志"
+                % (k + 1, ret))
+        dt = (time.perf_counter() - t0) * 1e6
+        if k >= warmup:
+            durs.append(dt)
+    if repeat > 1 or warmup:
+        print("\n[耗时] host 侧墙钟，含下发和同步；设备侧以 msprof 为准")
+        report_times(durs)
 
     out = ctypes.create_string_buffer(y_elems)
     check(acl.aclrtMemcpy(ctypes.cast(out, ctypes.c_void_p), y_elems, dev_ptrs[7], y_elems,
@@ -393,25 +434,6 @@ def main():
     # 达标比例只会是 100% 或者恰好等于逐位相等的比例。
     print("       注: 输出是 int8 且 |golden| <= 100，最小非零差值 1 对应相对误差 >= 1e-2，")
     print("           所以 %g 的判据在这里等价于逐位相等。" % rel_tol)
-
-    # ------------------------------------------------------------ 性能
-    if repeat > 0:
-        print("\n[性能] 再下发 %d 次（host 侧计时，含下发开销；设备侧以 msprof 为准）" % repeat)
-        durs = []
-        for i in range(repeat):
-            t0 = time.perf_counter()
-            rc = launch()
-            if rc != ACL_SUCCESS:
-                die("性能循环第 %d 次 aclopExecuteV2 = %d" % (i, rc))
-            rc = acl.aclrtSynchronizeStream(stream)
-            if rc != ACL_SUCCESS:
-                die("性能循环第 %d 次 aclrtSynchronizeStream = %d" % (i, rc))
-            durs.append((time.perf_counter() - t0) * 1e6)
-        durs_sorted = sorted(durs)
-        print("       n=%d  min=%.3f us  p50=%.3f us  max=%.3f us  first=%.3f us"
-              % (len(durs), durs_sorted[0], durs_sorted[len(durs_sorted) // 2],
-                 durs_sorted[-1], durs[0]))
-        print("       这是 host 侧的墙钟，包含下发和同步；真正的 kernel 时间用 ./run_prof.sh 拿。")
 
     acl.aclopDestroyAttr(attr)
     for i in range(8):
