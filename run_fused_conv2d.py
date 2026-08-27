@@ -64,8 +64,29 @@ REC_LEN = struct.calcsize(REC_FMT)
 ORDER = ["x", "filter1", "bias1", "scale1", "filter2", "bias2", "scale2"]
 
 
+# ACL 把失败的细节（AI Core 异常、哪条 task、PC）攒在一个进程级的字符串里，
+# 只有 aclGetRecentErrMsg() 能取出来 —— 它不走 slog，所以 ASCEND_SLOG_PRINT_TO_STDOUT
+# 打不打开都不影响。返回码本身（比如 507014）只说"哪一类"，这个字符串才说"哪一个"。
+_ACL_HANDLE = None
+
+
+def acl_err_detail():
+    if _ACL_HANDLE is None:
+        return ""
+    fn = getattr(_ACL_HANDLE, "aclGetRecentErrMsg", None)
+    if fn is None:
+        return "\n    （这个 CANN 的 libascendcl.so 里没有 aclGetRecentErrMsg）"
+    try:
+        msg = fn()
+    except Exception as e:  # noqa: BLE001 - 诊断路径，不能再抛
+        return "\n    （aclGetRecentErrMsg 调用失败: %s）" % e
+    if not msg:
+        return "\n    （aclGetRecentErrMsg 是空的 —— 错误可能发生在 runtime 更下层，看 ~/ascend/log/）"
+    return "\n\n    ---- aclGetRecentErrMsg ----\n    " + msg.decode(errors="replace").replace("\n", "\n    ")
+
+
 def die(msg):
-    print("\n[X] %s" % msg)
+    print("\n[X] %s%s" % (msg, acl_err_detail()))
     sys.exit(1)
 
 
@@ -152,6 +173,7 @@ def load_acl():
     opt = [
         ("aclopSetModelDir", [c_cp], c_i),
         ("aclopLoad", [c_vp, c_sz], c_i),
+        ("aclGetRecentErrMsg", [], c_cp),
     ]
     for name, argtypes, restype in sig:
         try:
@@ -167,6 +189,8 @@ def load_acl():
             continue
         fn.argtypes = argtypes
         fn.restype = restype
+    global _ACL_HANDLE
+    _ACL_HANDLE = acl
     return acl
 
 
