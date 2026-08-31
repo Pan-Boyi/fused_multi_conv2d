@@ -36,7 +36,7 @@
  *   b1, b2   int32    biases, delivered through the BT (C2) bias table
  *   L0C      int32    EXACT accumulation. The 5102 cube has no floating-point
  *                     accumulator; mad() on dav-510r2 only exists with an int32
- *                     destination. int8 x int8 -> int32 over K = 576 terms
+ *                     destination. int8 x int8 -> int32 over K <= 576 terms
  *                     cannot overflow (576 * 127 * 127 = 9.29e6 << 2^31), so
  *                     conv1's and conv2's accumulators are EXACT INTEGERS.
  *                     There is no rounding anywhere inside a convolution.
@@ -145,35 +145,38 @@ namespace FusedConv2dGolden {
 // which is the authority; test_fused_conv2d.cpp static_asserts the two against
 // each other, so drift is a compile error rather than a numeric mystery.
 // ---------------------------------------------------------------------------
+//     x    [1, 32, 288, 112] int8  -- conv1 3x3 s1 p1 -->
+//     mid  [1, 64, 288, 112] int8  -- conv2 3x3 s2 p1 -->
+//     y    [1, 96, 144,  56] fp16  -> [8064, 96] M-major in GM
 constexpr int C0 = 32; // int8: 32 bytes / 1 byte
-constexpr int CI = 64;
+constexpr int CI = 32;
 constexpr int HI = 288;
 constexpr int WI = 112;
-constexpr int C1 = CI / C0; // 2   (was 4 for fp16)
+constexpr int C1 = CI / C0; // 1 -- the input is a single NC1HWC0 strip
 constexpr int KH = 3;
 constexpr int KW = 3;
 constexpr int PAD = 1;
 
 constexpr int COUT1 = 64;
-constexpr int STRIDE1 = 2;
-constexpr int HO1 = 144;
-constexpr int WO1 = 56;
+constexpr int STRIDE1 = 1;
+constexpr int HO1 = 288;
+constexpr int WO1 = 112;
 
-constexpr int COUT2 = 64;
-constexpr int STRIDE2 = 1;
+constexpr int COUT2 = 96;
+constexpr int STRIDE2 = 2;
 constexpr int HO2 = 144;
 constexpr int WO2 = 56;
 
 constexpr int MID_C1 = COUT1 / C0; // 2
-constexpr int K1 = C1 * KH * KW * C0;     // 576
+constexpr int K1 = C1 * KH * KW * C0;     // 288
 constexpr int K2 = MID_C1 * KH * KW * C0; // 576
 
-constexpr size_t X_ELEMS = (size_t)C1 * HI * WI * C0;   // 2,064,384 int8
-constexpr size_t W1_ELEMS = (size_t)COUT1 * K1;         //    36,864 int8
-constexpr size_t W2_ELEMS = (size_t)COUT2 * K2;         //    36,864 int8
+constexpr size_t X_ELEMS = (size_t)C1 * HI * WI * C0;   // 1,032,192 int8
+constexpr size_t W1_ELEMS = (size_t)COUT1 * K1;         //    18,432 int8
+constexpr size_t W2_ELEMS = (size_t)COUT2 * K2;         //    55,296 int8
 constexpr size_t M_ROWS = (size_t)HO2 * WO2;            //     8,064
-constexpr size_t Y_ELEMS = M_ROWS * COUT2;              //   516,096
-constexpr size_t MID_ELEMS = (size_t)MID_C1 * HO1 * WO1 * C0; // 516,096 int8
+constexpr size_t Y_ELEMS = M_ROWS * COUT2;              //   774,144
+constexpr size_t MID_ELEMS = (size_t)MID_C1 * HO1 * WO1 * C0; // 2,064,384 int8
 
 // Target |mid| for the busiest element of each output channel. 100 of 127
 // leaves headroom for the float19 rounding of the scale (worst case +2^-10
@@ -229,6 +232,64 @@ constexpr int B_ABS = 8191;
 // (b) makes exact ties in acc*scale astronomically rare: with scale = m*2^-e
 // and m odd, acc*m == 2^(e-1) (mod 2^e) has exactly one solution for acc mod
 // 2^e, so ties occur with probability 2^-e.
+// fp32 -> fp16，round-to-nearest-even。手写而不是靠编译器的 _Float16 转换，
+// 理由和 RoundNearest 一样：不能依赖进程的浮点舍入模式，也不能依赖某个编译器
+// 是否支持 _Float16。返回 fp16 的位模式。
+//
+// VDEQF16 的语义是 y = (half)(acc_int32 * scale_fp32)。acc 的量级在
+// [-77278, 83979]，|acc| < 2^24，转 fp32 精确；所以整条链只有最后这一步有舍入。
+inline uint16_t F32ToF16Bits(float v)
+{
+    uint32_t u;
+    std::memcpy(&u, &v, sizeof(u));
+    const uint32_t sign = (u >> 16) & 0x8000u;
+    int32_t exp = (int32_t)((u >> 23) & 0xFFu) - 127;
+    uint32_t man = u & 0x007FFFFFu;
+
+    if (exp == 128) {                       // Inf / NaN
+        return (uint16_t)(sign | 0x7C00u | (man ? 0x0200u : 0u));
+    }
+    if (exp > 15) {                         // 上溢 -> Inf
+        return (uint16_t)(sign | 0x7C00u);
+    }
+    // exp == -25 这一档不能砍：它正好落在最小次正规 2^-24 的一半上，尾数非零就要
+    // 进位到 1。只有 exp <= -26 才恒为 0（此时 shift 也会超过 31，是真正的 UB 边界）。
+    if (exp < -25) {                        // 太小 -> 0
+        return (uint16_t)sign;
+    }
+    uint32_t sig;                           // 24 位有效数（含隐含位）
+    int32_t shift;
+    if (exp < -14) {                        // 次正规
+        // 次正规结果：value = sig * 2^(exp-23)，要表示成 m * 2^-24，
+        // 于是 m = sig >> (-exp-1)。（写成 14-exp 是错的，扫描对拍抓到的。）
+        sig = man | 0x00800000u;
+        shift = -exp - 1;
+        exp = -15;
+    } else {
+        sig = man;
+        shift = 13;
+    }
+    const uint32_t lsb = 1u << shift;
+    const uint32_t half_ = lsb >> 1;
+    const uint32_t rem = sig & (lsb - 1);
+    uint32_t out = sig >> shift;
+    if (rem > half_ || (rem == half_ && (out & 1u))) {   // round-half-to-even
+        ++out;
+    }
+    uint32_t e16 = (uint32_t)(exp + 15);
+    if (exp == -15) {                       // 次正规：进位可能把它抬成正规数
+        return (uint16_t)(sign | out);
+    }
+    if (out & 0x0400u) {                    // 尾数进位溢出，阶码加一
+        out = 0;
+        ++e16;
+        if (e16 >= 31u) {
+            return (uint16_t)(sign | 0x7C00u);
+        }
+    }
+    return (uint16_t)(sign | (e16 << 10) | (out & 0x03FFu));
+}
+
 inline float ChooseScale(float raw)
 {
     if (!(raw > 0.0f) || !std::isfinite(raw)) {
@@ -321,7 +382,7 @@ inline int8_t RequantToInt8(int32_t acc, float scale, bool* isTie, bool* isSat)
 
 // [1, CI, HI, WI] -> [C1*HI*WI, C0]. Element (c1, h, w, c0) lands at
 // ((c1*HI + h)*WI + w)*C0 + c0, with the true channel ci = c1*C0 + c0.
-// This is fused_data.py's to_nc1hwc0 with C0 = 32, C1 = 2.
+// This is fused_data.py's to_nc1hwc0 with C0 = 32, C1 = 1.
 // GM2L1_ND2NZ in the kernel reads strip c1 as a contiguous [XROWS*WI, C0]
 // block at offset (WI*b + c1*HI*WI)*C0 -- the same statement, read the other
 // way round. With C0 = 32 that offset is 32x the strip index, not 16x.
@@ -360,8 +421,9 @@ inline void FromNc1hwc0(const int8_t* dev, std::vector<int8_t>& nchw)
 // [COUT, CIN, KH, KW] -> [COUT, K] with K walked as (c1, kh, kw, c0), which is
 // load3d's own order. Element (co, c1, kh, kw, c0) lands at
 // co*K + ((c1*KH + kh)*KW + kw)*C0 + c0. fused_data.py's weight_to_kmajor.
-// NOTE the int8 shift: K = 576 is unchanged, but it is now 2 strips of 288
-// instead of 4 of 144, so a fp16-era weight blob is NOT reinterpretable.
+// NOTE the two convs no longer share a K: w1 is [64, 288] (1 strip of 288) and
+// w2 is [96, 576] (2 strips of 288). A weight blob from the previous shape is
+// NOT reinterpretable as either.
 inline void WeightToKMajor(const int8_t* nchw, int cin, int cout, int8_t* dev)
 {
     const int c1n = cin / C0;
@@ -432,8 +494,9 @@ inline void MidToNc1hwc0(const int8_t* midNchw, std::vector<int8_t>& dev)
 // fp16 golden, there is no summation-order argument to make, and the kernel
 // must match this BIT FOR BIT.
 //
-// The padding bounds are hoisted out of the innermost loop purely so that
-// ~300M MACs per conv stay tolerable in a -g / no-optimisation UT build.
+// The padding bounds are hoisted out of the innermost loop purely so that the
+// MAC count (595M for conv1, 446M for conv2) stays tolerable in a -g /
+// no-optimisation UT build.
 // ---------------------------------------------------------------------------
 inline void ConvFwdNchwI32(const int8_t* in, int cin, int hi, int wi, const int8_t* wt, const int32_t* bias, int cout,
                            int stride, int ho, int wo, std::vector<int32_t>& out)
@@ -502,6 +565,9 @@ struct Golden {
     std::vector<int32_t> acc2;    // [COUT2, HO2, WO2] conv2's exact int32 accumulator
     std::vector<int32_t> yI32;    // [M_ROWS, COUT2] device layout, int32 output path
     std::vector<int8_t> yI8;      // [M_ROWS, COUT2] device layout, int8 output path
+    std::vector<uint16_t> yF16;   // [M_ROWS, COUT2] 同布局，fp16 位模式（VDEQF16 路径）
+    float yF16Min = 0.0f;
+    float yF16Max = 0.0f;
 
     // diagnostics -- the UT should assert on these, not just print them
     int32_t acc1Min = 0, acc1Max = 0;
@@ -629,6 +695,8 @@ inline Golden BuildGolden(const Inputs& in)
 
     DeriveScales(g.acc2, COUT2, HO2 * WO2, g.scale2);
     g.yI8.assign(Y_ELEMS, 0);
+    g.yF16.assign(Y_ELEMS, 0);
+    bool firstF16 = true;
     g.yI8Min = 127;
     g.yI8Max = -128;
     for (int co = 0; co < COUT2; ++co) {
@@ -639,6 +707,13 @@ inline Golden BuildGolden(const Inputs& in)
             bool sat = false;
             const int8_t v = RequantToInt8(src[m], s, &tie, &sat);
             g.yI8[m * COUT2 + co] = v;
+            // VDEQF16：acc(int32) -> fp32（|acc| < 2^24，精确）-> 乘 float19 的
+            // scale -> 舍入到 fp16。scale 已经被 ChooseScale 掩成 float19，和硬件
+            // 表里的位一致，所以这一步是可以逐位对上的。
+            const float fv = (float)src[m] * s;
+            g.yF16[m * COUT2 + co] = F32ToF16Bits(fv);
+            if (firstF16) { g.yF16Min = g.yF16Max = fv; firstF16 = false; }
+            else { g.yF16Min = std::min(g.yF16Min, fv); g.yF16Max = std::max(g.yF16Max, fv); }
             g.ties2 += tie ? 1 : 0;
             g.sat2 += sat ? 1 : 0;
             g.yI8Min = std::min(g.yI8Min, (int)v);
@@ -649,7 +724,13 @@ inline Golden BuildGolden(const Inputs& in)
 }
 
 // Which output the UT should compare against, per the compile-time flag.
-#if FUSED_CONV2D_GOLDEN_INT8_OUT
+#if defined(FUSED_CONV2D_GOLDEN_FP16_OUT) && FUSED_CONV2D_GOLDEN_FP16_OUT
+using OutElem = uint16_t;   // fp16 的位模式
+inline const std::vector<uint16_t>& GoldenOutput(const Golden& g)
+{
+    return g.yF16;
+}
+#elif FUSED_CONV2D_GOLDEN_INT8_OUT
 using OutElem = int8_t;
 inline const std::vector<int8_t>& GoldenOutput(const Golden& g)
 {

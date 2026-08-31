@@ -33,7 +33,7 @@ done
 [ "$MISSING" = 0 ] || die "上面标 ** 缺失 ** 的文件要和脚本放在同一个目录"
 
 grep -q "^int main()" "$HERE/fused_conv2d_int8_golden.h" \
-    || die "fused_conv2d_int8_golden.h 里找不到 main() —— 文件不完整（应为 742 行）"
+    || die "fused_conv2d_int8_golden.h 里找不到 main() —— 文件被截断了"
 echo "  golden 头完整性 OK"
 
 # -ffp-contract=off: 有的架构上 gcc 默认允许把 a*b+c 融成 fmadd，结果和分开算不一样。
@@ -57,7 +57,7 @@ $CXX_HOST $CXXFLAGS "$HERE/gen_case.cpp" -o "$HERE/gen_case" -I"$HERE"
 [ -f "$HERE/fused_conv2d_case.bin" ] || die "gen_case 说成功了但没产出 .bin？"
 
 SZ=$(wc -c < "$HERE/fused_conv2d_case.bin" | tr -d " \t")   # macOS 的 wc 会补前导空格
-[ "$SZ" = 2656312 ] || echo "  [!] .bin 是 $SZ 字节，预期 2656312 —— 形状变了？"
+[ "$SZ" = 2656696 ] || echo "  [!] .bin 是 $SZ 字节，预期 2656696 —— 形状变了？"
 
 step "4) 拷过去"
 echo "  文件: $HERE/fused_conv2d_case.bin  ($SZ 字节)"

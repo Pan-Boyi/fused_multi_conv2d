@@ -8,11 +8,18 @@
 #   REPEAT=20        采集期间额外下发多少次（默认 20，越多统计越稳）
 #   OUT=prof_out     msprof 的输出目录
 #   MSPROF_ARGS=...  覆盖默认的采集开关（各版本开关名不一样时用）
+#   APP_CMD=...      换掉被采集的命令。采别的算子时用通用执行器：
+#                      APP_CMD="python3 run_op.py conv2d_case.json" \
+#                      OPTYPE=Conv2D ./run_prof.sh
+#   OPTYPE=...       解析时按哪个算子名过滤（默认取第 2 个位置参数）
 #
 # 不用 set -e，每步显式检查。
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 [ -n "$HERE" ] || HERE="$PWD"
+
+# 先把环境变量里的 OPTYPE 存下来 —— 下一行的位置参数默认值会把它盖掉。
+OPTYPE_ENV="$OPTYPE"
 
 CASE="${1:-fused_conv2d_case.bin}"
 OPTYPE="${2:-FusedConv2d}"
@@ -56,16 +63,24 @@ else
 fi
 echo "  REPEAT = $REPEAT   OUT = $OUT"
 
-for f in run_fused_conv2d.py parse_prof.py; do
-    [ -f "$HERE/$f" ] || die "缺 $HERE/$f"
-done
-[ -f "$HERE/$CASE" ] || [ -f "$CASE" ] || die "找不到 case 文件 $CASE"
+[ -f "$HERE/parse_prof.py" ] || die "缺 $HERE/parse_prof.py"
+if [ -z "$APP_CMD" ]; then
+    [ -f "$HERE/run_fused_conv2d.py" ] || die "缺 $HERE/run_fused_conv2d.py"
+    [ -f "$HERE/$CASE" ] || [ -f "$CASE" ] || die "找不到 case 文件 $CASE"
+fi
+# 解析时按哪个算子过滤。APP_CMD 模式下位置参数是无关的，用 OPTYPE 环境变量指定。
+FILTER="${OPTYPE_ENV:-$OPTYPE}"
 
 step "1) 采集"
 rm -rf "$OUT" && mkdir -p "$OUT" || die "建不了输出目录 $OUT"
 
-APP="python3 $HERE/run_fused_conv2d.py $CASE $OPTYPE $DEV"
-[ -n "$OMDIR" ] && APP="$APP $OMDIR"
+if [ -n "$APP_CMD" ]; then
+    APP="$APP_CMD"
+    echo "  （用的是 APP_CMD，位置参数被忽略）"
+else
+    APP="python3 $HERE/run_fused_conv2d.py $CASE $OPTYPE $DEV"
+    [ -n "$OMDIR" ] && APP="$APP $OMDIR"
+fi
 echo "  application: $APP"
 
 export REPEAT
@@ -94,7 +109,7 @@ ${TMO:+$TMO 300} "$MSPROF" --export=on --output="$OUT" >/dev/null 2>&1
 echo "  export rc=$?（非 0 也没关系）"
 
 step "3) 解析"
-python3 "$HERE/parse_prof.py" "$OUT" "$OPTYPE"
+python3 "$HERE/parse_prof.py" "$OUT" "$FILTER"
 PRC=$?
 
 echo

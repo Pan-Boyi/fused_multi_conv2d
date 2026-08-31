@@ -47,7 +47,10 @@
 #include <string>
 #include <vector>
 
-#define FUSED_CONV2D_GOLDEN_INT8_OUT 1
+// y 走 VDEQF16 出 fp16。这个宏只选 GoldenOutput()/OutElem 的类型，跟
+// gold.yI8 / gold.yF16 的直接取用无关，但留成 int8 会误导后来人。
+#define FUSED_CONV2D_GOLDEN_INT8_OUT 0
+#define FUSED_CONV2D_GOLDEN_FP16_OUT 1
 #include "fused_conv2d_int8_golden.h"
 
 namespace G = FusedConv2dGolden;
@@ -61,7 +64,7 @@ constexpr uint32_t ACL_DT_INT32 = 3;
 constexpr uint32_t ACL_DT_UINT64 = 10;
 constexpr uint32_t ACL_DT_FLOAT16 = 1;   // y 改成 fp16 之后用这个
 
-// VREQ8 deq 表项打包。和 test_aclop_fused_conv2d.cpp 里的那份必须一模一样。
+// VREQ8 重量化表项打包 —— 这是 scale1（conv1 -> int8 mid）。
 // bit[46] 不会从输出 dtype 推断 —— 忘了置 1 算子照样跑完，给出一串合理的无符号字节。
 uint64_t PackScaleEntry(float scale, int offset = 0)
 {
@@ -71,6 +74,16 @@ uint64_t PackScaleEntry(float scale, int offset = 0)
     e |= (static_cast<uint64_t>(static_cast<uint32_t>(offset) & 0x1FFu)) << 37;
     e |= (1ULL << 46);
     return e;
+}
+
+// VDEQF16 反量化表项打包 —— 这是 scale2（conv2 -> fp16 y）。编码和上面**不同**：
+// 只用 [31:0] 的 fp32 位模式，没有 offset 也没有饱和位，高 32 位必须是 0。
+// 和 tests/ut/op_kernel/test_fused_conv2d.cpp 里的那份必须一模一样。
+uint64_t PackDeqF16Entry(float scale)
+{
+    uint32_t u;
+    std::memcpy(&u, &scale, sizeof(u));
+    return static_cast<uint64_t>(u & 0xFFFFE000u);
 }
 
 bool WriteTensor(std::FILE* f, const char* name, uint32_t dtype, const std::vector<int64_t>& dims, const void* data,
@@ -141,7 +154,7 @@ int main(int argc, char** argv)
         s1[i] = PackScaleEntry(gold.scale1[i]);
     }
     for (int i = 0; i < G::COUT2; ++i) {
-        s2[i] = PackScaleEntry(gold.scale2[i]);
+        s2[i] = PackDeqF16Entry(gold.scale2[i]);
     }
 
     std::FILE* f = std::fopen(out.c_str(), "wb");

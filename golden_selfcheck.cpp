@@ -21,7 +21,10 @@
  * 用一个真正的 .cpp 把宏定义在 include 之前，就没有这个歧义了。
  */
 
-#define FUSED_CONV2D_GOLDEN_INT8_OUT 1
+// y 走 VDEQF16 出 fp16。这个宏只选 GoldenOutput()/OutElem 的类型，跟
+// gold.yI8 / gold.yF16 的直接取用无关，但留成 int8 会误导后来人。
+#define FUSED_CONV2D_GOLDEN_INT8_OUT 0
+#define FUSED_CONV2D_GOLDEN_FP16_OUT 1
 #define FUSED_CONV2D_GOLDEN_MAIN 1
 
 #include "fused_conv2d_int8_golden.h"

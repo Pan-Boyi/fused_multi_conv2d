@@ -58,7 +58,7 @@ done
 # golden 头必须完整：截断的话后面会报一句和 golden 毫无关系的
 # "undefined reference to \`main'"
 if ! grep -q "^int main()" "$HERE/fused_conv2d_int8_golden.h"; then
-    die "fused_conv2d_int8_golden.h 里找不到 main() —— 文件不完整（应为 742 行），重新拿一份"
+    die "fused_conv2d_int8_golden.h 里找不到 main() —— 文件被截断了，重新拿一份"
 fi
 echo "  golden 头完整性 OK"
 

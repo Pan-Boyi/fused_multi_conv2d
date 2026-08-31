@@ -35,7 +35,10 @@
 #include "acl/acl.h"
 #include "acl/acl_op.h"
 
-#define FUSED_CONV2D_GOLDEN_INT8_OUT 1
+// y 走 VDEQF16 出 fp16。这个宏只选 GoldenOutput()/OutElem 的类型，跟
+// gold.yI8 / gold.yF16 的直接取用无关，但留成 int8 会误导后来人。
+#define FUSED_CONV2D_GOLDEN_INT8_OUT 0
+#define FUSED_CONV2D_GOLDEN_FP16_OUT 1
 #include "fused_conv2d_int8_golden.h"
 
 namespace G = FusedConv2dGolden;
@@ -50,9 +53,10 @@ namespace G = FusedConv2dGolden;
 
 namespace {
 
-constexpr int8_t Y_SENTINEL = 127;
+// y 是 fp16，哨兵取 0x7F7F（一个 fp16 NaN 位模式，golden 里不可能出现）。
+constexpr uint16_t Y_SENTINEL = 0x7F7Fu;
 
-// VREQ8 deq 表项打包。位域说明见 test_aclnn_fused_conv2d.cpp / 步骤文档。
+// VREQ8 重量化表项打包 —— 这是 scale1。位域说明见步骤文档「附:算子的输入约定」。
 // bit[46] 不会从输出 dtype 推断 —— 忘了置 1 算子照样跑完，给出一串合理的无符号字节。
 uint64_t PackScaleEntry(float scale, int offset = 0)
 {
@@ -62,6 +66,40 @@ uint64_t PackScaleEntry(float scale, int offset = 0)
     e |= (static_cast<uint64_t>(static_cast<uint32_t>(offset) & 0x1FFu)) << 37;
     e |= (1ULL << 46);
     return e;
+}
+
+// VDEQF16 反量化表项打包 —— 这是 scale2（conv2 -> fp16 y）。编码和上面**不同**：
+// 只用 [31:0] 的 fp32 位模式，没有 offset 也没有饱和位，高 32 位必须是 0。
+// 和 tests/ut/op_kernel/test_fused_conv2d.cpp、gen_case.cpp 里的那份必须一模一样。
+uint64_t PackDeqF16Entry(float scale)
+{
+    uint32_t u;
+    std::memcpy(&u, &scale, sizeof(u));
+    return static_cast<uint64_t>(u & 0xFFFFE000u);
+}
+
+// fp16 位模式 -> float，只为打印和 ULP 分析用；不参与判据（判据是位模式逐位相等）。
+float F16ToFloat(uint16_t h)
+{
+    const uint32_t s = (uint32_t)(h >> 15) & 0x1u;
+    const uint32_t e = (uint32_t)(h >> 10) & 0x1Fu;
+    const uint32_t m = (uint32_t)h & 0x3FFu;
+    if (e == 0) {
+        // 次正规（含 ±0）：值就是 m * 2^-24。m <= 1023，2^-24 是 2 的幂，所以
+        // 这个乘法在 float 上是精确的 —— 比手写规格化循环短，也少一个能写错的地方。
+        // （手写那版第一稿就把指数算差了 1，65536 个位模式里错了 2046 个。）
+        const float v = (float)m * 5.9604644775390625e-08f; // 2^-24
+        return s ? -v : v;
+    }
+    uint32_t u;
+    if (e == 31) {
+        u = (s << 31) | 0x7F800000u | (m << 13); // inf / NaN
+    } else {
+        u = (s << 31) | ((e - 15 + 127) << 23) | (m << 13);
+    }
+    float f;
+    std::memcpy(&f, &u, sizeof(f));
+    return f;
 }
 
 struct Operand {
@@ -95,14 +133,19 @@ int main(int argc, char** argv)
 
     G::Inputs in = G::GenerateInputs();
     G::Golden gold = G::BuildGolden(in);
-    const std::vector<int8_t>& want = gold.yI8;
+    const std::vector<uint16_t>& want = gold.yF16;
 
     long long goldNonZero = 0;
     for (size_t i = 0; i < want.size(); ++i) {
         goldNonZero += (want[i] != 0) ? 1 : 0;
     }
-    printf("golden: acc1_range=[%d,%d] mid_range=[%d,%d] acc2_range=[%d,%d] y_range=[%d,%d]\n", gold.acc1Min,
-           gold.acc1Max, gold.midMin, gold.midMax, gold.acc2Min, gold.acc2Max, gold.yI8Min, gold.yI8Max);
+    printf("golden: acc1_range=[%d,%d] mid_range=[%d,%d] acc2_range=[%d,%d] y_range=[%.4g,%.4g]\n", gold.acc1Min,
+           gold.acc1Max, gold.midMin, gold.midMax, gold.acc2Min, gold.acc2Max, (double)gold.yF16Min,
+           (double)gold.yF16Max);
+    // 哨兵必须不可能是真结果，否则 unwritten 那一条判据是假的。
+    for (size_t i = 0; i < want.size(); ++i) {
+        CHECK(want[i] != Y_SENTINEL, "golden 里出现了哨兵位模式 0x%04X @ %zu —— 换一个哨兵", Y_SENTINEL, i);
+    }
     printf("golden: nonzero=%lld/%zu ties=%lld sat=%lld\n\n", goldNonZero, want.size(), gold.ties1 + gold.ties2,
            gold.sat1 + gold.sat2);
     CHECK(goldNonZero > 0, "golden 全是 0 —— 先别看设备");
@@ -112,7 +155,7 @@ int main(int argc, char** argv)
         s1[i] = PackScaleEntry(gold.scale1[i]);
     }
     for (int i = 0; i < G::COUT2; ++i) {
-        s2[i] = PackScaleEntry(gold.scale2[i]);
+        s2[i] = PackDeqF16Entry(gold.scale2[i]);
     }
 
     auto ret = aclInit(nullptr);
@@ -123,7 +166,7 @@ int main(int argc, char** argv)
     ret = aclrtCreateStream(&stream);
     CHECK(ret == ACL_SUCCESS, "aclrtCreateStream = %d", ret);
 
-    std::vector<int8_t> ySentinel(G::Y_ELEMS, Y_SENTINEL);
+    std::vector<uint16_t> ySentinel(G::Y_ELEMS, Y_SENTINEL);
 
     // ABI 顺序钉死：x, filter1, bias1, scale1, filter2, bias2, scale2 -> y
     Operand op[8];
@@ -135,7 +178,9 @@ int main(int argc, char** argv)
     if (MakeOperand(in.w2Dev.data(), in.w2Dev.size(), {G::COUT2, G::K2}, ACL_INT8, &op[4])) return 1;
     if (MakeOperand(in.b2.data(), in.b2.size() * 4, {G::COUT2}, ACL_INT32, &op[5])) return 1;
     if (MakeOperand(s2.data(), s2.size() * 8, {G::COUT2}, ACL_UINT64, &op[6])) return 1;
-    if (MakeOperand(ySentinel.data(), ySentinel.size(), {(int64_t)G::M_ROWS, G::COUT2}, ACL_INT8, &op[7])) return 1;
+    if (MakeOperand(ySentinel.data(), ySentinel.size() * sizeof(uint16_t), {(int64_t)G::M_ROWS, G::COUT2},
+                    ACL_FLOAT16, &op[7]))
+        return 1;
 
     aclTensorDesc* inDesc[7] = {op[0].desc, op[1].desc, op[2].desc, op[3].desc, op[4].desc, op[5].desc, op[6].desc};
     aclDataBuffer* inBuf[7] = {op[0].buf, op[1].buf, op[2].buf, op[3].buf, op[4].buf, op[5].buf, op[6].buf};
@@ -157,13 +202,14 @@ int main(int argc, char** argv)
     ret = aclrtSynchronizeStream(stream);
     CHECK(ret == ACL_SUCCESS, "aclrtSynchronizeStream = %d —— kernel 可能 abort 了，查 device 日志", ret);
 
-    std::vector<int8_t> got(G::Y_ELEMS, 0);
-    ret = aclrtMemcpy(got.data(), got.size(), op[7].dev, got.size(), ACL_MEMCPY_DEVICE_TO_HOST);
+    std::vector<uint16_t> got(G::Y_ELEMS, 0);
+    const size_t yBytes = got.size() * sizeof(uint16_t);
+    ret = aclrtMemcpy(got.data(), yBytes, op[7].dev, yBytes, ACL_MEMCPY_DEVICE_TO_HOST);
     CHECK(ret == ACL_SUCCESS, "aclrtMemcpy D2H = %d", ret);
 
     long long unwritten = 0, nonZero = 0, mismatches = 0, firstBad = -1;
     for (size_t i = 0; i < got.size(); ++i) {
-        if (got[i] == Y_SENTINEL && want[i] != Y_SENTINEL) {
+        if (got[i] == Y_SENTINEL) {
             unwritten++;
         }
         if (got[i] != 0) {
@@ -189,8 +235,10 @@ int main(int argc, char** argv)
                 offByOne++;
             }
         }
-        printf("first mismatch @ %lld: got %d, want %d (row %lld, cout %lld)；差 ±1 的 %lld / 共 %lld\n", firstBad,
-               (int)got[firstBad], (int)want[firstBad], firstBad / G::COUT2, firstBad % G::COUT2, offByOne, mismatches);
+        printf("first mismatch @ %lld: got %.6g (0x%04X), want %.6g (0x%04X) (row %lld, cout %lld)；"
+               "位模式差 ±1 的 %lld / 共 %lld\n",
+               firstBad, (double)F16ToFloat(got[firstBad]), got[firstBad], (double)F16ToFloat(want[firstBad]),
+               want[firstBad], firstBad / G::COUT2, firstBad % G::COUT2, offByOne, mismatches);
     }
 
     aclopDestroyAttr(attr);
@@ -215,6 +263,6 @@ int main(int argc, char** argv)
         printf("[FAIL] %lld 个元素数值不一致\n", mismatches);
         return 1;
     }
-    printf("[PASS] 516096 个输出全部写过，且与 CPU golden 逐位相等\n");
+    printf("[PASS] %zu 个输出全部写过，且与 CPU golden 逐位相等\n", got.size());
     return 0;
 }

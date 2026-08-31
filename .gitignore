@@ -1,0 +1,8 @@
+# 构建产物
+gen_case
+golden_selfcheck
+test_aclop_fused_conv2d
+test_aclop_fused_conv2d.aarch64
+fused_conv2d_case.bin
+om_out/
+prof_out/

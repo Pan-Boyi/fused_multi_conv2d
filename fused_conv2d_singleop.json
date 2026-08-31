@@ -2,16 +2,16 @@
   {
     "op": "FusedConv2d",
     "input_desc": [
-      {"format": "ND", "shape": [64512, 32], "type": "int8"},
-      {"format": "ND", "shape": [64, 576], "type": "int8"},
+      {"format": "ND", "shape": [32256, 32], "type": "int8"},
+      {"format": "ND", "shape": [64, 288], "type": "int8"},
       {"format": "ND", "shape": [64], "type": "int32"},
       {"format": "ND", "shape": [64], "type": "uint64"},
-      {"format": "ND", "shape": [64, 576], "type": "int8"},
-      {"format": "ND", "shape": [64], "type": "int32"},
-      {"format": "ND", "shape": [64], "type": "uint64"}
+      {"format": "ND", "shape": [96, 576], "type": "int8"},
+      {"format": "ND", "shape": [96], "type": "int32"},
+      {"format": "ND", "shape": [96], "type": "uint64"}
     ],
     "output_desc": [
-      {"format": "ND", "shape": [8064, 64], "type": "float16"}
+      {"format": "ND", "shape": [8064, 96], "type": "float16"}
     ]
   }
 ]
