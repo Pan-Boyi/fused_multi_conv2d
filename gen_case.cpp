@@ -59,6 +59,7 @@ namespace {
 constexpr uint32_t ACL_DT_INT8 = 2;
 constexpr uint32_t ACL_DT_INT32 = 3;
 constexpr uint32_t ACL_DT_UINT64 = 10;
+constexpr uint32_t ACL_DT_FLOAT16 = 1;   // y 改成 fp16 之后用这个
 
 // VREQ8 deq 表项打包。和 test_aclop_fused_conv2d.cpp 里的那份必须一模一样。
 // bit[46] 不会从输出 dtype 推断 —— 忘了置 1 算子照样跑完，给出一串合理的无符号字节。
@@ -113,15 +114,17 @@ int main(int argc, char** argv)
 
     G::Inputs in = G::GenerateInputs();
     G::Golden gold = G::BuildGolden(in);
-    const std::vector<int8_t>& want = gold.yI8;
+    // CHANGED：y 走 VDEQF16，输出是 fp16 的位模式。
+    const std::vector<uint16_t>& want = gold.yF16;
 
     long long goldNonZero = 0;
     for (size_t i = 0; i < want.size(); ++i) {
         goldNonZero += (want[i] != 0) ? 1 : 0;
     }
 
-    std::printf("golden: acc1_range=[%d,%d] mid_range=[%d,%d] acc2_range=[%d,%d] y_range=[%d,%d]\n", gold.acc1Min,
-                gold.acc1Max, gold.midMin, gold.midMax, gold.acc2Min, gold.acc2Max, gold.yI8Min, gold.yI8Max);
+    std::printf("golden: acc1_range=[%d,%d] mid_range=[%d,%d] acc2_range=[%d,%d] y_range=[%.4g,%.4g]\n",
+                gold.acc1Min, gold.acc1Max, gold.midMin, gold.midMax, gold.acc2Min, gold.acc2Max,
+                (double)gold.yF16Min, (double)gold.yF16Max);
     std::printf("golden: nonzero=%lld/%zu ties=%lld sat=%lld\n", goldNonZero, want.size(), gold.ties1 + gold.ties2,
                 gold.sat1 + gold.sat2);
     if (goldNonZero <= 0) {
@@ -173,8 +176,8 @@ int main(int argc, char** argv)
     ok = ok && WriteTensor(f, "filter2", ACL_DT_INT8, {G::COUT2, G::K2}, in.w2Dev.data(), in.w2Dev.size());
     ok = ok && WriteTensor(f, "bias2", ACL_DT_INT32, {G::COUT2}, in.b2.data(), in.b2.size() * 4);
     ok = ok && WriteTensor(f, "scale2", ACL_DT_UINT64, {G::COUT2}, s2.data(), s2.size() * 8);
-    ok = ok && WriteTensor(f, "y_expect", ACL_DT_INT8, {static_cast<int64_t>(G::M_ROWS), G::COUT2}, want.data(),
-                           want.size());
+    ok = ok && WriteTensor(f, "y_expect", ACL_DT_FLOAT16, {static_cast<int64_t>(G::M_ROWS), G::COUT2},
+                           want.data(), want.size() * 2);
 
     const bool closed = (std::fclose(f) == 0);
     if (!ok || !closed) {

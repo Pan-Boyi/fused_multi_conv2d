@@ -51,10 +51,15 @@ ACL_MEMCPY_DEVICE_TO_HOST = 2
 ACL_MEM_MALLOC_HUGE_FIRST = 0
 ACL_FORMAT_ND = 2
 
-DTYPE_NAME = {2: "int8", 3: "int32", 10: "uint64"}
-DTYPE_SIZE = {2: 1, 3: 4, 10: 8}
+DTYPE_NAME = {1: "float16", 2: "int8", 3: "int32", 10: "uint64"}
+DTYPE_SIZE = {1: 2, 2: 1, 3: 4, 10: 8}
 
-Y_SENTINEL = 127
+# y 改成 fp16（fixpipe 走 VDEQF16）之后，哨兵按字节填 0x7F，两字节拼起来是
+# 0x7F7F —— 一个 fp16 NaN（阶码全 1、尾数非零）。golden 永远算不出 NaN，所以
+# 「有没有被写过」这个判据不需要再论证合法输出取不到哨兵值。
+Y_SENTINEL_BYTE = 0x7F
+Y_SENTINEL_U16 = 0x7F7F
+Y_ELEM_BYTES = 2
 
 HDR_FMT = "<8sIIQQQQQ"          # magic, version, ntensors, nonzero, ties, sat, y_elems, reserved
 HDR_LEN = struct.calcsize(HDR_FMT)
@@ -214,28 +219,34 @@ def report_times(durs):
           % ("冷启动开销≈", durs[0] - warm, durs[0], warm))
 
 
-def as_i8(b):
-    """.bin 和 memcpy 回来的都是无符号字节；判据全按 int8 解释。"""
-    return b - 256 if b > 127 else b
+def decode_f16(buf):
+    """字节串 -> (值列表 float, 位模式列表 uint16)。
+
+    值用来算相对误差，位模式用来做逐位比较和哨兵判定 —— 两者缺一不可：
+    NaN != NaN，只看值会把「没写过」误判成「写错了」。
+    struct 的 'e' 就是 IEEE754 binary16，Python 3.6 起自带。
+    """
+    n = len(buf) // Y_ELEM_BYTES
+    return list(struct.unpack("<%de" % n, buf)), list(struct.unpack("<%dH" % n, buf))
 
 
 def evaluate(got, want, rel_tol):
     """一趟扫完所有判据。返回 dict。
 
     三个"写没写对"的判据，各挡一类失败，缺一不可：
-      unwritten  kernel 一个字节都没写（哨兵 127 还在）
+      unwritten  kernel 一个字节都没写（哨兵 0x7F7F 还在）
       nonzero    kernel 只写了一部分（前一半对、后一半空白）
       mismatches 数值错
 
     外加精度判据：逐元素相对误差 <= rel_tol 的比例。
       golden 非 0: |got-want| / |want|
-      golden 为 0: 退化成绝对误差 |got-want|（int8 下即要求 got 也为 0）
+      golden 为 0: 退化成绝对误差 |got-want|（即要求 got 也为 0）
     """
-    n = len(got)
+    n = len(got[1])   # got / want 都是 (值, 位模式) 二元组
     buckets = ["=0", "(0,1e-3]", "(1e-3,1e-2]", "(1e-2,1e-1]", "(1e-1,1]", ">1", "inf(golden=0)"]
     r = {
         "n": n,
-        "nonzero": n - got.count(0),
+        "nonzero": sum(1 for x in got[0] if x != 0.0),
         "unwritten": 0,
         "mismatches": 0,
         "first_bad": -1,
@@ -246,27 +257,31 @@ def evaluate(got, want, rel_tol):
         "zero_golden": 0,
         "hist": dict.fromkeys(buckets, 0),
     }
-    if got == want:
-        # 完全一致：不用逐元素算，相对误差全是 0
+    gv, gb = got
+    wv, wb = want
+    if gb == wb:
+        # 逐位一致：相对误差全是 0
         r["hist"]["=0"] = n
-        r["zero_golden"] = want.count(0)
+        r["zero_golden"] = sum(1 for x in wv if x == 0.0)
         return r
 
     zero_golden = 0
     prec_ok = 0
-    for i, (g8, w8) in enumerate(zip(got, want)):
-        g, w = as_i8(g8), as_i8(w8)
-        if g8 == Y_SENTINEL and w8 != Y_SENTINEL:
+    for i in range(n):
+        g, w = gv[i], wv[i]
+        g8, w8 = gb[i], wb[i]
+        if g8 == Y_SENTINEL_U16 and w8 != Y_SENTINEL_U16:
             r["unwritten"] += 1
         if g8 != w8:
             if r["first_bad"] < 0:
                 r["first_bad"] = i
             r["mismatches"] += 1
-            if abs(g - w) == 1:
+            # fp16 上「差 1」就是差 1 个 ULP（同号有限值的位模式相邻）。
+            if abs(g8 - w8) == 1:
                 r["off_by_one"] += 1
-        if w == 0:
+        if w == 0.0:
             zero_golden += 1
-            err = 0.0 if g == 0 else float("inf")
+            err = 0.0 if g == 0.0 else float("inf")
         else:
             err = abs(g - w) / float(abs(w))
         if err <= rel_tol:
@@ -353,9 +368,11 @@ def main():
             die("%s 既不是文件也不是目录" % om_arg)
 
     tensors, gold_nonzero, ties, sat, y_elems = load_case(case_path)
-    want = tensors["y_expect"][2]
-    if len(want) != y_elems:
-        die("golden 输出 %d 字节，头里写的是 %d" % (len(want), y_elems))
+    want_raw = tensors["y_expect"][2]
+    if len(want_raw) != y_elems * Y_ELEM_BYTES:
+        die("golden 输出 %d 字节，按 %d 个 fp16 元素应为 %d"
+            % (len(want_raw), y_elems, y_elems * Y_ELEM_BYTES))
+    want = decode_f16(want_raw)
     print("case 文件 OK：")
     for name in ORDER + ["y_expect"]:
         dtype, dims, data = tensors[name]
@@ -433,7 +450,7 @@ def main():
     # 输出缓冲预填哨兵 127：kernel 一个字节都没写的话，读回来还是 127，
     # 这是"返回码 0 但什么都没算"唯一能被抓住的地方。
     y_dtype, y_dims, _ = tensors["y_expect"]
-    make_operand(y_dtype, y_dims, bytes([Y_SENTINEL]) * y_elems)
+    make_operand(y_dtype, y_dims, bytes([Y_SENTINEL_BYTE]) * (y_elems * Y_ELEM_BYTES))
 
     in_desc = (ctypes.c_void_p * 7)(*descs[:7])
     in_buf = (ctypes.c_void_p * 7)(*bufs[:7])
@@ -473,10 +490,11 @@ def main():
         print("\n[耗时] host 侧墙钟，含下发和同步；设备侧以 msprof 为准")
         report_times(durs)
 
-    out = ctypes.create_string_buffer(y_elems)
-    check(acl.aclrtMemcpy(ctypes.cast(out, ctypes.c_void_p), y_elems, dev_ptrs[7], y_elems,
+    y_bytes = y_elems * Y_ELEM_BYTES
+    out = ctypes.create_string_buffer(y_bytes)
+    check(acl.aclrtMemcpy(ctypes.cast(out, ctypes.c_void_p), y_bytes, dev_ptrs[7], y_bytes,
                           ACL_MEMCPY_DEVICE_TO_HOST), "aclrtMemcpy D2H = %d")
-    got = out.raw[:y_elems]
+    got = decode_f16(out.raw[:y_bytes])
 
     # ------------------------------------------------------------ 比对
     r = evaluate(got, want, rel_tol)
@@ -489,8 +507,9 @@ def main():
     cout2 = y_dims[1]
     if mismatches:
         fb = r["first_bad"]
-        print("first mismatch @ %d: got %d, want %d (row %d, cout %d)；差 ±1 的 %d / 共 %d"
-              % (fb, as_i8(got[fb]), as_i8(want[fb]), fb // cout2, fb % cout2,
+        print("first mismatch @ %d: got %.6g (0x%04x), want %.6g (0x%04x) (row %d, cout %d)"
+              "；差 1 个 ULP 的 %d / 共 %d"
+              % (fb, got[0][fb], got[1][fb], want[0][fb], want[1][fb], fb // cout2, fb % cout2,
                  r["off_by_one"], mismatches))
 
     # ------------------------------------------------------------ 精度
@@ -499,9 +518,9 @@ def main():
     mr = r["max_rel"]
     if r["max_rel_idx"] >= 0:
         mi = r["max_rel_idx"]
-        print("       最大相对误差 %s @ %d (row %d, cout %d): got %d, want %d"
+        print("       最大相对误差 %s @ %d (row %d, cout %d): got %.6g, want %.6g"
               % ("inf" if mr == float("inf") else "%.6e" % mr, mi, mi // cout2, mi % cout2,
-                 as_i8(got[mi]), as_i8(want[mi])))
+                 got[0][mi], want[0][mi]))
     else:
         print("       最大相对误差 0")
     print("       golden 为 0 的 %d 个元素按绝对误差判" % r["zero_golden"])
