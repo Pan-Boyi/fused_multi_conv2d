@@ -57,7 +57,7 @@ $CXX_HOST $CXXFLAGS "$HERE/gen_case.cpp" -o "$HERE/gen_case" -I"$HERE"
 [ -f "$HERE/fused_conv2d_case.bin" ] || die "gen_case 说成功了但没产出 .bin？"
 
 SZ=$(wc -c < "$HERE/fused_conv2d_case.bin" | tr -d " \t")   # macOS 的 wc 会补前导空格
-[ "$SZ" = 2656696 ] || echo "  [!] .bin 是 $SZ 字节，预期 2656696 —— 形状变了？"
+[ "$SZ" = 3688956 ] || echo "  [!] .bin 是 $SZ 字节，预期 3688956 —— 形状变了？"
 
 step "4) 拷过去"
 echo "  文件: $HERE/fused_conv2d_case.bin  ($SZ 字节)"

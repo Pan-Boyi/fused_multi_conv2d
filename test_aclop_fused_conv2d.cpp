@@ -56,7 +56,7 @@ namespace {
 // y 是 fp16，哨兵取 0x7F7F（一个 fp16 NaN 位模式，golden 里不可能出现）。
 constexpr uint16_t Y_SENTINEL = 0x7F7Fu;
 
-// VREQ8 重量化表项打包 —— 这是 scale1。位域说明见步骤文档「附:算子的输入约定」。
+// VREQ8 deq 表项打包。位域说明见 test_aclnn_fused_conv2d.cpp / 步骤文档。
 // bit[46] 不会从输出 dtype 推断 —— 忘了置 1 算子照样跑完，给出一串合理的无符号字节。
 uint64_t PackScaleEntry(float scale, int offset = 0)
 {
@@ -135,19 +135,20 @@ int main(int argc, char** argv)
     G::Golden gold = G::BuildGolden(in);
     const std::vector<uint16_t>& want = gold.yF16;
 
+    // 忽略符号位:fixpipe 的 relu 对负数输出 -0（0x8000），数值上就是 0。
     long long goldNonZero = 0;
     for (size_t i = 0; i < want.size(); ++i) {
-        goldNonZero += (want[i] != 0) ? 1 : 0;
+        goldNonZero += ((want[i] & 0x7FFFu) != 0) ? 1 : 0;
     }
     printf("golden: acc1_range=[%d,%d] mid_range=[%d,%d] acc2_range=[%d,%d] y_range=[%.4g,%.4g]\n", gold.acc1Min,
-           gold.acc1Max, gold.midMin, gold.midMax, gold.acc2Min, gold.acc2Max, (double)gold.yF16Min,
-           (double)gold.yF16Max);
+           gold.acc1Max, gold.midMin, gold.midMax, gold.acc2Min, gold.acc2Max, (double)gold.yMin,
+           (double)gold.yMax);
     // 哨兵必须不可能是真结果，否则 unwritten 那一条判据是假的。
     for (size_t i = 0; i < want.size(); ++i) {
         CHECK(want[i] != Y_SENTINEL, "golden 里出现了哨兵位模式 0x%04X @ %zu —— 换一个哨兵", Y_SENTINEL, i);
     }
-    printf("golden: nonzero=%lld/%zu ties=%lld sat=%lld\n\n", goldNonZero, want.size(), gold.ties1 + gold.ties2,
-           gold.sat1 + gold.sat2);
+    printf("golden: nonzero=%lld/%zu ties=%lld sat=%lld\n\n", goldNonZero, want.size(), gold.tiesQ + gold.ties1,
+           gold.satQ + gold.sat1);
     CHECK(goldNonZero > 0, "golden 全是 0 —— 先别看设备");
 
     std::vector<uint64_t> s1(G::COUT1), s2(G::COUT2);
@@ -169,29 +170,37 @@ int main(int argc, char** argv)
     std::vector<uint16_t> ySentinel(G::Y_ELEMS, Y_SENTINEL);
 
     // ABI 顺序钉死：x, filter1, bias1, scale1, filter2, bias2, scale2 -> y
-    Operand op[8];
-    const int64_t xRows = (int64_t)G::C1 * G::HI * G::WI;
-    if (MakeOperand(in.xDev.data(), in.xDev.size(), {xRows, G::C0}, ACL_INT8, &op[0])) return 1;
-    if (MakeOperand(in.w1Dev.data(), in.w1Dev.size(), {G::COUT1, G::K1}, ACL_INT8, &op[1])) return 1;
-    if (MakeOperand(in.b1.data(), in.b1.size() * 4, {G::COUT1}, ACL_INT32, &op[2])) return 1;
-    if (MakeOperand(s1.data(), s1.size() * 8, {G::COUT1}, ACL_UINT64, &op[3])) return 1;
-    if (MakeOperand(in.w2Dev.data(), in.w2Dev.size(), {G::COUT2, G::K2}, ACL_INT8, &op[4])) return 1;
-    if (MakeOperand(in.b2.data(), in.b2.size() * 4, {G::COUT2}, ACL_INT32, &op[5])) return 1;
-    if (MakeOperand(s2.data(), s2.size() * 8, {G::COUT2}, ACL_UINT64, &op[6])) return 1;
-    if (MakeOperand(ySentinel.data(), ySentinel.size() * sizeof(uint16_t), {(int64_t)G::M_ROWS, G::COUT2},
-                    ACL_FLOAT16, &op[7]))
+    Operand op[9];
+    // ABI 顺序:x, scale_x, filter1, bias1, scale1, filter2, bias2, scale2 -> y
+    // x / y 是 4 维 NCHW，两个 filter 是 FRACTAL_Z 的 4 个维度摊开。
+    const int64_t fz1k = (G::CI / G::C0) * G::KH * G::KW;    // 9
+    const int64_t fz1n = G::COUT1 / 16;                      // 4
+    const int64_t fz2k = (G::COUT1 / G::C0) * G::KH * G::KW; // 18
+    const int64_t fz2n = G::COUT2 / 16;                      // 6
+    if (MakeOperand(in.xNchw.data(), in.xNchw.size() * 2, {1, G::CI, G::HI, G::WI}, ACL_FLOAT16, &op[0])) return 1;
+    if (MakeOperand(&in.qScaleF32, sizeof(float), {1}, ACL_FLOAT, &op[1])) return 1;
+    if (MakeOperand(in.w1Dev.data(), in.w1Dev.size(), {fz1k, fz1n, 16, G::C0}, ACL_INT8, &op[2])) return 1;
+    if (MakeOperand(in.b1.data(), in.b1.size() * 4, {G::COUT1}, ACL_INT32, &op[3])) return 1;
+    if (MakeOperand(s1.data(), s1.size() * 8, {G::COUT1}, ACL_UINT64, &op[4])) return 1;
+    if (MakeOperand(in.w2Dev.data(), in.w2Dev.size(), {fz2k, fz2n, 16, G::C0}, ACL_INT8, &op[5])) return 1;
+    if (MakeOperand(in.b2.data(), in.b2.size() * 4, {G::COUT2}, ACL_INT32, &op[6])) return 1;
+    if (MakeOperand(s2.data(), s2.size() * 8, {G::COUT2}, ACL_UINT64, &op[7])) return 1;
+    if (MakeOperand(ySentinel.data(), ySentinel.size() * sizeof(uint16_t), {1, G::COUT2, G::HO2, G::WO2},
+                    ACL_FLOAT16, &op[8]))
         return 1;
 
-    aclTensorDesc* inDesc[7] = {op[0].desc, op[1].desc, op[2].desc, op[3].desc, op[4].desc, op[5].desc, op[6].desc};
-    aclDataBuffer* inBuf[7] = {op[0].buf, op[1].buf, op[2].buf, op[3].buf, op[4].buf, op[5].buf, op[6].buf};
-    aclTensorDesc* outDesc[1] = {op[7].desc};
-    aclDataBuffer* outBuf[1] = {op[7].buf};
+    aclTensorDesc* inDesc[8] = {op[0].desc, op[1].desc, op[2].desc, op[3].desc,
+                                op[4].desc, op[5].desc, op[6].desc, op[7].desc};
+    aclDataBuffer* inBuf[8] = {op[0].buf, op[1].buf, op[2].buf, op[3].buf,
+                               op[4].buf, op[5].buf, op[6].buf, op[7].buf};
+    aclTensorDesc* outDesc[1] = {op[8].desc};
+    aclDataBuffer* outBuf[1] = {op[8].buf};
 
     // 本算子没有属性。文档说 attr 可以传 nullptr，但传一个空的 attr 更保险：
     // 有些版本按 attr 指针参与 kernel 选择的哈希。
     aclopAttr* attr = aclopCreateAttr();
 
-    ret = aclopExecuteV2(opType.c_str(), 7, inDesc, inBuf, 1, outDesc, outBuf, attr, stream);
+    ret = aclopExecuteV2(opType.c_str(), 8, inDesc, inBuf, 1, outDesc, outBuf, attr, stream);
     CHECK(ret == ACL_SUCCESS,
           "aclopExecuteV2(\"%s\") = %d\n"
           "        算子没找到 -> 类型名拼错，或者包里根本没这个 op\n"
@@ -242,7 +251,7 @@ int main(int argc, char** argv)
     }
 
     aclopDestroyAttr(attr);
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < 9; ++i) {
         aclDestroyDataBuffer(op[i].buf);
         aclDestroyTensorDesc(op[i].desc);
         aclrtFree(op[i].dev);
