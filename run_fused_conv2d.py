@@ -51,8 +51,8 @@ ACL_MEMCPY_DEVICE_TO_HOST = 2
 ACL_MEM_MALLOC_HUGE_FIRST = 0
 ACL_FORMAT_ND = 2
 
-DTYPE_NAME = {1: "float16", 2: "int8", 3: "int32", 10: "uint64"}
-DTYPE_SIZE = {1: 2, 2: 1, 3: 4, 10: 8}
+DTYPE_NAME = {0: "float32", 1: "float16", 2: "int8", 3: "int32", 10: "uint64"}
+DTYPE_SIZE = {0: 4, 1: 2, 2: 1, 3: 4, 10: 8}
 
 # y 改成 fp16（fixpipe 走 VDEQF16）之后，哨兵按字节填 0x7F，两字节拼起来是
 # 0x7F7F —— 一个 fp16 NaN（阶码全 1、尾数非零）。golden 永远算不出 NaN，所以
@@ -66,7 +66,7 @@ HDR_LEN = struct.calcsize(HDR_FMT)
 REC_FMT = "<16sII4qQ"           # name, dtype, ndim, dims[4], nbytes
 REC_LEN = struct.calcsize(REC_FMT)
 
-ORDER = ["x", "filter1", "bias1", "scale1", "filter2", "bias2", "scale2"]
+ORDER = ["x", "scale_x", "filter1", "bias1", "scale1", "filter2", "bias2", "scale2"]
 
 
 # ACL 把失败的细节（AI Core 异常、哪条 task、PC）攒在一个进程级的字符串里，
@@ -442,7 +442,9 @@ def main():
         descs.append(desc)
         bufs.append(buf)
 
-    # ABI 顺序钉死：x, filter1, bias1, scale1, filter2, bias2, scale2 -> y
+    # ABI 顺序钉死，和 op_host/fused_conv2d_def.cpp 的 Input() 调用顺序一一对应：
+    #   x, scale_x, filter1, bias1, scale1, filter2, bias2, scale2 -> y
+    # 少传一个 ACL 不一定报错，它可能把后面的实参往前挪，于是 filter1 被当成 scale_x。
     for name in ORDER:
         dtype, dims, data = tensors[name]
         make_operand(dtype, dims, data)
@@ -452,16 +454,17 @@ def main():
     y_dtype, y_dims, _ = tensors["y_expect"]
     make_operand(y_dtype, y_dims, bytes([Y_SENTINEL_BYTE]) * (y_elems * Y_ELEM_BYTES))
 
-    in_desc = (ctypes.c_void_p * 7)(*descs[:7])
-    in_buf = (ctypes.c_void_p * 7)(*bufs[:7])
-    out_desc = (ctypes.c_void_p * 1)(descs[7])
-    out_buf = (ctypes.c_void_p * 1)(bufs[7])
+    NIN = len(ORDER)
+    in_desc = (ctypes.c_void_p * NIN)(*descs[:NIN])
+    in_buf = (ctypes.c_void_p * NIN)(*bufs[:NIN])
+    out_desc = (ctypes.c_void_p * 1)(descs[NIN])
+    out_buf = (ctypes.c_void_p * 1)(bufs[NIN])
 
     # 本算子没有属性。传空 attr 而不是 null：有些版本按 attr 指针参与 kernel 选择的哈希。
     attr = acl.aclopCreateAttr()
 
     def launch():
-        return acl.aclopExecuteV2(op_type.encode(), 7, in_desc, in_buf,
+        return acl.aclopExecuteV2(op_type.encode(), NIN, in_desc, in_buf,
                                   1, out_desc, out_buf, attr, stream)
 
     # 总共下发 warmup + repeat 次；只有后 repeat 次计入统计。
@@ -492,7 +495,7 @@ def main():
 
     y_bytes = y_elems * Y_ELEM_BYTES
     out = ctypes.create_string_buffer(y_bytes)
-    check(acl.aclrtMemcpy(ctypes.cast(out, ctypes.c_void_p), y_bytes, dev_ptrs[7], y_bytes,
+    check(acl.aclrtMemcpy(ctypes.cast(out, ctypes.c_void_p), y_bytes, dev_ptrs[NIN], y_bytes,   # NIN 号才是输出，别写死
                           ACL_MEMCPY_DEVICE_TO_HOST), "aclrtMemcpy D2H = %d")
     got = decode_f16(out.raw[:y_bytes])
 
@@ -543,7 +546,7 @@ def main():
     print("           以 mismatches == 0 为准；只达标不逐位相等会报 [PASS*]。")
 
     acl.aclopDestroyAttr(attr)
-    for i in range(8):
+    for i in range(NIN + 1):
         acl.aclDestroyDataBuffer(bufs[i])
         acl.aclDestroyTensorDesc(descs[i])
         acl.aclrtFree(dev_ptrs[i])
