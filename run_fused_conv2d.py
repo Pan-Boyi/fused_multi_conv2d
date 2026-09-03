@@ -61,12 +61,17 @@ Y_SENTINEL_BYTE = 0x7F
 Y_SENTINEL_U16 = 0x7F7F
 Y_ELEM_BYTES = 2
 
-HDR_FMT = "<8sIIQQQQQ"          # magic, version, ntensors, nonzero, ties, sat, y_elems, reserved
+HDR_FMT = "<8sIIQQQQQ"          # magic, version, ntensors, nonzero, ties, sat, y_elems, attrs
+# attrs 的低 8 位是 fixed_shift1，次 8 位是 fixed_shift2。放在文件里而不是脚本
+# 里写死，是因为它由 golden 按数据算出来，主机和设备必须用同一个值。
 HDR_LEN = struct.calcsize(HDR_FMT)
 REC_FMT = "<16sII4qQ"           # name, dtype, ndim, dims[4], nbytes
 REC_LEN = struct.calcsize(REC_FMT)
 
-ORDER = ["x", "scale_x", "filter1", "bias1", "scale1", "filter2", "bias2", "scale2"]
+ORDER = ["x", "filter1", "bias1", "filter2", "bias2"]
+# 两个 golden：y_expect 是定点模型（假设成立时应逐位相等），y_exact 是纯 fp32
+# 参考（判「有没有在算这个卷积」，不受定点假设影响）。见 golden.h 顶部那段。
+GOLDENS = ["y_expect", "y_exact"]
 
 
 # ACL 把失败的细节（AI Core 异常、哪条 task、PC）攒在一个进程级的字符串里，
@@ -104,11 +109,11 @@ def load_case(path):
     if len(blob) < HDR_LEN:
         die("%s 只有 %d 字节，文件不完整（传输中断？）" % (path, len(blob)))
 
-    magic, version, ntensors, nonzero, ties, sat, y_elems, _ = struct.unpack_from(HDR_FMT, blob, 0)
+    magic, version, ntensors, nonzero, ties, sat, y_elems, attrs = struct.unpack_from(HDR_FMT, blob, 0)
     if magic != b"FC2DCASE":
         die("%s 不是 case 文件（magic = %r）" % (path, magic))
-    if version != 1:
-        die("case 文件版本 %d，本脚本只认 1 —— gen_case 和 run_fused_conv2d.py 得配套" % version)
+    if version != 2:
+        die("case 文件版本 %d，本脚本只认 2 —— gen_case 和 run_fused_conv2d.py 得配套。\n        版本 1 是上一版的量化接口（8 输入），这一版是定点接口（5 输入 + 2 属性）。" % version)
 
     tensors, off = {}, HDR_LEN
     for i in range(ntensors):
@@ -136,11 +141,15 @@ def load_case(path):
             die("张量 %s: dims=%s dtype=%s 应为 %d 字节，实际 %d"
                 % (name, dims, DTYPE_NAME[dtype], want, len(data)))
 
-    for name in ORDER + ["y_expect"]:
+    for name in ORDER + GOLDENS:
         if name not in tensors:
             die("case 文件里缺张量 %s" % name)
 
-    return tensors, nonzero, ties, sat, y_elems
+    shift1 = int(attrs & 0xFF)
+    shift2 = int((attrs >> 8) & 0xFF)
+    if not (0 <= shift1 <= 58 and 0 <= shift2 <= 58):
+        die("header 里的定点定标 %d / %d 超出 [0,58] —— case 文件版本对不上？" % (shift1, shift2))
+    return tensors, nonzero, ties, sat, y_elems, shift1, shift2
 
 
 # ---------------------------------------------------------------- 绑 libascendcl
@@ -169,6 +178,7 @@ def load_acl():
         ("aclCreateDataBuffer", [c_vp, c_sz], c_vp),
         ("aclDestroyDataBuffer", [c_vp], c_i),
         ("aclopCreateAttr", [], c_vp),
+        ("aclopSetAttrInt", [c_vp, ctypes.c_char_p, ctypes.c_int64], ctypes.c_int),
         ("aclopDestroyAttr", [c_vp], None),
         ("aclopExecuteV2", [c_cp, c_i, ctypes.POINTER(c_vp), ctypes.POINTER(c_vp),
                             c_i, ctypes.POINTER(c_vp), ctypes.POINTER(c_vp), c_vp, c_vp], c_i),
@@ -367,16 +377,18 @@ def main():
         else:
             die("%s 既不是文件也不是目录" % om_arg)
 
-    tensors, gold_nonzero, ties, sat, y_elems = load_case(case_path)
+    tensors, gold_nonzero, ties, sat, y_elems, shift1, shift2 = load_case(case_path)
     want_raw = tensors["y_expect"][2]
     if len(want_raw) != y_elems * Y_ELEM_BYTES:
         die("golden 输出 %d 字节，按 %d 个 fp16 元素应为 %d"
             % (len(want_raw), y_elems, y_elems * Y_ELEM_BYTES))
     want = decode_f16(want_raw)
     print("case 文件 OK：")
-    for name in ORDER + ["y_expect"]:
+    for name in ORDER + GOLDENS:
         dtype, dims, data = tensors[name]
         print("  %-9s %-6s %-16s %9d 字节" % (name, DTYPE_NAME[dtype], dims, len(data)))
+    print("定点定标（来自 header，将作为算子属性下发）: fixed_shift1=%d fixed_shift2=%d"
+          % (shift1, shift2))
     print("golden: nonzero=%d/%d ties=%d sat=%d" % (gold_nonzero, y_elems, ties, sat))
     if gold_nonzero == 0:
         die("golden 全是 0 —— 先别管设备")
@@ -460,8 +472,18 @@ def main():
     out_desc = (ctypes.c_void_p * 1)(descs[NIN])
     out_buf = (ctypes.c_void_p * 1)(bufs[NIN])
 
-    # 本算子没有属性。传空 attr 而不是 null：有些版本按 attr 指针参与 kernel 选择的哈希。
+    # 两个定点定标是**必需属性**。顺序和 fused_conv2d_def.cpp 里 Attr() 的调用
+    # 顺序一致（fixed_shift1 在前），tiling 侧按 GetInt(0)/GetInt(1) 取。
     attr = acl.aclopCreateAttr()
+    if not attr:
+        die("aclopCreateAttr 返回 null")
+    setattr_fn = getattr(acl, "aclopSetAttrInt", None)
+    if setattr_fn is None:
+        die("这个 CANN 的 libascendcl.so 里没有 aclopSetAttrInt —— 属性传不下去")
+    for nm, v in (("fixed_shift1", shift1), ("fixed_shift2", shift2)):
+        rc = setattr_fn(attr, nm.encode(), v)
+        if rc != ACL_SUCCESS:
+            die("aclopSetAttrInt(%s=%d) = %d" % (nm, v, rc))
 
     def launch():
         return acl.aclopExecuteV2(op_type.encode(), NIN, in_desc, in_buf,

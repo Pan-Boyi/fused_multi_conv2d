@@ -22,7 +22,7 @@ echo "  脚本目录 = $HERE"
 
 step "1) 检查所需文件"
 MISSING=0
-for f in fused_conv2d_int8_golden.h golden_selfcheck.cpp gen_case.cpp run_fused_conv2d.py; do
+for f in fused_conv2d_golden.h golden_selfcheck.cpp gen_case.cpp run_fused_conv2d.py; do
     if [ -f "$HERE/$f" ]; then
         printf '  %-32s %s 行\n' "$f" "$(wc -l < "$HERE/$f" 2>/dev/null)"
     else
@@ -32,8 +32,8 @@ for f in fused_conv2d_int8_golden.h golden_selfcheck.cpp gen_case.cpp run_fused_
 done
 [ "$MISSING" = 0 ] || die "上面标 ** 缺失 ** 的文件要和脚本放在同一个目录"
 
-grep -q "^int main()" "$HERE/fused_conv2d_int8_golden.h" \
-    || die "fused_conv2d_int8_golden.h 里找不到 main() —— 文件被截断了"
+grep -q "^} // namespace fc2d_golden" "$HERE/fused_conv2d_golden.h" \
+    || die "fused_conv2d_golden.h 没有闭合的命名空间 —— 文件被截断了"
 echo "  golden 头完整性 OK"
 
 # -ffp-contract=off: 有的架构上 gcc 默认允许把 a*b+c 融成 fmadd，结果和分开算不一样。
@@ -57,7 +57,7 @@ $CXX_HOST $CXXFLAGS "$HERE/gen_case.cpp" -o "$HERE/gen_case" -I"$HERE"
 [ -f "$HERE/fused_conv2d_case.bin" ] || die "gen_case 说成功了但没产出 .bin？"
 
 SZ=$(wc -c < "$HERE/fused_conv2d_case.bin" | tr -d " \t")   # macOS 的 wc 会补前导空格
-[ "$SZ" = 3688956 ] || echo "  [!] .bin 是 $SZ 字节，预期 3688956 —— 形状变了？"
+[ "$SZ" = 5309240 ] || echo "  [!] .bin 是 $SZ 字节，预期 5309240 —— 形状变了？"
 
 step "4) 拷过去"
 echo "  文件: $HERE/fused_conv2d_case.bin  ($SZ 字节)"
@@ -71,6 +71,9 @@ cat <<TIP
   cd ~/a5102_st
   source <CANN安装路径>/set_env.sh
   python3 run_fused_conv2d.py fused_conv2d_case.bin FusedConv2d 0
+
+  定点定标（fixed_shift1 / fixed_shift2）由 golden 按数据算出，打包在 .bin 的
+  header 里，脚本自己取来当算子属性下发 —— 不用手填，也不会主机设备两边不一致。
 
   传完先在两边各跑一次 md5sum 对一下，.bin 传坏了脚本会报"文件被截断"，
   但传成另一个完整文件它是看不出来的。

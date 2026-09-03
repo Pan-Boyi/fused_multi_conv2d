@@ -11,3 +11,7 @@ prof_out/
 onnx_block/*.onnx
 onnx_block/io/
 onnx_block/om_out/
+
+# python 缓存
+__pycache__/
+*.pyc
