@@ -244,6 +244,57 @@ def decode_f16(buf):
     return list(struct.unpack("<%de" % n, buf)), list(struct.unpack("<%dH" % n, buf))
 
 
+def report_ratio(got, want, n):
+    """got / want 的比值分布。这是判「定标错了」还是「算错了」的直接证据。
+
+    定点链里每一环的误差都是**乘性**的：任何一级的 shift 猜错，输出就整体差一个
+    2 的整数次幂。所以只要两边都非零，看 log2(got/want)：
+      集中在某个整数 k  -> 定标差 2^k，改 shift 就行，卷积本身是对的；
+      散开 / 大量反号   -> 不是定标问题（溢出饱和、或者真算错了）。
+    饱和的点要摘出去单独看 —— 它们的比值只反映饱和值，不反映定标。
+    """
+    import math
+    hist, sign_flip, sat_like, both_nz = {}, 0, 0, 0
+    for i in range(n):
+        g, w = got[0][i], want[0][i]
+        if g == 0.0 or w == 0.0:
+            continue
+        if g != g or w != w or abs(g) == float("inf"):
+            continue
+        both_nz += 1
+        if (g > 0) != (w > 0):
+            sign_flip += 1
+            continue
+        k = int(round(math.log(abs(g) / abs(w), 2)))
+        hist[k] = hist.get(k, 0) + 1
+    print("\n[比值] 两边都非零的 %d 个点，log2(got/want) 的分布" % both_nz)
+    if both_nz == 0:
+        print("       （没有可比的点）")
+        return
+    print("       符号相反 %d 个 (%.4f%%)" % (sign_flip, sign_flip * 100.0 / both_nz))
+    top = sorted(hist.items(), key=lambda kv: -kv[1])[:12]
+    for k, c in top:
+        print("         2^%-4d %9d  (%.4f%%)" % (k, c, c * 100.0 / both_nz))
+    if top and top[0][1] > both_nz * 0.5:
+        print("       => 有主峰 2^%d：定标整体差这么多，改 shift 即可，卷积是对的。" % top[0][0])
+    else:
+        print("       => 没有主峰：不是单纯的定标问题。")
+
+
+def dump_raw(path, raw, tag):
+    """把设备原始输出落盘，供离线分析。
+
+    上板一次很贵，而「到底哪一级错了」往往要拿原始数据反复试假设。存下来之后
+    所有分析都能在本地做，不用再占板子。
+    """
+    try:
+        with open(path, "wb") as f:
+            f.write(raw)
+        print("\n[dump] %s 已写入 %s (%d 字节)" % (tag, path, len(raw)))
+    except IOError as e:
+        print("\n[dump] 写 %s 失败: %s" % (path, e))
+
+
 def report_lsb(got, want, r, mismatches, cout2, shift2):
     """把偏差换算成累加器 LSB —— 这是分开两类失败的判据。
 
@@ -655,8 +706,15 @@ def main():
     print("           以 mismatches == 0 为准；只达标不逐位相等会报 [PASS*]。")
 
     report_lsb(got, want, r, mismatches, cout2, shift2)
+    report_ratio(got, want, r["n"])
     if "y_exact" in tensors:
         report_vs_exact(got, decode_f16(tensors["y_exact"][2]), r["n"])
+
+    # 设备原始输出落盘。默认就存 —— 上板一次太贵，别让分析反过来占板子。
+    dump_path = os.environ.get("FC2D_DUMP", "fused_conv2d_device_out.bin")
+    if dump_path and dump_path != "-":
+        dump_raw(dump_path, out.raw[:y_bytes], "设备输出 (fp16 NCHW [1,%d,%d,%d])"
+                 % (y_dims[1], y_dims[2], y_dims[3]))
 
     acl.aclopDestroyAttr(attr)
     for i in range(NIN + 1):
