@@ -295,6 +295,106 @@ def dump_raw(path, raw, tag):
         print("\n[dump] 写 %s 失败: %s" % (path, e))
 
 
+def probe_acc_scale(got, exact, n, shift2, cout2):
+    """在设备上把定标推出来，只打印结论 —— 原始数据传不出去。
+
+    已确证的那半：out = acc_int32 * 2^-F，F = 58 - S（fixpipe 的 DEQF16 分支只按
+    shift 现搭一个 2^-F 的 float，见 kernel_operator_fixpipe_impl.h:77）。
+    未知的那半：mmad 拿 fixShiftVal 干了什么，也就是 acc 相对真值的定标 2^E。
+
+    合起来 out = 真值 * 2^(E-F)，饱和阈值 |真值| * 2^E >= 2^31。两件事都可测：
+
+      (1) 比值。未饱和的点上 log2(|got| / |真值|) 应当是常数 E-F。有单一主峰就
+          说明整条链只差一个 2 的幂，改 shift 即可。
+      (2) 夹逼。饱和的点给出 E >= log2(2^31/|真值|)，未饱和的点给出 E < 同式。
+          两边一夹，E 就定到 1 位以内 —— 不依赖 (1) 的主峰是否干净。
+
+    真值取 y_exact（纯 fp32 参考）。它是 relu 之后的，所以只有正半边可观测；
+    负半边饱和会被 relu 抹成 0，看不见，这不影响结论。
+    """
+    import math
+    deq_exp = FIX_SHIFT_LEN - shift2
+    sat_out = math.ldexp(1.0, 31 - deq_exp)      # acc 顶到 2^31 时的输出值
+    print("\n[定标反推] F = 58 - %d = %d，累加器饱和对应的输出值 = %.6g" % (shift2, deq_exp, sat_out))
+
+    hist = {}
+    nsat = nz = flip = 0
+    sat_min_true = float("inf")     # 饱和点里最小的 |真值| -> E 的下界
+    unsat_max_true = 0.0            # 未饱和点里最大的 |真值| -> E 的上界
+    sat_idx = unsat_idx = -1
+    for i in range(n):
+        g, t = got[0][i], exact[0][i]
+        if t == 0.0 or g == 0.0:
+            continue
+        if g != g or t != t or abs(g) == float("inf"):
+            continue
+        nz += 1
+        if (g > 0) != (t > 0):
+            flip += 1
+        # 饱和判据要**精确**。acc 顶到 2^31-1 时输出是 sat_out*(1-2^-31)，fp16 舍成
+        # 恰好 sat_out；而未饱和的最大可能输出是它下面那个 fp16（sat_out 的 1 个 ULP
+        # 之下）。所以 >= sat_out 是干净的分界。留松一点（比如 0.999）会把边界附近
+        # 被 fp16 上舍的点误判成饱和，夹逼就会差 1 位 —— 合成数据上踩到过。
+        if abs(g) >= sat_out:
+            nsat += 1
+            if abs(t) < sat_min_true:
+                sat_min_true, sat_idx = abs(t), i
+        else:
+            if abs(t) > unsat_max_true:
+                unsat_max_true, unsat_idx = abs(t), i
+            k = int(round(math.log(abs(g) / abs(t), 2)))
+            hist[k] = hist.get(k, 0) + 1
+
+    print("       两边都非零 %d 个；其中疑似饱和 %d 个 (%.4f%%)；符号相反 %d 个 (%.4f%%)"
+          % (nz, nsat, nsat * 100.0 / max(nz, 1), flip, flip * 100.0 / max(nz, 1)))
+
+    tot = sum(hist.values())
+    print("       (1) 未饱和点上 log2(|got|/|真值|) 的分布，共 %d 个:" % tot)
+    for k, c in sorted(hist.items(), key=lambda kv: -kv[1])[:10]:
+        print("             2^%-4d %9d  (%.4f%%)   => E-F=%d, 即 E=%d" % (k, c, c * 100.0 / max(tot, 1), k, k + deq_exp))
+    if tot and max(hist.values()) > tot * 0.5:
+        kbest = max(hist, key=lambda k: hist[k])
+        print("           有主峰: E = %d。想让 out == 真值，需要 E-F = 0，" % (kbest + deq_exp))
+        print("           即把 F 从 %d 改成 %d，也就是属性 S 从 %d 改成 %d。"
+              % (deq_exp, kbest + deq_exp, shift2, FIX_SHIFT_LEN - (kbest + deq_exp)))
+    else:
+        print("           没有主峰 —— 不是单纯的定标问题（多半是上一层就错了）。")
+
+    print("       (2) 夹逼:")
+    lo = math.log(math.ldexp(1.0, 31) / sat_min_true, 2) if nsat and sat_min_true > 0 else None
+    hi = math.log(math.ldexp(1.0, 31) / unsat_max_true, 2) if unsat_max_true > 0 else None
+    if lo is not None:
+        print("             饱和点里最小真值 %.6g @ %d (row %d, cout %d)  =>  E >= %.2f"
+              % (sat_min_true, sat_idx, sat_idx // cout2, sat_idx % cout2, lo))
+    else:
+        print("             没有饱和点 —— 拿不到 E 的下界")
+    if hi is not None:
+        print("             未饱和点里最大真值 %.6g @ %d (row %d, cout %d)  =>  E <  %.2f"
+              % (unsat_max_true, unsat_idx, unsat_idx // cout2, unsat_idx % cout2, hi))
+    if lo is not None and hi is not None:
+        if lo < hi:
+            print("             => E 落在 [%.2f, %.2f)，取整 E = %d" % (lo, hi, int(math.ceil(lo))))
+        else:
+            print("             => 区间是空的（%.2f >= %.2f）：饱和与否不只由 |真值| 决定，" % (lo, hi))
+            print("                说明上一层（conv1）就已经错了，不是 conv2 单级定标的问题。")
+
+
+def print_sample(got, want, exact, n, cout2, count=32):
+    """定点抽样。原始数据传不出去，就打一小撮出来供离线核对。
+
+    取等间距的 count 个点，位模式和值都打 —— 位模式才能看出 -0 和舍入的最后一位。
+    """
+    print("\n[抽样] 等间距 %d 个点   (idx  row/cout   got | y_expect | y_exact)" % count)
+    step = max(1, n // count)
+    for j in range(count):
+        i = j * step
+        if i >= n:
+            break
+        print("   %7d %5d/%-3d  0x%04x %-12.6g | 0x%04x %-12.6g | 0x%04x %.6g"
+              % (i, i // cout2, i % cout2, got[1][i], got[0][i],
+                 want[1][i], want[0][i], exact[1][i], exact[0][i]))
+
+
 def report_lsb(got, want, r, mismatches, cout2, shift2):
     """把偏差换算成累加器 LSB —— 这是分开两类失败的判据。
 
@@ -708,10 +808,15 @@ def main():
     report_lsb(got, want, r, mismatches, cout2, shift2)
     report_ratio(got, want, r["n"])
     if "y_exact" in tensors:
-        report_vs_exact(got, decode_f16(tensors["y_exact"][2]), r["n"])
+        exact = decode_f16(tensors["y_exact"][2])
+        report_vs_exact(got, exact, r["n"])
+        # 拿真值反推定标。和 y_expect 比没意义 —— 那是按（可能错的）模型算出来的。
+        probe_acc_scale(got, exact, r["n"], shift2, cout2)
+        print_sample(got, want, exact, r["n"], cout2)
 
-    # 设备原始输出落盘。默认就存 —— 上板一次太贵，别让分析反过来占板子。
-    dump_path = os.environ.get("FC2D_DUMP", "fused_conv2d_device_out.bin")
+    # 设备原始输出落盘。默认**关**：板子那台机器上的文件多半传不出来，存了也是垃圾。
+    # 真要离线分析再 FC2D_DUMP=<路径> 打开。分析所需的结论上面几段已经在设备上算完了。
+    dump_path = os.environ.get("FC2D_DUMP", "")
     if dump_path and dump_path != "-":
         dump_raw(dump_path, out.raw[:y_bytes], "设备输出 (fp16 NCHW [1,%d,%d,%d])"
                  % (y_dims[1], y_dims[2], y_dims[3]))
