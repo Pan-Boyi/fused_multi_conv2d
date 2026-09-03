@@ -478,23 +478,38 @@ def report_idmap(got, dims, probe):
 
 
 def report_lsb(got, want, r, mismatches, dims, shift2):
-    """把偏差换算成累加器 LSB —— 这是分开两类失败的判据。
+    """把偏差同时按**输出 ULP** 和累加器 LSB 报出来。
 
-    定点链是 acc_i32 = round(真值 * 2^F)，出口再乘 2^-F，F = 58 - fixed_shift2。
-    所以输出的最小可分辨间隔就是 2^-F。换算成 LSB 之后：
-      偏差都在个位数 LSB   -> 只是那次 round 发生的级别猜得不同（每个乘积 /
-                             每条 mmad / 整条 K 累完），卷积本身是对的；
-      偏差成千上万个 LSB   -> 算错了，或者定标错了、累加器溢出了。
+    以前这里只按累加器 LSB 判，是错的。累加器的 LSB 是 2^-F（F = 58 - S），而
+    fp16 输出在数值 v 附近的间隔是 v * 2^-10。F=16、v=142 时，1 个输出 ULP =
+    0.125 = **8192 个累加器 LSB** —— 于是「差 1 个 ULP」这种最良性的情况会被报成
+    「远超 LSB 量级」。判据必须用输出 ULP，累加器 LSB 只作参考。
+
+    读法：
+      偏差 <= 1 ULP    定点链算对了，差的只是 round 发生在哪一级（每个乘积 /
+                       每条 mmad / 整条 K 累完），属于建模精度，不是 kernel 的问题；
+      偏差 >> 1 ULP    才是真错了或者累加器溢出了。
     """
-    deq_exp2 = FIX_SHIFT_LEN - shift2
-    lsb = 2.0 ** (-deq_exp2)
-    print("\n[定点] conv2 定标 2^%d（属性 S=%d），累加器 1 LSB = %.6g" % (deq_exp2, shift2, lsb))
+    import math
+    deq_exp = FIX_SHIFT_LEN - shift2
+    lsb = 2.0 ** (-deq_exp)
+    print("\n[偏差] conv2 定标 2^%d（属性 S=%d）；累加器 1 LSB = %.6g" % (deq_exp, shift2, lsb))
     if not mismatches:
+        print("       逐位全等，无偏差")
         return
-    edges = [1, 2, 4, 16, 256, 4096]
-    names = ["<=1", "<=2", "<=4", "<=16", "<=256", "<=4096", ">4096"]
+
+    def ulp_of(v):
+        """v 附近 fp16 的间隔。次正规区间恒为 2^-24。"""
+        a = abs(v)
+        if a == 0.0 or a < 2.0 ** -14:
+            return 2.0 ** -24
+        e = math.floor(math.log(a, 2))
+        return 2.0 ** (e - 10)
+
+    edges = [1.0, 2.0, 4.0, 16.0, 256.0]
+    names = ["<=1 ULP", "<=2", "<=4", "<=16", "<=256", ">256"]
     hist = dict.fromkeys(names, 0)
-    max_lsb, max_i, nonfinite = 0.0, -1, 0
+    max_ulp, max_i, nonfinite = 0.0, -1, 0
     for i in range(r["n"]):
         if got[1][i] == want[1][i]:
             continue
@@ -502,27 +517,35 @@ def report_lsb(got, want, r, mismatches, dims, shift2):
         if d != d or d in (float("inf"), float("-inf")):
             nonfinite += 1
             continue
-        d = abs(d) / lsb
+        # 用两者中较大的那个定 ULP —— relu 边界上一边是 0，用 0 的 ULP 没意义
+        scale = max(abs(got[0][i]), abs(want[0][i]))
+        d = abs(d) / ulp_of(scale)
         for e, nm in zip(edges, names):
             if d <= e:
                 hist[nm] += 1
                 break
         else:
-            hist[">4096"] += 1
-        if d > max_lsb:
-            max_lsb, max_i = d, i
+            hist[">256"] += 1
+        if d > max_ulp:
+            max_ulp, max_i = d, i
     if max_i >= 0:
-        print("       最大偏差 %.1f LSB @ %d (%s): got %.6g, want %.6g"
-              % (max_lsb, max_i, idx_label(max_i, dims), got[0][max_i], want[0][max_i]))
+        print("       最大偏差 %.2f ULP @ %d (%s): got %.6g, want %.6g   （= %.0f 个累加器 LSB）"
+              % (max_ulp, max_i, idx_label(max_i, dims), got[0][max_i], want[0][max_i],
+                 abs(got[0][max_i] - want[0][max_i]) / lsb))
     for nm in names:
         if hist[nm]:
-            print("         %-8s %9d  (%.6f%%)" % (nm, hist[nm], hist[nm] * 100.0 / mismatches))
+            print("         %-9s %9d  (%.4f%%)" % (nm, hist[nm], hist[nm] * 100.0 / mismatches))
     if nonfinite:
-        print("         非有限差 %d 个（got 或 want 是 Inf/NaN）" % nonfinite)
-    if max_lsb <= 16.0 and nonfinite == 0:
-        print("       => 偏差全在个位数 LSB 量级：卷积算对了，差的只是 round 的级别。")
+        print("         非有限差 %d 个" % nonfinite)
+    within1 = hist["<=1 ULP"]
+    if max_ulp <= 2.0 and nonfinite == 0:
+        print("       => 全部在 1~2 个输出 ULP 以内：卷积算对了，差的只是 round 的级别。")
+    elif within1 * 1.0 / mismatches >= 0.9:
+        print("       => %.2f%% 在 1 个 ULP 以内，尾部 %d 个更大 —— 多半是 relu 边界附近"
+              % (within1 * 100.0 / mismatches, mismatches - within1))
+        print("          （真值贴近 0 时，累加的一点点差异就会改变 relu 的取舍）。")
     else:
-        print("       => 偏差远超 LSB 量级：这不是 round 的问题，是算错了或累加器溢出了。")
+        print("       => 偏差远超 1 个 ULP：这不是 round 的问题。")
 
 
 def report_vs_exact(got, exact, n):
