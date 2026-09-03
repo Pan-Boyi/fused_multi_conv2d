@@ -45,7 +45,7 @@ fi
 # ---------------------------------------------------------------- 1) 文件齐不齐
 step "1) 检查所需文件"
 MISSING=0
-for f in fused_conv2d_int8_golden.h golden_selfcheck.cpp test_aclop_fused_conv2d.cpp; do
+for f in fused_conv2d_golden.h golden_selfcheck.cpp test_aclop_fused_conv2d.cpp; do
     if [ -f "$HERE/$f" ]; then
         printf '  %-32s %s 行\n' "$f" "$(wc -l < "$HERE/$f" 2>/dev/null)"
     else
@@ -57,8 +57,8 @@ done
 
 # golden 头必须完整：截断的话后面会报一句和 golden 毫无关系的
 # "undefined reference to \`main'"
-if ! grep -q "^int main()" "$HERE/fused_conv2d_int8_golden.h"; then
-    die "fused_conv2d_int8_golden.h 里找不到 main() —— 文件被截断了，重新拿一份"
+if ! grep -q "^} // namespace fc2d_golden" "$HERE/fused_conv2d_golden.h"; then
+    die "fused_conv2d_golden.h 没有闭合的命名空间 —— 文件被截断了，重新拿一份"
 fi
 echo "  golden 头完整性 OK"
 

@@ -57,6 +57,12 @@ constexpr int KH = 3, KW = 3, PAD = 1;
 constexpr int C0 = 16;                 // fp16 -> 32B / 2
 constexpr int FIX_SHIFT_LEN_A16W16 = 58;
 
+// 元素数。放在这里而不是让每个消费者自己乘，是因为它们要和 kernel 的几何一致，
+// 只该有一个出处。
+constexpr int X_ELEMS = CI * HI * WI;          // 1,032,192
+constexpr int Y_ELEMS = COUT2 * HO2 * WO2;     //   774,144
+constexpr int MID_ELEMS = COUT1 * HO1 * WO1;   // 2,064,384
+
 // ---------------------------------------------------------------------------
 // fp16 <-> fp32。自己写而不是用 _Float16，是为了在任何编译器上位型都一样 ——
 // 板上和主机上比对的是**位**，不是近似值。

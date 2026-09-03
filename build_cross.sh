@@ -49,7 +49,7 @@ echo "$LIBMACH" | grep -qi "AArch64" \
     || die "这份 libascendcl.so 不是 aarch64 的（是 $LIBMACH）—— 你拷的是本机 x86 那份"
 
 step "1) 检查源文件"
-for f in fused_conv2d_int8_golden.h test_aclop_fused_conv2d.cpp; do
+for f in fused_conv2d_golden.h test_aclop_fused_conv2d.cpp; do
     [ -f "$HERE/$f" ] || die "缺 $f"
     printf '  %-32s %s 行\n' "$f" "$(wc -l < "$HERE/$f" | tr -d " \t")"
 done
