@@ -61,7 +61,17 @@ Y_SENTINEL_BYTE = 0x7F
 Y_SENTINEL_U16 = 0x7F7F
 Y_ELEM_BYTES = 2
 
-HDR_FMT = "<8sIIQQQQQ"          # magic, version, ntensors, nonzero, ties, sat, y_elems, attrs
+HDR_FMT = "<8sIIQQQQQ"          # magic, version, ntensors, nonzero, probe, sat, y_elems, attrs
+
+# 第 5 个字段原本恒为 0（int8 时代的 ties 计数），现在放探针 id。
+# 探针 = 把某一层的权重换成中心抽头恒等，用来把两层拆开单独看。
+# 权重是运行时输入不是属性，所以换探针只要换 .bin，不用重编 .om。
+PROBES = {
+    0: "none —— 随机权重，正常用例",
+    1: "passthrough —— conv1/conv2 都恒等、bias 全 0；y 应当 == relu(x[c][2h][2w])，"
+       "c>=32 全 0。纯数据搬运测试，和 fixShiftVal 无关",
+    2: "mid —— 只有 conv2 恒等；y 直接暴露 conv1 的输出（下采样后）",
+}
 # attrs 的低 8 位是 fixed_shift1，次 8 位是 fixed_shift2。放在文件里而不是脚本
 # 里写死，是因为它由 golden 按数据算出来，主机和设备必须用同一个值。
 HDR_LEN = struct.calcsize(HDR_FMT)
@@ -113,7 +123,7 @@ def load_case(path):
     if len(blob) < HDR_LEN:
         die("%s 只有 %d 字节，文件不完整（传输中断？）" % (path, len(blob)))
 
-    magic, version, ntensors, nonzero, ties, sat, y_elems, attrs = struct.unpack_from(HDR_FMT, blob, 0)
+    magic, version, ntensors, nonzero, probe, sat, y_elems, attrs = struct.unpack_from(HDR_FMT, blob, 0)
     if magic != b"FC2DCASE":
         die("%s 不是 case 文件（magic = %r）" % (path, magic))
     if version != 2:
@@ -153,7 +163,7 @@ def load_case(path):
     shift2 = int((attrs >> 8) & 0xFF)
     if not (0 <= shift1 <= 58 and 0 <= shift2 <= 58):
         die("header 里的定点定标 %d / %d 超出 [0,58] —— case 文件版本对不上？" % (shift1, shift2))
-    return tensors, nonzero, ties, sat, y_elems, shift1, shift2
+    return tensors, nonzero, probe, sat, y_elems, shift1, shift2
 
 
 # ---------------------------------------------------------------- 绑 libascendcl
@@ -621,7 +631,7 @@ def main():
         else:
             die("%s 既不是文件也不是目录" % om_arg)
 
-    tensors, gold_nonzero, ties, sat, y_elems, shift1, shift2 = load_case(case_path)
+    tensors, gold_nonzero, probe, sat, y_elems, shift1, shift2 = load_case(case_path)
     want_raw = tensors["y_expect"][2]
     if len(want_raw) != y_elems * Y_ELEM_BYTES:
         die("golden 输出 %d 字节，按 %d 个 fp16 元素应为 %d"
@@ -635,7 +645,8 @@ def main():
           % (shift1, shift2))
     print("            对应累加器定标 2^%d / 2^%d —— 属性越大定标越小，别搞反"
           % (FIX_SHIFT_LEN - shift1, FIX_SHIFT_LEN - shift2))
-    print("golden: nonzero=%d/%d ties=%d sat=%d" % (gold_nonzero, y_elems, ties, sat))
+    print("golden: nonzero=%d/%d sat=%d" % (gold_nonzero, y_elems, sat))
+    print("探针: %s" % PROBES.get(probe, "未知 id %d —— .bin 和脚本版本可能对不上" % probe))
     if gold_nonzero == 0:
         die("golden 全是 0 —— 先别管设备")
 

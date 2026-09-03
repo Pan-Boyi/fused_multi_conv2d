@@ -59,6 +59,19 @@ $CXX_HOST $CXXFLAGS "$HERE/gen_case.cpp" -o "$HERE/gen_case" -I"$HERE"
 SZ=$(wc -c < "$HERE/fused_conv2d_case.bin" | tr -d " \t")   # macOS 的 wc 会补前导空格
 [ "$SZ" = 5309240 ] || echo "  [!] .bin 是 $SZ 字节，预期 5309240 —— 形状变了？"
 
+step "3.5) 顺带生成两个探针 case"
+# 探针 = 把某一层权重换成中心抽头恒等，把两层拆开单独看。权重是运行时输入不是
+# 属性，所以这些 .bin 和正常 case 用**同一个 .om**，不用重编。
+for pm in passthrough mid; do
+    "$HERE/gen_case" "$HERE/fused_conv2d_probe_$pm.bin" "--probe=$pm" >/dev/null 2>&1
+    if [ -f "$HERE/fused_conv2d_probe_$pm.bin" ]; then
+        printf '  %-38s %s 字节\n' "fused_conv2d_probe_$pm.bin" \
+               "$(wc -c < "$HERE/fused_conv2d_probe_$pm.bin" | tr -d ' \t')"
+    else
+        echo "  [!] 探针 $pm 没生成出来"
+    fi
+done
+
 step "4) 拷过去"
 echo "  文件: $HERE/fused_conv2d_case.bin  ($SZ 字节)"
 command -v md5sum >/dev/null 2>&1 && md5sum "$HERE/fused_conv2d_case.bin" | sed 's/^/  md5: /'
