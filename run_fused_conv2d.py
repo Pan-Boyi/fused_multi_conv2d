@@ -295,7 +295,7 @@ def dump_raw(path, raw, tag):
         print("\n[dump] 写 %s 失败: %s" % (path, e))
 
 
-def probe_acc_scale(got, exact, n, shift2, cout2):
+def probe_acc_scale(got, exact, n, shift2, dims):
     """在设备上把定标推出来，只打印结论 —— 原始数据传不出去。
 
     已确证的那半：out = acc_int32 * 2^-F，F = 58 - S（fixpipe 的 DEQF16 分支只按
@@ -364,13 +364,13 @@ def probe_acc_scale(got, exact, n, shift2, cout2):
     lo = math.log(math.ldexp(1.0, 31) / sat_min_true, 2) if nsat and sat_min_true > 0 else None
     hi = math.log(math.ldexp(1.0, 31) / unsat_max_true, 2) if unsat_max_true > 0 else None
     if lo is not None:
-        print("             饱和点里最小真值 %.6g @ %d (row %d, cout %d)  =>  E >= %.2f"
-              % (sat_min_true, sat_idx, sat_idx // cout2, sat_idx % cout2, lo))
+        print("             饱和点里最小真值 %.6g @ %d (%s)  =>  E >= %.2f"
+              % (sat_min_true, sat_idx, idx_label(sat_idx, dims), lo))
     else:
         print("             没有饱和点 —— 拿不到 E 的下界")
     if hi is not None:
-        print("             未饱和点里最大真值 %.6g @ %d (row %d, cout %d)  =>  E <  %.2f"
-              % (unsat_max_true, unsat_idx, unsat_idx // cout2, unsat_idx % cout2, hi))
+        print("             未饱和点里最大真值 %.6g @ %d (%s)  =>  E <  %.2f"
+              % (unsat_max_true, unsat_idx, idx_label(unsat_idx, dims), hi))
     if lo is not None and hi is not None:
         if lo < hi:
             print("             => E 落在 [%.2f, %.2f)，取整 E = %d" % (lo, hi, int(math.ceil(lo))))
@@ -379,23 +379,34 @@ def probe_acc_scale(got, exact, n, shift2, cout2):
             print("                说明上一层（conv1）就已经错了，不是 conv2 单级定标的问题。")
 
 
-def print_sample(got, want, exact, n, cout2, count=32):
+def print_sample(got, want, exact, n, dims, count=32):
     """定点抽样。原始数据传不出去，就打一小撮出来供离线核对。
 
     取等间距的 count 个点，位模式和值都打 —— 位模式才能看出 -0 和舍入的最后一位。
     """
-    print("\n[抽样] 等间距 %d 个点   (idx  row/cout   got | y_expect | y_exact)" % count)
-    step = max(1, n // count)
+    # 步长要和 HO2*WO2 互质，否则会一直落在同一个空间位置上（上一版就是，32 个点
+    # 全在 h0 w0 那个 padding 角落）。这里直接取一个不整除 plane 的奇数步长。
+    print("\n[抽样] %d 个点，跨通道跨空间铺开   (idx  c/h/w   got | y_expect | y_exact)" % count)
+    step = max(1, n // count) | 1
+    while step > 1 and (dims[2] * dims[3]) % step == 0:
+        step += 2
     for j in range(count):
-        i = j * step
-        if i >= n:
-            break
-        print("   %7d %5d/%-3d  0x%04x %-12.6g | 0x%04x %-12.6g | 0x%04x %.6g"
-              % (i, i // cout2, i % cout2, got[1][i], got[0][i],
+        i = (j * step) % n
+        print("   %7d %-14s 0x%04x %-12.6g | 0x%04x %-12.6g | 0x%04x %.6g"
+              % (i, idx_label(i, dims), got[1][i], got[0][i],
                  want[1][i], want[0][i], exact[1][i], exact[0][i]))
 
 
-def report_lsb(got, want, r, mismatches, cout2, shift2):
+# 输出是 NCHW [1, COUT2, HO2, WO2]，所以下标先除 HO2*WO2 得通道，再拆 h/w。
+# 之前这里按 i // cout2 拆，那是把 [空间][通道] 的排布当成了真的 —— 标签是错的，
+# 而且等间距抽样会全落在同一个空间位置上（padding 角落），看不出问题。
+def idx_label(i, dims):
+    plane = dims[2] * dims[3]
+    c, sp = i // plane, i % plane
+    return "c%d h%d w%d" % (c, sp // dims[3], sp % dims[3])
+
+
+def report_lsb(got, want, r, mismatches, dims, shift2):
     """把偏差换算成累加器 LSB —— 这是分开两类失败的判据。
 
     定点链是 acc_i32 = round(真值 * 2^F)，出口再乘 2^-F，F = 58 - fixed_shift2。
@@ -430,8 +441,8 @@ def report_lsb(got, want, r, mismatches, cout2, shift2):
         if d > max_lsb:
             max_lsb, max_i = d, i
     if max_i >= 0:
-        print("       最大偏差 %.1f LSB @ %d (row %d, cout %d): got %.6g, want %.6g"
-              % (max_lsb, max_i, max_i // cout2, max_i % cout2, got[0][max_i], want[0][max_i]))
+        print("       最大偏差 %.1f LSB @ %d (%s): got %.6g, want %.6g"
+              % (max_lsb, max_i, idx_label(max_i, dims), got[0][max_i], want[0][max_i]))
     for nm in names:
         if hist[nm]:
             print("         %-8s %9d  (%.6f%%)" % (nm, hist[nm], hist[nm] * 100.0 / mismatches))
@@ -767,12 +778,11 @@ def main():
     print("\n[fused-conv2d-5102-device] out_elems=%d nonzero=%d golden_nonzero=%d "
           "unwritten=%d mismatches=%d" % (y_elems, nonzero, gold_nonzero, unwritten, mismatches))
 
-    cout2 = y_dims[1]
     if mismatches:
         fb = r["first_bad"]
-        print("first mismatch @ %d: got %.6g (0x%04x), want %.6g (0x%04x) (row %d, cout %d)"
+        print("first mismatch @ %d: got %.6g (0x%04x), want %.6g (0x%04x) (%s)"
               "；差 1 个 ULP 的 %d / 共 %d"
-              % (fb, got[0][fb], got[1][fb], want[0][fb], want[1][fb], fb // cout2, fb % cout2,
+              % (fb, got[0][fb], got[1][fb], want[0][fb], want[1][fb], idx_label(fb, y_dims),
                  r["off_by_one"], mismatches))
 
     # ------------------------------------------------------------ 精度
@@ -781,8 +791,8 @@ def main():
     mr = r["max_rel"]
     if r["max_rel_idx"] >= 0:
         mi = r["max_rel_idx"]
-        print("       最大相对误差 %s @ %d (row %d, cout %d): got %.6g, want %.6g"
-              % ("inf" if mr == float("inf") else "%.6e" % mr, mi, mi // cout2, mi % cout2,
+        print("       最大相对误差 %s @ %d (%s): got %.6g, want %.6g"
+              % ("inf" if mr == float("inf") else "%.6e" % mr, mi, idx_label(mi, y_dims),
                  got[0][mi], want[0][mi]))
     else:
         print("       最大相对误差 0")
@@ -805,14 +815,14 @@ def main():
     print("           所以 %g 的判据比逐位相等**宽**：差 1 ULP 也能达标。" % rel_tol)
     print("           以 mismatches == 0 为准；只达标不逐位相等会报 [PASS*]。")
 
-    report_lsb(got, want, r, mismatches, cout2, shift2)
+    report_lsb(got, want, r, mismatches, y_dims, shift2)
     report_ratio(got, want, r["n"])
     if "y_exact" in tensors:
         exact = decode_f16(tensors["y_exact"][2])
         report_vs_exact(got, exact, r["n"])
         # 拿真值反推定标。和 y_expect 比没意义 —— 那是按（可能错的）模型算出来的。
-        probe_acc_scale(got, exact, r["n"], shift2, cout2)
-        print_sample(got, want, exact, r["n"], cout2)
+        probe_acc_scale(got, exact, r["n"], shift2, y_dims)
+        print_sample(got, want, exact, r["n"], y_dims)
 
     # 设备原始输出落盘。默认**关**：板子那台机器上的文件多半传不出来，存了也是垃圾。
     # 真要离线分析再 FC2D_DUMP=<路径> 打开。分析所需的结论上面几段已经在设备上算完了。

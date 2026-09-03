@@ -35,10 +35,11 @@ int main()
     Golden g = BuildGolden(in);
     std::printf("\n定点定标（这两个数就是算子属性 fixed_shift1 / fixed_shift2 该传的值）:\n");
     // 属性 S 和实际定标 F 是反的（F = 58 - S），两个都打，别再搞反。
-    std::printf("  conv1  |最终值|峰值 %-10.4f  部分和上界 %-10.4f  定标 2^%-2d  ->  属性 S = %d\n",
-                g.peak1, g.peakPartial1, g.deqExp1, g.shift1);
-    std::printf("  conv2  |最终值|峰值 %-10.4f  部分和上界 %-10.4f  定标 2^%-2d  ->  属性 S = %d\n",
-                g.peak2, g.peakPartial2, g.deqExp2, g.shift2);
+    std::printf("  （定标跟 CANN 自己的 matmul 走：5102 上 shiftValue 默认 42，即 F=16）\n");
+    std::printf("  conv1  |最终值|峰值 %-10.4f  部分和上界 %-10.4f  定标 2^%-2d  ->  属性 S = %d   (余量到 F=%d)\n",
+                g.peak1, g.peakPartial1, g.deqExp1, g.shift1, g.safeExp1);
+    std::printf("  conv2  |最终值|峰值 %-10.4f  部分和上界 %-10.4f  定标 2^%-2d  ->  属性 S = %d   (余量到 F=%d)\n",
+                g.peak2, g.peakPartial2, g.deqExp2, g.shift2, g.safeExp2);
     // 定标是按**部分和**挑的，所以这一条才是真正的越界判据。
     {
         const double h1 = g.peakPartial1 * std::ldexp(1.0, g.deqExp1);

@@ -284,6 +284,21 @@ inline int MaxSafeDeqExp(const std::vector<double>& acc, const std::vector<doubl
     return F;
 }
 
+// 厂商的默认工作点。CANN 自己的 matmul 在 5102 上就用这个值：
+//   matmul/common/cmct/block/block_mmad_pingpong_without_que.h:144
+//   matmul/common/cmct/block/block_mmad_iterbatch.h:85
+//       #if __NPU_ARCH__ == 5102
+//           uint8_t shiftValue_{42};
+//   58 - 42 = 16
+// 权重 int8 的那条路（weight_quant_batch_matmul_v2_tiling.cpp:33）默认 13，
+// FIX_SHIFT_LEN_A16W8 = 29，29 - 13 也是 16。旧版 API 里 DEQF16 的系数干脆写死成
+// 0x37800000 = 2^-16，注释就是 "fix point 1/2^16"。三条独立证据都落在 F=16。
+//
+// 上一版自作主张挑「最大安全 F」（24/21），偏离了这个工作点，上板结果不成立：
+// 按部分和算本不该溢出的定标却出现了 int32 饱和，而且饱和与否和 |真值| 无关。
+// 所以定标不再自己挑，跟厂商走。MaxSafeDeqExp 保留，只用来校验 F=16 有没有余量。
+constexpr int DEFAULT_ATTR_SHIFT = 42;
+
 // 反缩放指数 F -> 算子属性 S。两者之和恒为 58。
 inline int AttrFromDeqExp(int deqExp)
 {
@@ -355,7 +370,8 @@ struct Golden {
     int shift1 = 0, shift2 = 0;      // 算子属性 S（下发给 fixed_shift1/2）
     int deqExp1 = 0, deqExp2 = 0;    // 实际定标指数 F = 58 - S
     double peak1 = 0, peak2 = 0;              // |最终值 + bias| 的峰值
-    double peakPartial1 = 0, peakPartial2 = 0; // sum|a*b| + |bias| 的峰值，定标按它挑
+    double peakPartial1 = 0, peakPartial2 = 0; // sum|a*b| + |bias| 的峰值
+    int safeExp1 = 0, safeExp2 = 0;            // 部分和不溢出所允许的最大 F（只作校验）
     long sat = 0;
     long yNonZero = 0;
 };
@@ -387,7 +403,11 @@ inline Golden BuildGolden(const Inputs& in, int shiftFor1 = -1, int shiftFor2 = 
     ConvFwdRaw(in.xNchw.data(), in.w1Nchw.data(), sp1, acc1, &abs1);
     const int hw1 = HO1 * WO1;
     const int autoExp1 = MaxSafeDeqExp(acc1, abs1, in.b1.data(), COUT1, hw1, &g.peak1, &g.peakPartial1);
-    g.shift1 = shiftFor1 >= 0 ? shiftFor1 : AttrFromDeqExp(autoExp1);
+    g.safeExp1 = autoExp1;
+    // 跟厂商的工作点走；只有当 F=16 都装不下时才退到自己算的安全值。
+    g.shift1 = shiftFor1 >= 0 ? shiftFor1
+             : (autoExp1 >= FIX_SHIFT_LEN_A16W16 - DEFAULT_ATTR_SHIFT ? DEFAULT_ATTR_SHIFT
+                                                                      : AttrFromDeqExp(autoExp1));
     g.deqExp1 = FIX_SHIFT_LEN_A16W16 - g.shift1;
     FixedEpilogue(acc1, in.b1.data(), COUT1, hw1, g.shift1, true, g.midFixed, &g.sat);
     ExactEpilogue(acc1, in.b1.data(), COUT1, hw1, true, g.midExact);
@@ -398,7 +418,10 @@ inline Golden BuildGolden(const Inputs& in, int shiftFor1 = -1, int shiftFor2 = 
     ConvFwdRaw(g.midFixed.data(), in.w2Nchw.data(), sp2, acc2, &abs2);
     const int hw2 = HO2 * WO2;
     const int autoExp2 = MaxSafeDeqExp(acc2, abs2, in.b2.data(), COUT2, hw2, &g.peak2, &g.peakPartial2);
-    g.shift2 = shiftFor2 >= 0 ? shiftFor2 : AttrFromDeqExp(autoExp2);
+    g.safeExp2 = autoExp2;
+    g.shift2 = shiftFor2 >= 0 ? shiftFor2
+             : (autoExp2 >= FIX_SHIFT_LEN_A16W16 - DEFAULT_ATTR_SHIFT ? DEFAULT_ATTR_SHIFT
+                                                                      : AttrFromDeqExp(autoExp2));
     g.deqExp2 = FIX_SHIFT_LEN_A16W16 - g.shift2;
     FixedEpilogue(acc2, in.b2.data(), COUT2, hw2, g.shift2, true, g.yFixed, &g.sat);
 
