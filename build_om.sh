@@ -17,6 +17,7 @@
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 [ -n "$HERE" ] || HERE="$PWD"
 JSON="$HERE/fused_conv2d_singleop.json"
+CASE="${CASE:-$HERE/fused_conv2d_case.bin}"
 OUTDIR="${OUTDIR:-$HERE/om_out}"
 
 die()  { echo; echo "[X] $*"; exit 1; }
@@ -184,6 +185,53 @@ fi
 
 step "4) atc 单算子编译  soc_version=$SOC"
 rm -rf "$OUTDIR" && mkdir -p "$OUTDIR"
+
+# ---------------------------------------------------------------------------
+# 定点定标（fixed_shift1/2）不能在这份 json 里手写死。
+#
+# ACL 匹配 .om 是拿 **op 类型 + 每个 tensor 的 shape/dtype/format + 全部 attr 的值**
+# 一起匹配的。json 里写 26/22 而脚本按 .bin 的 header 下发 34/37，就匹配不上，而且
+# 报出来的是 100024 / "算子没找到(161001)" —— 看着像算子没装，其实是属性对不上。
+# 这个坑真踩过一次。
+#
+# 所以属性值只有 .bin 的 header 一个来源，这里现读现填，人不参与。
+# ---------------------------------------------------------------------------
+USED_JSON="$OUTDIR/singleop_used.json"
+if [ -f "$CASE" ] && command -v python3 >/dev/null 2>&1; then
+    python3 - "$JSON" "$CASE" "$USED_JSON" <<'PYSYNC'
+import json, struct, sys
+tpl, case, out = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(case, "rb") as f:
+    hdr = f.read(56)
+if len(hdr) < 56 or hdr[:8] != b"FC2DCASE":
+    sys.exit("case 文件头不对，读不出定标")
+attrs = struct.unpack_from("<Q", hdr, 48)[0]     # header 里最后一个 uint64
+shifts = {"fixed_shift1": attrs & 0xFF, "fixed_shift2": (attrs >> 8) & 0xFF}
+desc = json.load(open(tpl, encoding="utf-8"))
+hit = 0
+for op in desc:
+    for a in op.get("attr", []):
+        if a.get("name") in shifts:
+            a["value"] = shifts[a["name"]]
+            hit += 1
+if hit != 2:
+    sys.exit("模板里没找齐 fixed_shift1/2（找到 %d 个）" % hit)
+json.dump(desc, open(out, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+print("  定标取自 %s: fixed_shift1=%d fixed_shift2=%d"
+      % (case, shifts["fixed_shift1"], shifts["fixed_shift2"]))
+PYSYNC
+    [ $? -eq 0 ] || die "从 $CASE 同步定标失败。
+    要么 .bin 是旧版本的，要么模板 json 里没有 fixed_shift1/2。"
+    JSON="$USED_JSON"
+else
+    [ -f "$CASE" ] || echo "  [!] 找不到 $CASE"
+    command -v python3 >/dev/null 2>&1 || echo "  [!] 没有 python3"
+    echo "  [!] 没法从 case 文件同步定标，直接用模板里写死的值。"
+    echo "      模板和 .bin 的定标一旦不一致，执行时会报 100024 / 算子没找到 ——"
+    echo "      那不是算子没装，是属性对不上。跑之前先自己核一遍："
+    grep -E 'fixed_shift[12]' "$JSON" | sed 's/^/        /'
+fi
+
 echo "  json   = $JSON"
 echo "  output = $OUTDIR"
 echo

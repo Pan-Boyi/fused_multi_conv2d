@@ -581,12 +581,15 @@ def main():
         if ret != ACL_SUCCESS:
             if k == 0:
                 die('aclopExecuteV2("%s") = %d\n'
-                    "        算子没找到(161001) -> 本机的算子信息库里没有它，或者类型名拼错\n"
-                    "                      查: grep -ri '\"%s\"' $ASCEND_OPP_PATH/built-in/op_impl/ai_core/tbe/config/\n"
-                    "                      这台机器没装带 FusedConv2d 的算子包的话，先在有包的机器上\n"
-                    "                      跑 build_om.sh 编出 .om，把它当第 4 个参数传进来\n"
-                    "        找到但选不出 kernel -> shape/dtype 和 binary.json 里登记的组合对不上"
-                    % (op_type, ret, op_type))
+                    "        走 .om（已 aclopSetModelDir）时最常见的其实不是「没装」，而是**匹配不上**：\n"
+                    "          ACL 拿 op 类型 + 每个 tensor 的 shape/dtype/format + **全部 attr 的值**\n"
+                    "          一起去匹配 .om，任何一项对不上都报成这个「算子没找到」。\n"
+                    "          本次下发的属性: fixed_shift1=%d fixed_shift2=%d\n"
+                    "          编 .om 时用的值在 om_out/singleop_used.json 里，先比这两个数。\n"
+                    "          对不上 -> 重跑 build_om.sh（它会从 .bin 的 header 现读，不用手改）\n"
+                    "        真的没装 -> grep -ri '\"%s\"' $ASCEND_OPP_PATH/built-in/op_impl/ai_core/tbe/config/\n"
+                    "        装了但选不出 kernel -> shape/dtype 和 binary.json 里登记的组合对不上"
+                    % (op_type, ret, shift1, shift2, op_type))
             die("第 %d 次 aclopExecuteV2 = %d" % (k + 1, ret))
         ret = acl.aclrtSynchronizeStream(stream)
         if ret != ACL_SUCCESS:

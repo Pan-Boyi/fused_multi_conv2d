@@ -12,8 +12,8 @@
       {"format": "ND", "shape": [1, 96, 144, 56], "type": "float16"}
     ],
     "attr": [
-      {"name": "fixed_shift1", "type": "int", "value": 26},
-      {"name": "fixed_shift2", "type": "int", "value": 22}
+      {"name": "fixed_shift1", "type": "int", "value": 34},
+      {"name": "fixed_shift2", "type": "int", "value": 37}
     ]
   }
 ]
