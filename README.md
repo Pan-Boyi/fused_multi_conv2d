@@ -53,7 +53,28 @@ python3 run_fused_conv2d.py fused_conv2d_case.bin FusedConv2d 0
 | `y_expect` | 定点模型 | 应**逐位相等** |
 | `y_exact` | 纯 fp32 参考 | 用相对误差判 |
 
-`fixedShiftValue` 的确切语义还没有硬件实测(golden 按
-`acc = round(Σa·b · 2^S)`、`out = fp16(acc · 2^-S)` 建模)。所以:
-**只有 `y_exact` 过、`y_expect` 不过,是卷积算对了而定点模型猜错了**,该改的是
-golden 不是 kernel。建议先拿现成的 `conv2d_v2` 扫一遍 shift 把语义钉死。
+`fixed_shift` 的语义**已经从 CANN 源码确证**,不再是假设。记属性为 `S`:
+
+```
+acc_int32 = round( 真值 * 2^(58 - S) )
+out_fp16  = fp16( acc_int32 * 2^-(58 - S) )
+```
+
+依据是 DEQF16 模式下 fixpipe 根本不看 `deqScalar`,只按 shift 现搭一个 float
+(`dav_m510/kernel_operator_fixpipe_impl.h:77` `SetDeqScalarDepOnMode`):
+
+```c
+uint64_t newExponent = (127 - shiftVal) & 0xFF;
+uint64_t newScalar   = (floatOne & ~mask) | (newExponent << shift);
+```
+
+指数为 `127-F` 的 float 就是 `2^-F`,而 `F` 正是传给 fixpipe 的 `58 - S`。
+
+> **S 越大,累加器的定标越小 —— 和「shift 越大精度越高」的直觉正好相反。**
+> 这个方向写反了不报任何错。本算子踩过一次:S 按 26/22 下发,硬件实际按
+> `2^32`/`2^36` 定标,几乎每个非零点都撑爆 int32,输出的符号退化成掷硬币。
+> 板上的表征很干脆 —— 非零元素一个都没对上,对上的全部是两边都为零的点。
+
+所以判据是:**先看 `mismatches`(对 `y_expect`,应逐位相等)**。不等时脚本会报一行
+以累加器 LSB 计的偏差 —— 个位数 LSB 说明只是 round 的级别猜得不同,卷积是对的;
+成千上万个 LSB 才是真错了。`y_exact` 那一路不设门槛,只回答「有没有在算这个卷积」。

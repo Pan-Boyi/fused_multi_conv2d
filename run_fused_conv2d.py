@@ -73,6 +73,10 @@ ORDER = ["x", "filter1", "bias1", "filter2", "bias2"]
 # 参考（判「有没有在算这个卷积」，不受定点假设影响）。见 golden.h 顶部那段。
 GOLDENS = ["y_expect", "y_exact"]
 
+# 硬件移位域宽度。属性 S 和实际定标指数 F 的关系恒为 F = FIX_SHIFT_LEN - S，
+# 见 dav_m510/kernel_operator_fixpipe_impl.h:77 SetDeqScalarDepOnMode。
+FIX_SHIFT_LEN = 58
+
 
 # ACL 把失败的细节（AI Core 异常、哪条 task、PC）攒在一个进程级的字符串里，
 # 只有 aclGetRecentErrMsg() 能取出来 —— 它不走 slog，所以 ASCEND_SLOG_PRINT_TO_STDOUT
@@ -240,6 +244,84 @@ def decode_f16(buf):
     return list(struct.unpack("<%de" % n, buf)), list(struct.unpack("<%dH" % n, buf))
 
 
+def report_lsb(got, want, r, mismatches, cout2, shift2):
+    """把偏差换算成累加器 LSB —— 这是分开两类失败的判据。
+
+    定点链是 acc_i32 = round(真值 * 2^F)，出口再乘 2^-F，F = 58 - fixed_shift2。
+    所以输出的最小可分辨间隔就是 2^-F。换算成 LSB 之后：
+      偏差都在个位数 LSB   -> 只是那次 round 发生的级别猜得不同（每个乘积 /
+                             每条 mmad / 整条 K 累完），卷积本身是对的；
+      偏差成千上万个 LSB   -> 算错了，或者定标错了、累加器溢出了。
+    """
+    deq_exp2 = FIX_SHIFT_LEN - shift2
+    lsb = 2.0 ** (-deq_exp2)
+    print("\n[定点] conv2 定标 2^%d（属性 S=%d），累加器 1 LSB = %.6g" % (deq_exp2, shift2, lsb))
+    if not mismatches:
+        return
+    edges = [1, 2, 4, 16, 256, 4096]
+    names = ["<=1", "<=2", "<=4", "<=16", "<=256", "<=4096", ">4096"]
+    hist = dict.fromkeys(names, 0)
+    max_lsb, max_i, nonfinite = 0.0, -1, 0
+    for i in range(r["n"]):
+        if got[1][i] == want[1][i]:
+            continue
+        d = got[0][i] - want[0][i]
+        if d != d or d in (float("inf"), float("-inf")):
+            nonfinite += 1
+            continue
+        d = abs(d) / lsb
+        for e, nm in zip(edges, names):
+            if d <= e:
+                hist[nm] += 1
+                break
+        else:
+            hist[">4096"] += 1
+        if d > max_lsb:
+            max_lsb, max_i = d, i
+    if max_i >= 0:
+        print("       最大偏差 %.1f LSB @ %d (row %d, cout %d): got %.6g, want %.6g"
+              % (max_lsb, max_i, max_i // cout2, max_i % cout2, got[0][max_i], want[0][max_i]))
+    for nm in names:
+        if hist[nm]:
+            print("         %-8s %9d  (%.6f%%)" % (nm, hist[nm], hist[nm] * 100.0 / mismatches))
+    if nonfinite:
+        print("         非有限差 %d 个（got 或 want 是 Inf/NaN）" % nonfinite)
+    if max_lsb <= 16.0 and nonfinite == 0:
+        print("       => 偏差全在个位数 LSB 量级：卷积算对了，差的只是 round 的级别。")
+    else:
+        print("       => 偏差远超 LSB 量级：这不是 round 的问题，是算错了或累加器溢出了。")
+
+
+def report_vs_exact(got, exact, n):
+    """对纯 fp32 参考。不设门槛，只报数。
+
+    上面那一路拿定点模型当判据；这一路完全不依赖定点模型，只回答「这个算子到底
+    有没有在算这个卷积」。定点格本身有噪声，所以这里不当失败判据 —— 它过而定点
+    模型不过，问题在模型，不在 kernel。
+    """
+    worst, worst_i, ok1, ok2 = 0.0, -1, 0, 0
+    for i in range(n):
+        g, w = got[0][i], exact[0][i]
+        if w == 0.0:
+            e = 0.0 if g == 0.0 else float("inf")
+        else:
+            e = abs(g - w) / abs(w)
+        if e <= 1e-2:
+            ok1 += 1
+        if e <= 1e-1:
+            ok2 += 1
+        if e > worst:
+            worst, worst_i = e, i
+    print("\n[对纯 fp32 参考] 不设门槛，只报数（定点格本身有噪声）")
+    print("       相对误差 <= 1e-2: %d / %d = %.4f%%    <= 1e-1: %d / %d = %.4f%%"
+          % (ok1, n, ok1 * 100.0 / n, ok2, n, ok2 * 100.0 / n))
+    if worst_i >= 0:
+        print("       最大相对误差 %s @ %d: got %.6g, 纯 fp32 %.6g"
+              % (("%.4g" % worst) if worst != float("inf") else "inf",
+                 worst_i, got[0][worst_i], exact[0][worst_i]))
+
+
+
 def evaluate(got, want, rel_tol):
     """一趟扫完所有判据。返回 dict。
 
@@ -389,6 +471,8 @@ def main():
         print("  %-9s %-6s %-16s %9d 字节" % (name, DTYPE_NAME[dtype], dims, len(data)))
     print("定点定标（来自 header，将作为算子属性下发）: fixed_shift1=%d fixed_shift2=%d"
           % (shift1, shift2))
+    print("            对应累加器定标 2^%d / 2^%d —— 属性越大定标越小，别搞反"
+          % (FIX_SHIFT_LEN - shift1, FIX_SHIFT_LEN - shift2))
     print("golden: nonzero=%d/%d ties=%d sat=%d" % (gold_nonzero, y_elems, ties, sat))
     if gold_nonzero == 0:
         die("golden 全是 0 —— 先别管设备")
@@ -566,6 +650,10 @@ def main():
     print("       注: 输出是 fp16，1 个 ULP 的相对误差 <= 2^-10 ≈ 9.77e-4 < %g，" % rel_tol)
     print("           所以 %g 的判据比逐位相等**宽**：差 1 ULP 也能达标。" % rel_tol)
     print("           以 mismatches == 0 为准；只达标不逐位相等会报 [PASS*]。")
+
+    report_lsb(got, want, r, mismatches, cout2, shift2)
+    if "y_exact" in tensors:
+        report_vs_exact(got, decode_f16(tensors["y_exact"][2]), r["n"])
 
     acl.aclopDestroyAttr(attr)
     for i in range(NIN + 1):

@@ -34,8 +34,19 @@ int main()
     // 3) 建 golden，报告标定用的量
     Golden g = BuildGolden(in);
     std::printf("\n定点定标（这两个数就是算子属性 fixed_shift1 / fixed_shift2 该传的值）:\n");
-    std::printf("  conv1  峰值 |sum+bias| = %.4f   ->  最大安全 S = %d\n", g.peak1, g.shift1);
-    std::printf("  conv2  峰值 |sum+bias| = %.4f   ->  最大安全 S = %d\n", g.peak2, g.shift2);
+    // 属性 S 和实际定标 F 是反的（F = 58 - S），两个都打，别再搞反。
+    std::printf("  conv1  |最终值|峰值 %-10.4f  部分和上界 %-10.4f  定标 2^%-2d  ->  属性 S = %d\n",
+                g.peak1, g.peakPartial1, g.deqExp1, g.shift1);
+    std::printf("  conv2  |最终值|峰值 %-10.4f  部分和上界 %-10.4f  定标 2^%-2d  ->  属性 S = %d\n",
+                g.peak2, g.peakPartial2, g.deqExp2, g.shift2);
+    // 定标是按**部分和**挑的，所以这一条才是真正的越界判据。
+    {
+        const double h1 = g.peakPartial1 * std::ldexp(1.0, g.deqExp1);
+        const double h2 = g.peakPartial2 * std::ldexp(1.0, g.deqExp2);
+        std::printf("  部分和最坏落点 %.4g / %.4g  (int32 上限 2.147e9)%s\n",
+                    h1, h2, (h1 < 2147483000.0 && h2 < 2147483000.0) ? "" : "   <-- [X] 越界");
+        if (!(h1 < 2147483000.0 && h2 < 2147483000.0)) return 1;
+    }
     std::printf("  int32 饱和点 %ld 个（应为 0）\n", g.sat);
 
     // 4) 定点模型 vs 纯 fp32 参考差多少 —— 这个差就是定点落格引入的误差，

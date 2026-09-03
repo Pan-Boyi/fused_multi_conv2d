@@ -18,6 +18,7 @@
  * （见 golden.h 顶部）。板上先看 y_exact 的相对误差过不过，再看 y_expect 能不能
  * 逐位对上；只有前者过、后者不过，说明卷积算对了但定点模型猜错了。
  */
+#include <cmath>
 #include "fused_conv2d_golden.h"
 #include <cstdio>
 #include <cstdlib>
@@ -50,11 +51,13 @@ int main(int argc, char** argv)
     Inputs in = GenerateInputs();
     Golden g = BuildGolden(in);
 
-    std::printf("golden: conv1 峰值 %.4f -> shift %d   conv2 峰值 %.4f -> shift %d   饱和 %ld\n",
-                g.peak1, g.shift1, g.peak2, g.shift2, g.sat);
+    // S 是下发的属性；真正决定定标的是 F = 58 - S，两个都打出来，免得又搞反。
+    std::printf("golden: conv1 峰值 %.4f -> 定标 2^%d (属性 S=%d)   "
+                "conv2 峰值 %.4f -> 定标 2^%d (属性 S=%d)   饱和 %ld\n",
+                g.peak1, g.deqExp1, g.shift1, g.peak2, g.deqExp2, g.shift2, g.sat);
     std::printf("golden: y 非零 %ld / %zu\n", g.yNonZero, g.yFixed.size());
     if (g.yNonZero == 0) { std::printf("[X] golden 全是 0\n"); return 1; }
-    if (g.sat != 0) { std::printf("[X] 定点累加溢出了 int32 %ld 次 —— shift 挑大了\n", g.sat); return 1; }
+    if (g.sat != 0) { std::printf("[X] 定点累加溢出了 int32 %ld 次 —— 定标 F 挑大了（即 S 挑小了）\n", g.sat); return 1; }
 
     std::FILE* f = std::fopen(path, "wb");
     if (f == nullptr) { std::printf("[X] 打不开 %s\n", path); return 1; }
@@ -93,5 +96,7 @@ int main(int argc, char** argv)
     if (!ok) { std::printf("[X] 写 %s 失败\n", path); return 1; }
     std::printf("\n[OK] 写出 %s\n     5 个输入 + 2 个 golden，共 %u 个张量\n", path, ntensors);
     std::printf("     算子属性 fixed_shift1 = %d, fixed_shift2 = %d（已打包进 header）\n", g.shift1, g.shift2);
+    std::printf("     对应的累加器定标 2^%d / 2^%d，LSB = %.3g / %.3g\n",
+                g.deqExp1, g.deqExp2, std::ldexp(1.0, -g.deqExp1), std::ldexp(1.0, -g.deqExp2));
     return 0;
 }

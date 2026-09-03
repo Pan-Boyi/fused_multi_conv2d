@@ -7,34 +7,42 @@
  * 全程定点（f162s32），没有量化、没有向量。权重 FRACTAL_Z fp16（C0 = 16）。
  *
  * ===========================================================================
- * 这份 golden 里哪些是确证的、哪些是假设 —— 先说清楚。
+ * 定标语义 —— 已从 CANN 源码确证，不再是假设。
  * ===========================================================================
  *
- * 确证（读 CANN / ops-nn 源码得到）：
  *   * cube 走 f162s32：half x half -> int32，带 fixShiftVal 操作数
  *     (dav_m510/kernel_operator_mm_impl.h:355)
  *   * fixedShiftValue 是算子属性，范围 [0, 58]
  *     (conv2d_v2_base_tiling_check_attrs.cpp:449 CheckFixedShiftValueLegal)
- *   * 三个消费者的方向：mmad 用原值，L1->BT 和 fixpipe 用 58 - 原值
+ *   * 三个消费者的方向：mmad 用原值 S，L1->BT 和 fixpipe 用 58 - S
  *     (conv2d_small_kernel.h:354 / :937 / :1111)
- *   * fixpipe 的 deqScalar 恒为 float 1.0 的位型，缩放全由 shift 完成
- *     (conv2d_small_kernel.h:27 FLOAT_ONE_FIXED_POINT / :1160)
+ *   * **出口的反缩放系数就是 2^-(58-S)**。DEQF16 模式下 fixpipe 根本不看
+ *     deqScalar，只按 shift 现搭一个 float 出来：
+ *       (dav_m510/kernel_operator_fixpipe_impl.h:77 SetDeqScalarDepOnMode)
+ *         uint64_t newExponent = (127 - shiftVal) & 0xFF;
+ *         uint64_t newScalar   = (floatOne & ~mask) | (newExponent << shift);
+ *     指数为 127-F 的 float 就是 2^-F，而 F 正是传给 fixpipe 的那个数 58 - S。
  *
- * **假设**（没有文档，也没有硬件实测）：
- *   fixedShiftValue = S 表示定点表示的二进制小数点位置，即
- *       acc_int32 = round( sum(a*b) * 2^S ) + round(bias * 2^S)
- *       out_fp16  = fp16( acc_int32 * 2^-S )
- *   那个 58 是硬件移位域的宽度，所以出口方向写成 58 - S。
+ * 所以定点模型是（记 F = 58 - S）：
+ *       acc_int32 = round( sum(a*b) * 2^F ) + round( bias * 2^F )
+ *       out_fp16  = fp16( acc_int32 * 2^-F )
  *
- * 这个假设**必须先在板上验**再依赖：拿现成的 conv2d_v2 跑一个小 shape，同一组
- * 输入把 fixedShiftValue 从 0 扫到 58，看输出是不是每加 1 就整体乘/除 2。在那之
- * 前，下面 GoldenFixed() 算出来的数只能当参考，不能当判据。
+ * **S 越大，累加器的定标越小。** 上一版把这个方向写反了（拿 S 直接当 2 的指
+ * 数），于是 S=26 在板上实际跑成 2^32：几乎每个非零点都溢出 int32 并回绕，符
+ * 号退化成掷硬币。板上的表征很干脆 —— 非零元素一个都没对上，对上的 216604 个
+ * **全部**是两边都为零的点。那不是缩放错了，是回绕了。
  *
- * 所以这份 golden 同时给两个答案：
+ * 还没实测的只剩一件事：那次 round 发生在哪一级 —— 每个乘积各 round 一次、每
+ * 条 mmad 指令一次、还是整条 K 累完再 round。下面按「累完再 round」建模（误差
+ * 最小的那种）。三者的差别至多是累加器的几十个 LSB，对靠近峰值的输出远在 fp16
+ * 的 1 个 ULP 之下，只有接近零的输出才可能差最后几位。所以比对脚本会额外报一
+ * 行「以累加器 LSB 计的偏差」：偏差全在个位数 LSB 以内，就说明只是 round 的级
+ * 别猜得不同，卷积本身是对的。
+ *
+ * 两个 golden 都仍然给：
  *   GoldenExact()  纯 fp32 参考 —— 「这个算子到底有没有在算这个卷积」，用相对
- *                  误差判，不受上面那个假设影响；
- *   GoldenFixed(S) 定点模型 —— 假设成立时应当逐位相等。
- * 板上先看 GoldenExact 的相对误差；过了再看 GoldenFixed 能不能逐位对上。
+ *                  误差判，完全不依赖定点模型；
+ *   GoldenFixed(S) 定点模型 —— 上面那条链成立时应当逐位相等。
  */
 #ifndef FUSED_CONV2D_GOLDEN_H
 #define FUSED_CONV2D_GOLDEN_H
@@ -200,7 +208,7 @@ inline void WeightFromFractalZ(const uint16_t* dev, int cin, int cout, std::vect
 // 卷积。两条路：
 //   ConvFwdExact  纯 fp32 累加 —— 「这个算子有没有在算这个卷积」的判据，不受
 //                 定点模型的假设影响。
-//   ConvFwdFixed  定点模型 —— 假设 acc_int32 = round(sum(a*b) * 2^S)。
+//   ConvFwdFixed  定点模型 —— acc_int32 = round(sum(a*b) * 2^F)，F = 58 - S。
 //
 // 两条都在 fp32 里做乘加（fp16 输入本来就能精确转 fp32），差别只在结果怎么落格。
 // 输入输出都是 NCHW 的 fp16 位型。
@@ -210,13 +218,18 @@ struct ConvSpec {
 };
 
 // 返回每个输出点的精确 sum(a*b)（不含 bias），供上层落格用。
-inline void ConvFwdRaw(const uint16_t* in, const uint16_t* wt, const ConvSpec& sp, std::vector<double>& acc)
+// absAcc 非空时同时返回 sum|a*b| —— 累加器里跑的是**部分和**，最终值不溢出不代表
+// 中途不溢出。sum|a*b| 是任何 mmad 次序下部分和的保守上界，定标就按它挑。
+inline void ConvFwdRaw(const uint16_t* in, const uint16_t* wt, const ConvSpec& sp, std::vector<double>& acc,
+                       std::vector<double>* absAcc = nullptr)
 {
     acc.assign((size_t)sp.cout * sp.ho * sp.wo, 0.0);
+    if (absAcc != nullptr) absAcc->assign((size_t)sp.cout * sp.ho * sp.wo, 0.0);
     for (int co = 0; co < sp.cout; ++co) {
         for (int oh = 0; oh < sp.ho; ++oh) {
             for (int ow = 0; ow < sp.wo; ++ow) {
                 double sum = 0.0;
+                double asum = 0.0;
                 for (int ci = 0; ci < sp.cin; ++ci) {
                     for (int kh = 0; kh < KH; ++kh) {
                         const int ih = oh * sp.stride + kh - PAD;
@@ -227,43 +240,68 @@ inline void ConvFwdRaw(const uint16_t* in, const uint16_t* wt, const ConvSpec& s
                             const float a = F16BitsToF32(in[((size_t)ci * sp.hi + ih) * sp.wi + iw]);
                             const float b = F16BitsToF32(wt[(((size_t)co * sp.cin + ci) * KH + kh) * KW + kw]);
                             sum += (double)a * (double)b;
+                            asum += std::fabs((double)a * (double)b);
                         }
                     }
                 }
                 acc[((size_t)co * sp.ho + oh) * sp.wo + ow] = sum;
+                if (absAcc != nullptr) (*absAcc)[((size_t)co * sp.ho + oh) * sp.wo + ow] = asum;
             }
         }
     }
 }
 
-// 给定这一层的原始累加值，报告 int32 不溢出所允许的最大 S。
-// 这就是标定 fixed_shift1 / fixed_shift2 该用的数：取它，或比它小一两位留余量。
-inline int MaxSafeShift(const std::vector<double>& acc, const uint16_t* bias, int cout, int hw, double* peak)
+// 报告 int32 不溢出所允许的最大**反缩放指数 F**。
+//
+// 约束取在**部分和**上，不是最终值上：L0C 一路累加，中途的部分和最大能到
+// sum|a*b| + |bias|，这个 shape 下它比 |最终值| 大 3 倍还多。最终值不溢出而部分
+// 和溢出时，结果对不对取决于 L0C 的加法器是回绕还是饱和 —— 我没有依据断定是哪
+// 一种，所以直接按上界挑，把这个问题消掉。代价是 conv1 少 2 位、conv2 少 1 位
+// 精度，而定点格本来就比 fp16 的 ULP 细上千倍，这点损失看不见。
+//
+// 注意 F 不是算子属性：属性是 S = 58 - F（见文件头）。要属性值请过一道
+// AttrFromDeqExp()，别把这个返回值直接当 fixed_shift 下发 —— 上一版就是这么错的。
+inline int MaxSafeDeqExp(const std::vector<double>& acc, const std::vector<double>& absAcc, const uint16_t* bias,
+                         int cout, int hw, double* peak, double* peakPartial)
 {
     double m = 0.0;
+    double mp = 0.0;
     for (int co = 0; co < cout; ++co) {
         const double b = (double)F16BitsToF32(bias[co]);
+        const double ab = std::fabs(b);
         for (int i = 0; i < hw; ++i) {
             const double v = std::fabs(acc[(size_t)co * hw + i] + b);
             if (v > m) m = v;
+            const double p = absAcc[(size_t)co * hw + i] + ab;
+            if (p > mp) mp = p;
         }
     }
     *peak = m;
-    if (m <= 0.0) return FIX_SHIFT_LEN_A16W16;
-    int S = 0;
-    while (S < FIX_SHIFT_LEN_A16W16 && m * std::ldexp(1.0, S + 1) < 2147483000.0) ++S;
-    return S;
+    *peakPartial = mp;
+    if (mp <= 0.0) return FIX_SHIFT_LEN_A16W16;
+    int F = 0;
+    while (F < FIX_SHIFT_LEN_A16W16 && mp * std::ldexp(1.0, F + 1) < 2147483000.0) ++F;
+    return F;
+}
+
+// 反缩放指数 F -> 算子属性 S。两者之和恒为 58。
+inline int AttrFromDeqExp(int deqExp)
+{
+    const int S = FIX_SHIFT_LEN_A16W16 - deqExp;
+    return S < 0 ? 0 : (S > FIX_SHIFT_LEN_A16W16 ? FIX_SHIFT_LEN_A16W16 : S);
 }
 
 // 定点落格 + bias + relu -> fp16 位型。
-//   acc_i32 = round(sum * 2^S) + round(bias * 2^S)
-//   out     = fp16(acc_i32 * 2^-S)，再 relu
-// bias 的那一次 round 对应 kernel 里 L1->BT 带 fixShiftVal 的那条搬运。
-inline void FixedEpilogue(const std::vector<double>& acc, const uint16_t* bias, int cout, int hw, int S, bool relu,
-                          std::vector<uint16_t>& out, long* satCount)
+// attrShift 是**算子属性 S**；实际用的反缩放指数是 F = 58 - S（推导见文件头）。
+//   acc_i32 = round(sum * 2^F) + round(bias * 2^F)
+//   out     = fp16(acc_i32 * 2^-F)，再 relu
+// bias 的那一次 round 对应 kernel 里 L1->BT 带 fixShiftVal = 58 - S 的那条搬运。
+inline void FixedEpilogue(const std::vector<double>& acc, const uint16_t* bias, int cout, int hw, int attrShift,
+                          bool relu, std::vector<uint16_t>& out, long* satCount)
 {
     out.assign((size_t)cout * hw, 0);
-    const double scale = std::ldexp(1.0, S);
+    const int deqExp = FIX_SHIFT_LEN_A16W16 - attrShift;
+    const double scale = std::ldexp(1.0, deqExp);
     for (int co = 0; co < cout; ++co) {
         const double bq = std::nearbyint((double)F16BitsToF32(bias[co]) * scale);
         for (int i = 0; i < hw; ++i) {
@@ -314,8 +352,10 @@ struct Inputs {
 struct Golden {
     std::vector<uint16_t> midFixed, yFixed;   // 定点模型
     std::vector<uint16_t> midExact, yExact;   // 纯 fp32 参考
-    int shift1 = 0, shift2 = 0;
-    double peak1 = 0, peak2 = 0;
+    int shift1 = 0, shift2 = 0;      // 算子属性 S（下发给 fixed_shift1/2）
+    int deqExp1 = 0, deqExp2 = 0;    // 实际定标指数 F = 58 - S
+    double peak1 = 0, peak2 = 0;              // |最终值 + bias| 的峰值
+    double peakPartial1 = 0, peakPartial2 = 0; // sum|a*b| + |bias| 的峰值，定标按它挑
     long sat = 0;
     long yNonZero = 0;
 };
@@ -338,26 +378,28 @@ inline Inputs GenerateInputs()
     return in;
 }
 
-// shiftFor* 传 -1 表示「按数据自动挑一个安全的 S」，否则用给定值。
+// shiftFor* 是**算子属性 S**。传 -1 表示按数据自动挑（先算安全的 F，再取 58-F）。
 inline Golden BuildGolden(const Inputs& in, int shiftFor1 = -1, int shiftFor2 = -1)
 {
     Golden g;
     const ConvSpec sp1{CI, HI, WI, COUT1, HO1, WO1, STRIDE1};
-    std::vector<double> acc1;
-    ConvFwdRaw(in.xNchw.data(), in.w1Nchw.data(), sp1, acc1);
+    std::vector<double> acc1, abs1;
+    ConvFwdRaw(in.xNchw.data(), in.w1Nchw.data(), sp1, acc1, &abs1);
     const int hw1 = HO1 * WO1;
-    const int auto1 = MaxSafeShift(acc1, in.b1.data(), COUT1, hw1, &g.peak1);
-    g.shift1 = shiftFor1 >= 0 ? shiftFor1 : auto1;
+    const int autoExp1 = MaxSafeDeqExp(acc1, abs1, in.b1.data(), COUT1, hw1, &g.peak1, &g.peakPartial1);
+    g.shift1 = shiftFor1 >= 0 ? shiftFor1 : AttrFromDeqExp(autoExp1);
+    g.deqExp1 = FIX_SHIFT_LEN_A16W16 - g.shift1;
     FixedEpilogue(acc1, in.b1.data(), COUT1, hw1, g.shift1, true, g.midFixed, &g.sat);
     ExactEpilogue(acc1, in.b1.data(), COUT1, hw1, true, g.midExact);
 
     const ConvSpec sp2{COUT1, HO1, WO1, COUT2, HO2, WO2, STRIDE2};
-    std::vector<double> acc2;
+    std::vector<double> acc2, abs2;
     // conv2 吃的是 conv1 的**定点**结果 —— 板上就是这条链，不能拿 exact 的中间值。
-    ConvFwdRaw(g.midFixed.data(), in.w2Nchw.data(), sp2, acc2);
+    ConvFwdRaw(g.midFixed.data(), in.w2Nchw.data(), sp2, acc2, &abs2);
     const int hw2 = HO2 * WO2;
-    const int auto2 = MaxSafeShift(acc2, in.b2.data(), COUT2, hw2, &g.peak2);
-    g.shift2 = shiftFor2 >= 0 ? shiftFor2 : auto2;
+    const int autoExp2 = MaxSafeDeqExp(acc2, abs2, in.b2.data(), COUT2, hw2, &g.peak2, &g.peakPartial2);
+    g.shift2 = shiftFor2 >= 0 ? shiftFor2 : AttrFromDeqExp(autoExp2);
+    g.deqExp2 = FIX_SHIFT_LEN_A16W16 - g.shift2;
     FixedEpilogue(acc2, in.b2.data(), COUT2, hw2, g.shift2, true, g.yFixed, &g.sat);
 
     std::vector<double> acc2e;
