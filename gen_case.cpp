@@ -47,7 +47,7 @@ constexpr uint32_t ACL_DT_FLOAT16 = 1;
 //   mid          只有 conv2 恒等，conv1 保持随机
 //                y 直接暴露 conv1 的输出（下采样后），把 conv1 单独拎出来看。
 // ---------------------------------------------------------------------------
-enum class Probe { None, Passthrough, Mid };
+enum class Probe { None, Passthrough, Mid, ChanId, ColId };
 
 // NCHW [cout][cin][KH][KW]：co == ci 的中心抽头置 1.0，其余全 0。
 // cout > cin 时多出来的输出通道全 0 —— golden 会照样算出来，不用特殊处理。
@@ -60,10 +60,33 @@ static void MakeIdentityWeight(std::vector<uint16_t>& w, int cout, int cin)
     }
 }
 
+// 把 x 换成「编号斜坡」：每个位置的值只编码它的通道号（或列号），乘上一个很小的
+// 比例因子。恒等权重下正确的输出就是同一个编号，于是设备打出来的数**直接读出**
+// 数据实际落到了哪里 —— 不用再从错误里反推。
+//
+// 比例因子取 2^-14（fp16 最小的正规数，(c+1)*2^-14 到 32 都能精确表示）。选这么
+// 小是为了不饱和：acc = 真值 * 2^E，真值 <= 32*2^-14 时 E 到 39 都还在 int32 内。
+// 上一轮 passthrough 几乎全饱和在 32768，信息被抹掉了，这次要留出读数的余量。
+static void FillRamp(std::vector<uint16_t>& x, bool byChannel)
+{
+    const float unit = std::ldexp(1.0f, -14);
+    for (int c = 0; c < CI; ++c) {
+        for (int h = 0; h < HI; ++h) {
+            for (int w = 0; w < WI; ++w) {
+                const int id = byChannel ? c : w;
+                x[((size_t)c * HI + h) * WI + w] = F32ToF16Bits((float)(id + 1) * unit);
+            }
+        }
+    }
+}
+
 static void ApplyProbe(Inputs& in, Probe mode)
 {
     if (mode == Probe::None) return;
-    if (mode == Probe::Passthrough) {
+    if (mode == Probe::ChanId || mode == Probe::ColId) {
+        FillRamp(in.xNchw, mode == Probe::ChanId);
+    }
+    if (mode == Probe::Passthrough || mode == Probe::ChanId || mode == Probe::ColId) {
         MakeIdentityWeight(in.w1Nchw, COUT1, CI);
         std::fill(in.b1.begin(), in.b1.end(), (uint16_t)0);
     }
@@ -103,8 +126,10 @@ int main(int argc, char** argv)
             const char* v = a + 8;
             if (std::strcmp(v, "passthrough") == 0)      { probe = Probe::Passthrough; probeName = v; }
             else if (std::strcmp(v, "mid") == 0)          { probe = Probe::Mid;         probeName = v; }
+            else if (std::strcmp(v, "chanid") == 0)       { probe = Probe::ChanId;      probeName = v; }
+            else if (std::strcmp(v, "colid") == 0)        { probe = Probe::ColId;       probeName = v; }
             else if (std::strcmp(v, "none") == 0)         { probe = Probe::None;        probeName = v; }
-            else { std::printf("[X] --probe 只认 none / passthrough / mid，收到 %s\n", v); return 1; }
+            else { std::printf("[X] --probe 只认 none/passthrough/mid/chanid/colid，收到 %s\n", v); return 1; }
         } else if (a[0] == '-') {
             std::printf("[X] 不认识的参数 %s\n", a); return 1;
         } else {

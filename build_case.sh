@@ -62,7 +62,7 @@ SZ=$(wc -c < "$HERE/fused_conv2d_case.bin" | tr -d " \t")   # macOS 的 wc 会�
 step "3.5) 顺带生成两个探针 case"
 # 探针 = 把某一层权重换成中心抽头恒等，把两层拆开单独看。权重是运行时输入不是
 # 属性，所以这些 .bin 和正常 case 用**同一个 .om**，不用重编。
-for pm in passthrough mid; do
+for pm in passthrough mid chanid colid; do
     "$HERE/gen_case" "$HERE/fused_conv2d_probe_$pm.bin" "--probe=$pm" >/dev/null 2>&1
     if [ -f "$HERE/fused_conv2d_probe_$pm.bin" ]; then
         printf '  %-38s %s 字节\n' "fused_conv2d_probe_$pm.bin" \

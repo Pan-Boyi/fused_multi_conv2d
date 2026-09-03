@@ -71,6 +71,9 @@ PROBES = {
     1: "passthrough —— conv1/conv2 都恒等、bias 全 0；y 应当 == relu(x[c][2h][2w])，"
        "c>=32 全 0。纯数据搬运测试，和 fixShiftVal 无关",
     2: "mid —— 只有 conv2 恒等；y 直接暴露 conv1 的输出（下采样后）",
+    3: "chanid —— 恒等权重 + x[c][h][w] = (c+1)*2^-14；每个输出通道的值直接编码"
+       "「哪个输入通道落到了这里」",
+    4: "colid —— 恒等权重 + x[c][h][w] = (w+1)*2^-14；值编码「哪一列落到了这里」",
 }
 # attrs 的低 8 位是 fixed_shift1，次 8 位是 fixed_shift2。放在文件里而不是脚本
 # 里写死，是因为它由 golden 按数据算出来，主机和设备必须用同一个值。
@@ -414,6 +417,64 @@ def idx_label(i, dims):
     plane = dims[2] * dims[3]
     c, sp = i // plane, i % plane
     return "c%d h%d w%d" % (c, sp // dims[3], sp % dims[3])
+
+
+def report_idmap(got, dims, probe):
+    """编号斜坡探针的读数表。
+
+    x 里每个位置的值只编码它的通道号（或列号），恒等权重下输出应当是同一个编号。
+    所以设备打出来的值除以最小的那个，就是「实际落到这里的是几号」—— 不用从错误里
+    反推排布，直接读。比例是自归一的，所以不受未知的 2^E 定标影响。
+
+    每个输出通道取众数（同一通道内所有位置本该是同一个值），并报告：
+      modal      该通道出现最多的非零值
+      id         modal / 全局最小 modal - 1，即实际落到这里的编号
+      一致率     取到众数的位置占比。远小于 1 说明同一通道内部就不一致，
+                 那不是通道置换，是空间上也错位了。
+      饱和       该通道里顶到 32768 的位置数；饱和会毁掉读数，要单独看
+    """
+    plane = dims[2] * dims[3]
+    nch = dims[1]
+    sat = 32768.0
+    rows = []
+    gmin = None
+    for c in range(nch):
+        cnt = {}
+        nsat = 0
+        for i in range(c * plane, (c + 1) * plane):
+            v = got[0][i]
+            if v >= sat:
+                nsat += 1
+                continue
+            if v == 0.0:
+                continue
+            cnt[v] = cnt.get(v, 0) + 1
+        if cnt:
+            modal = max(cnt, key=lambda k: cnt[k])
+            agree = cnt[modal] / float(plane)
+            if gmin is None or modal < gmin:
+                gmin = modal
+        else:
+            modal, agree = 0.0, 0.0
+        rows.append((c, modal, agree, nsat, len(cnt)))
+
+    label = "输入通道" if probe == 3 else "列号"
+    print("\n[编号读数] 每个输出通道的众数值 -> 实际落在这里的%s" % label)
+    print("       全局最小众数 = %s（当作编号 0 的刻度）" % ("%.6g" % gmin if gmin else "无"))
+    print("       %-4s %-14s %-6s %-8s %-7s %s" % ("c", "众数", "实测id", "一致率", "饱和数", "应为"))
+    for c, modal, agree, nsat, ndist in rows:
+        want = str(c) if c < 32 else "0(空)"
+        if modal == 0.0:
+            got_id = "-" if nsat == 0 else "全饱和"
+        else:
+            got_id = "%.2f" % (modal / gmin - 1.0) if gmin else "?"
+        flag = ""
+        if modal == 0.0 and nsat == 0 and c >= 32:
+            flag = "  OK(空)"
+        elif gmin and modal and abs(modal / gmin - 1.0 - c) < 0.01 and c < 32 and nsat == 0:
+            flag = "  OK"
+        print("       %-4d %-14.6g %-6s %-8.4f %-7d %s%s"
+              % (c, modal, got_id, agree, nsat, want, flag))
 
 
 def report_lsb(got, want, r, mismatches, dims, shift2):
@@ -834,6 +895,8 @@ def main():
         # 拿真值反推定标。和 y_expect 比没意义 —— 那是按（可能错的）模型算出来的。
         probe_acc_scale(got, exact, r["n"], shift2, y_dims)
         print_sample(got, want, exact, r["n"], y_dims)
+    if probe in (3, 4):
+        report_idmap(got, y_dims, probe)
 
     # 设备原始输出落盘。默认**关**：板子那台机器上的文件多半传不出来，存了也是垃圾。
     # 真要离线分析再 FC2D_DUMP=<路径> 打开。分析所需的结论上面几段已经在设备上算完了。
