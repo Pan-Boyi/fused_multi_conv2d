@@ -697,10 +697,34 @@ def evaluate(got, want, rel_tol, sentinel=Y_SENTINEL_U16):
 
 # ---------------------------------------------------------------- main
 def main():
-    case_path = sys.argv[1] if len(sys.argv) > 1 else "fused_conv2d_case.bin"
-    op_type = sys.argv[2] if len(sys.argv) > 2 else "FusedConv2d"
-    device_id = int(sys.argv[3]) if len(sys.argv) > 3 else 0
-    om_arg = sys.argv[4] if len(sys.argv) > 4 else None
+    # 参数是位置式的，而最自然的写法 `脚本 case.bin om_out/fp16` 会把 om 目录
+    # 撞到「算子名」那一位上 —— 于是去找一个名叫 "om_out/fp16/" 的算子，报
+    # MatchOpModel fail，看着像算子没装。真踩过，所以这里按**形状**认参数，
+    # 不强求顺序：带 / 或者是个已存在的目录，那就是 om 目录；纯数字是 device。
+    argv = sys.argv[1:]
+    case_path, op_type, device_id, om_arg = "fused_conv2d_case.bin", "FusedConv2d", 0, None
+    positional = []
+    for a in argv:
+        if os.path.isdir(a) or ("/" in a) or ("\\" in a):
+            if om_arg is None:
+                om_arg = a
+            else:
+                die("给了两个像目录的参数：%s 和 %s" % (om_arg, a))
+        elif a.isdigit():
+            device_id = int(a)
+        else:
+            positional.append(a)
+    if positional:
+        case_path = positional[0]
+    if len(positional) > 1:
+        op_type = positional[1]
+    if len(positional) > 2:
+        die("多余的参数：%s\n        用法: %s <case.bin> [算子名] [device_id] [om目录]\n"
+            "        顺序随意 —— 带 / 的当 om 目录，纯数字当 device_id。"
+            % (positional[2:], os.path.basename(sys.argv[0])))
+    if not os.path.isfile(case_path):
+        die("找不到 case 文件 %s\n        用法: %s <case.bin> [算子名] [device_id] [om目录]"
+            % (case_path, os.path.basename(sys.argv[0])))
 
     def env_num(name, default, cast):
         v = os.environ.get(name)
