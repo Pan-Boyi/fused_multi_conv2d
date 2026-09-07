@@ -223,6 +223,12 @@ def load_acl():
     # 这两个只有用离线模型时才需要，缺了不该在这里就把脚本打死 ——
     # 用到的时候再报，那时的报错还能顺带说清楚该退回哪条路。
     opt = [
+        # 这两个只有 int8 通路用。放**可选**里：fp16 那条已经在跑了，不该因为
+        # 我新增的依赖而在缺这两个函数的 CANN 上直接 die。真要用时再报缺。
+        # 注意签名必须注册，否则 ctypes 不知道怎么转 float/bool，报
+        # "Don't know how to convert parameter 3"。
+        ("aclopSetAttrFloat", [c_vp, ctypes.c_char_p, ctypes.c_float], ctypes.c_int),
+        ("aclopSetAttrBool", [c_vp, ctypes.c_char_p, ctypes.c_uint8], ctypes.c_int),
         ("aclopSetModelDir", [c_cp], c_i),
         ("aclopLoad", [c_vp, c_sz], c_i),
         ("aclGetRecentErrMsg", [], c_cp),
@@ -913,18 +919,31 @@ def main():
         setattr_fn = getattr(acl, "aclopSetAttrInt", None)
         if setattr_fn is None:
             die("这个 CANN 的 libascendcl.so 里没有 aclopSetAttrInt —— 属性传不下去")
+        # 下发的属性集必须和编 .om 时那份**完全一致** —— ACL 匹配 .om 是连 attr
+        # 一起匹配的，多设一个或少设一个都会 MatchOpModel fail，而报出来是
+        # 100024 / "算子没找到"。所以两条通路各设各的，不能叠加：
+        #   fp16   fixed_shift1/2                       （singleop_fp16.json）
+        #   int8   quant_scale1/2 + relu1/2             （singleop_int8.json）
         if info["isInt8"]:
-            # int8 通路：缩放走 quant_scale（float），fixed_shift 不参与。
+            for fn in ("aclopSetAttrFloat", "aclopSetAttrBool"):
+                if getattr(acl, fn, None) is None:
+                    die("这个 CANN 的 libascendcl.so 里没有 %s —— int8 通路的属性传不下去。\n"
+                        "        fp16 通路不受影响（它只用 aclopSetAttrInt）。" % fn)
             for nm, v in (("quant_scale1", info["qs1"]), ("quant_scale2", info["qs2"])):
-                check(acl.aclopSetAttrFloat(attr, nm, v), "aclopSetAttrFloat(" + nm + ") = %d")
+                rc = acl.aclopSetAttrFloat(attr, nm.encode(), ctypes.c_float(v))
+                if rc != ACL_SUCCESS:
+                    die("aclopSetAttrFloat(%s=%g) = %d" % (nm, v, rc))
             for nm, v in (("relu1", info["relu"]), ("relu2", info["relu"])):
-                check(acl.aclopSetAttrBool(attr, nm, v), "aclopSetAttrBool(" + nm + ") = %d")
-            print("算子属性: quant_scale1=%.9g quant_scale2=%.9g relu=%s"
+                rc = acl.aclopSetAttrBool(attr, nm.encode(), 1 if v else 0)
+                if rc != ACL_SUCCESS:
+                    die("aclopSetAttrBool(%s=%s) = %d" % (nm, v, rc))
+            print("算子属性: quant_scale1=%.9g quant_scale2=%.9g relu1=relu2=%s"
                   % (info["qs1"], info["qs2"], info["relu"]))
-        for nm, v in (("fixed_shift1", shift1), ("fixed_shift2", shift2)):
-            rc = setattr_fn(attr, nm.encode(), v)
-            if rc != ACL_SUCCESS:
-                die("aclopSetAttrInt(%s=%d) = %d" % (nm, v, rc))
+        else:
+            for nm, v in (("fixed_shift1", shift1), ("fixed_shift2", shift2)):
+                rc = setattr_fn(attr, nm.encode(), v)
+                if rc != ACL_SUCCESS:
+                    die("aclopSetAttrInt(%s=%d) = %d" % (nm, v, rc))
 
         def launch():
             return acl.aclopExecuteV2(op_type.encode(), NIN, in_desc, in_buf,
