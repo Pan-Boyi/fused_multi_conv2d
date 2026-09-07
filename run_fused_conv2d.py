@@ -702,6 +702,9 @@ def main():
     # MatchOpModel fail，看着像算子没装。真踩过，所以这里按**形状**认参数，
     # 不强求顺序：带 / 或者是个已存在的目录，那就是 om 目录；纯数字是 device。
     argv = sys.argv[1:]
+    dry_run = "--dry-run" in argv
+    if dry_run:
+        argv = [a for a in argv if a != "--dry-run"]
     case_path, op_type, device_id, om_arg = "fused_conv2d_case.bin", "FusedConv2d", 0, None
     positional = []
     for a in argv:
@@ -722,6 +725,10 @@ def main():
         die("多余的参数：%s\n        用法: %s <case.bin> [算子名] [device_id] [om目录]\n"
             "        顺序随意 —— 带 / 的当 om 目录，纯数字当 device_id。"
             % (positional[2:], os.path.basename(sys.argv[0])))
+    # --dry-run：不碰硬件，用 golden 冒充设备输出把主流程走一遍。加它是因为
+    # 「只在板上才炸」的问题（比如 int8 没有 y_exact，而下面按 ORDER + GOLDENS
+    # 遍历会 KeyError）本地发现不了 —— 单独测 load_case 和 evaluate 不够，
+    # 得真的走完 main()。
     if not os.path.isfile(case_path):
         die("找不到 case 文件 %s\n        用法: %s <case.bin> [算子名] [device_id] [om目录]"
             % (case_path, os.path.basename(sys.argv[0])))
@@ -787,156 +794,176 @@ def main():
             % (len(want_raw), y_elems, y_elems * yElemBytes))
     want = decode_y(want_raw, info["isInt8"])
     print("case 文件 OK：")
+    # 只列**存在**的张量：int8 通路没有 y_exact（它的 golden 是精确整数模型，
+    # 不需要 fp16 那边的"纯 fp32 参考"）。写死成 ORDER + GOLDENS 会 KeyError。
     for name in ORDER + GOLDENS:
+        if name not in tensors:
+            continue
         dtype, dims, data = tensors[name]
         print("  %-9s %-6s %-16s %9d 字节" % (name, DTYPE_NAME[dtype], dims, len(data)))
-    print("定点定标（来自 header，将作为算子属性下发）: fixed_shift1=%d fixed_shift2=%d"
-          % (shift1, shift2))
-    print("            对应累加器定标 2^%d / 2^%d —— 属性越大定标越小，别搞反"
-          % (FIX_SHIFT_LEN - shift1, FIX_SHIFT_LEN - shift2))
+    if info["isInt8"]:
+        print("量化系数（来自 header，将作为算子属性下发）: quant_scale1=%.9g quant_scale2=%.9g  relu=%s  bias=%s"
+              % (info["qs1"], info["qs2"], "on" if info["relu"] else "off",
+                 "on" if info["hasBias"] else "off"))
+        print("            out_int8 = saturate( round( acc_int32 * quant_scale ) )，再 relu")
+    else:
+        print("定点定标（来自 header，将作为算子属性下发）: fixed_shift1=%d fixed_shift2=%d"
+              % (shift1, shift2))
+        print("            对应累加器定标 2^%d / 2^%d —— 属性越大定标越小，别搞反"
+              % (FIX_SHIFT_LEN - shift1, FIX_SHIFT_LEN - shift2))
     print("golden: nonzero=%d/%d sat=%d" % (gold_nonzero, y_elems, sat))
     print("探针: %s" % PROBES.get(probe, "未知 id %d —— .bin 和脚本版本可能对不上" % probe))
     if gold_nonzero == 0:
         die("golden 全是 0 —— 先别管设备")
 
-    acl = load_acl()
+    # dry-run 连库都不加载 —— 它的目的就是在没有 CANN 的机器上验代码路径。
+    acl = None if dry_run else load_acl()
 
     def check(ret, msg):
         if ret != ACL_SUCCESS:
             die(msg % ret if "%d" in msg else "%s (ret=%d)" % (msg, ret))
 
-    check(acl.aclInit(None), "aclInit = %d")
-    # 离线模型的注册。要在 aclopExecuteV2 之前，和 aclrtSetDevice 的先后无所谓。
-    om_keep = []
-    if om_file is not None:
-        fn = getattr(acl, "aclopLoad", None)
-        if fn is not None:
-            with open(om_file, "rb") as f:
-                blob = f.read()
-            buf = ctypes.create_string_buffer(blob, len(blob))
-            om_keep.append(buf)  # 挡住 GC，ACL 可能还引用着这块内存
-            check(fn(ctypes.cast(buf, ctypes.c_void_p), len(blob)),
-                  "aclopLoad(%s) = " % os.path.basename(om_file) + "%d")
-            print("  aclopLoad OK (%d 字节)" % len(blob))
-        else:
-            d = os.path.dirname(om_file)
-            smd = getattr(acl, "aclopSetModelDir", None)
-            if smd is None:
-                die("这个 CANN 的 libascendcl.so 里既没有 aclopLoad 也没有 aclopSetModelDir，\n"
-                    "    用不了离线模型。只能在设备上装带这个算子的算子包。")
-            print("  [!] 这个 CANN 没有 aclopLoad，退回 aclopSetModelDir(%s)。" % d)
-            print("      注意这会把该目录下**所有** .om 都加载进来。")
-            check(smd(d.encode()), "aclopSetModelDir = %d")
-            print("  aclopSetModelDir OK")
-    elif om_dir is not None:
-        fn = getattr(acl, "aclopSetModelDir", None)
-        if fn is None:
-            die("这个 CANN 的 libascendcl.so 里没有 aclopSetModelDir，用不了离线模型目录")
-        check(fn(om_dir.encode()), "aclopSetModelDir(%s) = " % om_dir + "%d")
-        print("  aclopSetModelDir OK")
-    check(acl.aclrtSetDevice(device_id), "aclrtSetDevice(" + str(device_id) + ") = %d —— 芯片被占？")
-    stream = ctypes.c_void_p()
-    check(acl.aclrtCreateStream(ctypes.byref(stream)), "aclrtCreateStream = %d")
-
-    keep = []          # 挡住 GC：host 侧缓冲在 memcpy 之前不能被回收
-    dev_ptrs, descs, bufs = [], [], []
-
-    def make_operand(dtype, dims, data):
-        dev = ctypes.c_void_p()
-        check(acl.aclrtMalloc(ctypes.byref(dev), len(data), ACL_MEM_MALLOC_HUGE_FIRST),
-              "aclrtMalloc(%d) 失败, ret = " % len(data) + "%d")
-        host = ctypes.create_string_buffer(data, len(data))
-        keep.append(host)
-        check(acl.aclrtMemcpy(dev, len(data), ctypes.cast(host, ctypes.c_void_p),
-                              len(data), ACL_MEMCPY_HOST_TO_DEVICE), "aclrtMemcpy H2D = %d")
-        arr = (ctypes.c_int64 * len(dims))(*dims)
-        desc = acl.aclCreateTensorDesc(dtype, len(dims), arr, ACL_FORMAT_ND)
-        if not desc:
-            die("aclCreateTensorDesc 返回 null")
-        buf = acl.aclCreateDataBuffer(dev, len(data))
-        if not buf:
-            die("aclCreateDataBuffer 返回 null")
-        dev_ptrs.append(dev)
-        descs.append(desc)
-        bufs.append(buf)
-
-    # ABI 顺序钉死，和 op_host/fused_conv2d_def.cpp 的 Input() 调用顺序一一对应：
-    #   x, scale_x, filter1, bias1, scale1, filter2, bias2, scale2 -> y
-    # 少传一个 ACL 不一定报错，它可能把后面的实参往前挪，于是 filter1 被当成 scale_x。
-    for name in ORDER:
-        dtype, dims, data = tensors[name]
-        make_operand(dtype, dims, data)
-
-    # 输出缓冲预填哨兵 127：kernel 一个字节都没写的话，读回来还是 127，
-    # 这是"返回码 0 但什么都没算"唯一能被抓住的地方。
+    # 这两个来自 case 文件本身，和跑不跑硬件无关，所以必须在分叉之前拿到 ——
+    # 之前它们在 ACL 那段里，dry-run 走不到，抽样处就 UnboundLocalError。
     y_dtype, y_dims, _ = tensors["y_expect"]
-    make_operand(y_dtype, y_dims, bytes([Y_SENTINEL_BYTE]) * (y_elems * yElemBytes))
+    if dry_run:
+        # 用 golden 冒充设备输出，把 ACL 之后的整段（比对、诊断、抽样、判据）
+        # 原样走一遍。目的不是验数值 —— 数值必然全对 —— 而是验**代码路径**：
+        # 两条通路的解码、属性打印、诊断分支都得能跑到底，不能只在板上才炸。
+        print("\n[dry-run] 不碰硬件，用 golden 冒充设备输出走一遍主流程")
+        got = want
+    else:
+        check(acl.aclInit(None), "aclInit = %d")
+        # 离线模型的注册。要在 aclopExecuteV2 之前，和 aclrtSetDevice 的先后无所谓。
+        om_keep = []
+        if om_file is not None:
+            fn = getattr(acl, "aclopLoad", None)
+            if fn is not None:
+                with open(om_file, "rb") as f:
+                    blob = f.read()
+                buf = ctypes.create_string_buffer(blob, len(blob))
+                om_keep.append(buf)  # 挡住 GC，ACL 可能还引用着这块内存
+                check(fn(ctypes.cast(buf, ctypes.c_void_p), len(blob)),
+                      "aclopLoad(%s) = " % os.path.basename(om_file) + "%d")
+                print("  aclopLoad OK (%d 字节)" % len(blob))
+            else:
+                d = os.path.dirname(om_file)
+                smd = getattr(acl, "aclopSetModelDir", None)
+                if smd is None:
+                    die("这个 CANN 的 libascendcl.so 里既没有 aclopLoad 也没有 aclopSetModelDir，\n"
+                        "    用不了离线模型。只能在设备上装带这个算子的算子包。")
+                print("  [!] 这个 CANN 没有 aclopLoad，退回 aclopSetModelDir(%s)。" % d)
+                print("      注意这会把该目录下**所有** .om 都加载进来。")
+                check(smd(d.encode()), "aclopSetModelDir = %d")
+                print("  aclopSetModelDir OK")
+        elif om_dir is not None:
+            fn = getattr(acl, "aclopSetModelDir", None)
+            if fn is None:
+                die("这个 CANN 的 libascendcl.so 里没有 aclopSetModelDir，用不了离线模型目录")
+            check(fn(om_dir.encode()), "aclopSetModelDir(%s) = " % om_dir + "%d")
+            print("  aclopSetModelDir OK")
+        check(acl.aclrtSetDevice(device_id), "aclrtSetDevice(" + str(device_id) + ") = %d —— 芯片被占？")
+        stream = ctypes.c_void_p()
+        check(acl.aclrtCreateStream(ctypes.byref(stream)), "aclrtCreateStream = %d")
 
-    NIN = len(ORDER)
-    in_desc = (ctypes.c_void_p * NIN)(*descs[:NIN])
-    in_buf = (ctypes.c_void_p * NIN)(*bufs[:NIN])
-    out_desc = (ctypes.c_void_p * 1)(descs[NIN])
-    out_buf = (ctypes.c_void_p * 1)(bufs[NIN])
+        keep = []          # 挡住 GC：host 侧缓冲在 memcpy 之前不能被回收
+        dev_ptrs, descs, bufs = [], [], []
 
-    # 两个定点定标是**必需属性**。顺序和 fused_conv2d_def.cpp 里 Attr() 的调用
-    # 顺序一致（fixed_shift1 在前），tiling 侧按 GetInt(0)/GetInt(1) 取。
-    attr = acl.aclopCreateAttr()
-    if not attr:
-        die("aclopCreateAttr 返回 null")
-    setattr_fn = getattr(acl, "aclopSetAttrInt", None)
-    if setattr_fn is None:
-        die("这个 CANN 的 libascendcl.so 里没有 aclopSetAttrInt —— 属性传不下去")
-    if info["isInt8"]:
-        # int8 通路：缩放走 quant_scale（float），fixed_shift 不参与。
-        for nm, v in (("quant_scale1", info["qs1"]), ("quant_scale2", info["qs2"])):
-            check(acl.aclopSetAttrFloat(attr, nm, v), "aclopSetAttrFloat(" + nm + ") = %d")
-        for nm, v in (("relu1", info["relu"]), ("relu2", info["relu"])):
-            check(acl.aclopSetAttrBool(attr, nm, v), "aclopSetAttrBool(" + nm + ") = %d")
-        print("算子属性: quant_scale1=%.9g quant_scale2=%.9g relu=%s"
-              % (info["qs1"], info["qs2"], info["relu"]))
-    for nm, v in (("fixed_shift1", shift1), ("fixed_shift2", shift2)):
-        rc = setattr_fn(attr, nm.encode(), v)
-        if rc != ACL_SUCCESS:
-            die("aclopSetAttrInt(%s=%d) = %d" % (nm, v, rc))
+        def make_operand(dtype, dims, data):
+            dev = ctypes.c_void_p()
+            check(acl.aclrtMalloc(ctypes.byref(dev), len(data), ACL_MEM_MALLOC_HUGE_FIRST),
+                  "aclrtMalloc(%d) 失败, ret = " % len(data) + "%d")
+            host = ctypes.create_string_buffer(data, len(data))
+            keep.append(host)
+            check(acl.aclrtMemcpy(dev, len(data), ctypes.cast(host, ctypes.c_void_p),
+                                  len(data), ACL_MEMCPY_HOST_TO_DEVICE), "aclrtMemcpy H2D = %d")
+            arr = (ctypes.c_int64 * len(dims))(*dims)
+            desc = acl.aclCreateTensorDesc(dtype, len(dims), arr, ACL_FORMAT_ND)
+            if not desc:
+                die("aclCreateTensorDesc 返回 null")
+            buf = acl.aclCreateDataBuffer(dev, len(data))
+            if not buf:
+                die("aclCreateDataBuffer 返回 null")
+            dev_ptrs.append(dev)
+            descs.append(desc)
+            bufs.append(buf)
 
-    def launch():
-        return acl.aclopExecuteV2(op_type.encode(), NIN, in_desc, in_buf,
-                                  1, out_desc, out_buf, attr, stream)
+        # ABI 顺序钉死，和 op_host/fused_conv2d_def.cpp 的 Input() 调用顺序一一对应：
+        #   x, scale_x, filter1, bias1, scale1, filter2, bias2, scale2 -> y
+        # 少传一个 ACL 不一定报错，它可能把后面的实参往前挪，于是 filter1 被当成 scale_x。
+        for name in ORDER:
+            dtype, dims, data = tensors[name]
+            make_operand(dtype, dims, data)
 
-    # 总共下发 warmup + repeat 次；只有后 repeat 次计入统计。
-    durs = []
-    for k in range(warmup + repeat):
-        t0 = time.perf_counter()
-        ret = launch()
-        if ret != ACL_SUCCESS:
-            if k == 0:
-                die('aclopExecuteV2("%s") = %d\n'
-                    "        走 .om（已 aclopSetModelDir）时最常见的其实不是「没装」，而是**匹配不上**：\n"
-                    "          ACL 拿 op 类型 + 每个 tensor 的 shape/dtype/format + **全部 attr 的值**\n"
-                    "          一起去匹配 .om，任何一项对不上都报成这个「算子没找到」。\n"
-                    "          本次下发的属性: fixed_shift1=%d fixed_shift2=%d\n"
-                    "          编 .om 时用的值在 om_out/singleop_used.json 里，先比这两个数。\n"
-                    "          对不上 -> 重跑 build_om.sh（它会从 .bin 的 header 现读，不用手改）\n"
-                    "        真的没装 -> grep -ri '\"%s\"' $ASCEND_OPP_PATH/built-in/op_impl/ai_core/tbe/config/\n"
-                    "        装了但选不出 kernel -> shape/dtype 和 binary.json 里登记的组合对不上"
-                    % (op_type, ret, shift1, shift2, op_type))
-            die("第 %d 次 aclopExecuteV2 = %d" % (k + 1, ret))
-        ret = acl.aclrtSynchronizeStream(stream)
-        if ret != ACL_SUCCESS:
-            die("第 %d 次 aclrtSynchronizeStream = %d —— kernel 可能 abort 了，查 device 日志"
-                % (k + 1, ret))
-        dt = (time.perf_counter() - t0) * 1e6
-        if k >= warmup:
-            durs.append(dt)
-    if repeat > 1 or warmup:
-        print("\n[耗时] host 侧墙钟，含下发和同步；设备侧以 msprof 为准")
-        report_times(durs)
+        # 输出缓冲预填哨兵 127：kernel 一个字节都没写的话，读回来还是 127，
+        # 这是"返回码 0 但什么都没算"唯一能被抓住的地方。
+        make_operand(y_dtype, y_dims, bytes([Y_SENTINEL_BYTE]) * (y_elems * yElemBytes))
 
-    y_bytes = y_elems * yElemBytes
-    out = ctypes.create_string_buffer(y_bytes)
-    check(acl.aclrtMemcpy(ctypes.cast(out, ctypes.c_void_p), y_bytes, dev_ptrs[NIN], y_bytes,   # NIN 号才是输出，别写死
-                          ACL_MEMCPY_DEVICE_TO_HOST), "aclrtMemcpy D2H = %d")
-    got = decode_y(out.raw[:y_bytes], info["isInt8"])
+        NIN = len(ORDER)
+        in_desc = (ctypes.c_void_p * NIN)(*descs[:NIN])
+        in_buf = (ctypes.c_void_p * NIN)(*bufs[:NIN])
+        out_desc = (ctypes.c_void_p * 1)(descs[NIN])
+        out_buf = (ctypes.c_void_p * 1)(bufs[NIN])
+
+        # 两个定点定标是**必需属性**。顺序和 fused_conv2d_def.cpp 里 Attr() 的调用
+        # 顺序一致（fixed_shift1 在前），tiling 侧按 GetInt(0)/GetInt(1) 取。
+        attr = acl.aclopCreateAttr()
+        if not attr:
+            die("aclopCreateAttr 返回 null")
+        setattr_fn = getattr(acl, "aclopSetAttrInt", None)
+        if setattr_fn is None:
+            die("这个 CANN 的 libascendcl.so 里没有 aclopSetAttrInt —— 属性传不下去")
+        if info["isInt8"]:
+            # int8 通路：缩放走 quant_scale（float），fixed_shift 不参与。
+            for nm, v in (("quant_scale1", info["qs1"]), ("quant_scale2", info["qs2"])):
+                check(acl.aclopSetAttrFloat(attr, nm, v), "aclopSetAttrFloat(" + nm + ") = %d")
+            for nm, v in (("relu1", info["relu"]), ("relu2", info["relu"])):
+                check(acl.aclopSetAttrBool(attr, nm, v), "aclopSetAttrBool(" + nm + ") = %d")
+            print("算子属性: quant_scale1=%.9g quant_scale2=%.9g relu=%s"
+                  % (info["qs1"], info["qs2"], info["relu"]))
+        for nm, v in (("fixed_shift1", shift1), ("fixed_shift2", shift2)):
+            rc = setattr_fn(attr, nm.encode(), v)
+            if rc != ACL_SUCCESS:
+                die("aclopSetAttrInt(%s=%d) = %d" % (nm, v, rc))
+
+        def launch():
+            return acl.aclopExecuteV2(op_type.encode(), NIN, in_desc, in_buf,
+                                      1, out_desc, out_buf, attr, stream)
+
+        # 总共下发 warmup + repeat 次；只有后 repeat 次计入统计。
+        durs = []
+        for k in range(warmup + repeat):
+            t0 = time.perf_counter()
+            ret = launch()
+            if ret != ACL_SUCCESS:
+                if k == 0:
+                    die('aclopExecuteV2("%s") = %d\n'
+                        "        走 .om（已 aclopSetModelDir）时最常见的其实不是「没装」，而是**匹配不上**：\n"
+                        "          ACL 拿 op 类型 + 每个 tensor 的 shape/dtype/format + **全部 attr 的值**\n"
+                        "          一起去匹配 .om，任何一项对不上都报成这个「算子没找到」。\n"
+                        "          本次下发的属性: fixed_shift1=%d fixed_shift2=%d\n"
+                        "          编 .om 时用的值在 om_out/singleop_used.json 里，先比这两个数。\n"
+                        "          对不上 -> 重跑 build_om.sh（它会从 .bin 的 header 现读，不用手改）\n"
+                        "        真的没装 -> grep -ri '\"%s\"' $ASCEND_OPP_PATH/built-in/op_impl/ai_core/tbe/config/\n"
+                        "        装了但选不出 kernel -> shape/dtype 和 binary.json 里登记的组合对不上"
+                        % (op_type, ret, shift1, shift2, op_type))
+                die("第 %d 次 aclopExecuteV2 = %d" % (k + 1, ret))
+            ret = acl.aclrtSynchronizeStream(stream)
+            if ret != ACL_SUCCESS:
+                die("第 %d 次 aclrtSynchronizeStream = %d —— kernel 可能 abort 了，查 device 日志"
+                    % (k + 1, ret))
+            dt = (time.perf_counter() - t0) * 1e6
+            if k >= warmup:
+                durs.append(dt)
+        if repeat > 1 or warmup:
+            print("\n[耗时] host 侧墙钟，含下发和同步；设备侧以 msprof 为准")
+            report_times(durs)
+
+        y_bytes = y_elems * yElemBytes
+        out = ctypes.create_string_buffer(y_bytes)
+        check(acl.aclrtMemcpy(ctypes.cast(out, ctypes.c_void_p), y_bytes, dev_ptrs[NIN], y_bytes,   # NIN 号才是输出，别写死
+                              ACL_MEMCPY_DEVICE_TO_HOST), "aclrtMemcpy D2H = %d")
+        got = decode_y(out.raw[:y_bytes], info["isInt8"])
 
     # ------------------------------------------------------------ 比对
     r = evaluate(got, want, rel_tol, ySentinel)
@@ -979,9 +1006,12 @@ def main():
     # **小于 1e-3**。也就是说差 1 个 ULP 的结果照样能通过 1e-3 的判据。
     # 所以现在这两条判据不再等价，宽严关系是：逐位相等 严于 1e-3。
     # 真正的判据是 mismatches == 0；达标比例 100% 但 mismatches != 0 就是 [PASS*]。
-    print("       注: 输出是 fp16，1 个 ULP 的相对误差 <= 2^-10 ≈ 9.77e-4 < %g，" % rel_tol)
-    print("           所以 %g 的判据比逐位相等**宽**：差 1 ULP 也能达标。" % rel_tol)
-    print("           以 mismatches == 0 为准；只达标不逐位相等会报 [PASS*]。")
+    if info["isInt8"]:
+        print("       注: 输出是 int8，判据只有逐位相等 —— 没有 ULP 可言。")
+    else:
+        print("       注: 输出是 fp16，1 个 ULP 的相对误差 <= 2^-10 ≈ 9.77e-4 < %g，" % rel_tol)
+        print("           所以 %g 的判据比逐位相等**宽**：差 1 ULP 也能达标。" % rel_tol)
+        print("           以 mismatches == 0 为准；只达标不逐位相等会报 [PASS*]。")
 
     if info["isInt8"]:
         # int8 的输出就是整数，没有"累加器 LSB"或"输出 ULP"可言 —— 判据只有
@@ -1002,6 +1032,17 @@ def main():
     else:
         report_lsb(got, want, r, mismatches, y_dims, shift2)
     report_ratio(got, want, r["n"])
+    if info["isInt8"]:
+        # int8 没有 y_exact，但抽样一样有用 —— 打整数就行。
+        print("\n[抽样] 32 个点，跨通道跨空间铺开   (idx  c/h/w   got | y_expect)")
+        plane = y_dims[2] * y_dims[3]
+        step = max(1, r["n"] // 32) | 1
+        while step > 1 and plane % step == 0:
+            step += 2
+        for j in range(32):
+            i = (j * step) % r["n"]
+            mark = "" if got[0][i] == want[0][i] else "   <- 不符"
+            print("   %7d %-14s %5d | %5d%s" % (i, idx_label(i, y_dims), got[0][i], want[0][i], mark))
     if "y_exact" in tensors:
         exact = decode_f16(tensors["y_exact"][2])
         report_vs_exact(got, exact, r["n"])
@@ -1014,18 +1055,19 @@ def main():
     # 设备原始输出落盘。默认**关**：板子那台机器上的文件多半传不出来，存了也是垃圾。
     # 真要离线分析再 FC2D_DUMP=<路径> 打开。分析所需的结论上面几段已经在设备上算完了。
     dump_path = os.environ.get("FC2D_DUMP", "")
-    if dump_path and dump_path != "-":
-        dump_raw(dump_path, out.raw[:y_bytes], "设备输出 (fp16 NCHW [1,%d,%d,%d])"
-                 % (y_dims[1], y_dims[2], y_dims[3]))
+    if (not dry_run) and dump_path and dump_path != "-":
+        dump_raw(dump_path, out.raw[:y_bytes], "设备输出 (%s NCHW [1,%d,%d,%d])"
+                 % ("int8" if info["isInt8"] else "fp16", y_dims[1], y_dims[2], y_dims[3]))
 
-    acl.aclopDestroyAttr(attr)
-    for i in range(NIN + 1):
-        acl.aclDestroyDataBuffer(bufs[i])
-        acl.aclDestroyTensorDesc(descs[i])
-        acl.aclrtFree(dev_ptrs[i])
-    acl.aclrtDestroyStream(stream)
-    acl.aclrtResetDevice(device_id)
-    acl.aclFinalize()
+    if not dry_run:
+        acl.aclopDestroyAttr(attr)
+        for i in range(NIN + 1):
+            acl.aclDestroyDataBuffer(bufs[i])
+            acl.aclDestroyTensorDesc(descs[i])
+            acl.aclrtFree(dev_ptrs[i])
+        acl.aclrtDestroyStream(stream)
+        acl.aclrtResetDevice(device_id)
+        acl.aclFinalize()
 
     print()
     if unwritten:
