@@ -59,6 +59,12 @@ $CXX_HOST $CXXFLAGS "$HERE/gen_case.cpp" -o "$HERE/gen_case" -I"$HERE"
 SZ=$(wc -c < "$HERE/fused_conv2d_case.bin" | tr -d " \t")   # macOS 的 wc 会补前导空格
 [ "$SZ" = 5309240 ] || echo "  [!] .bin 是 $SZ 字节，预期 5309240 —— 形状变了？"
 
+step "3.2) int8 通路的 case"
+# 同一个 gen_case，--dtype=int8。int8 通路带 bias（fp16 通路不带，见算子说明）。
+"$HERE/gen_case" "$HERE/fused_conv2d_case_int8.bin" --dtype=int8 || die "int8 case 生成失败"
+printf '  %-38s %s 字节\n' "fused_conv2d_case_int8.bin" \
+       "$(wc -c < "$HERE/fused_conv2d_case_int8.bin" | tr -d ' \t')"
+
 step "3.5) 顺带生成两个探针 case"
 # 探针 = 把某一层权重换成中心抽头恒等，把两层拆开单独看。权重是运行时输入不是
 # 属性，所以这些 .bin 和正常 case 用**同一个 .om**，不用重编。

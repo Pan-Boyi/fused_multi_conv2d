@@ -1,0 +1,85 @@
+[
+  {
+    "op": "FusedConv2d",
+    "input_desc": [
+      {
+        "format": "ND",
+        "shape": [
+          1,
+          32,
+          288,
+          112
+        ],
+        "type": "int8"
+      },
+      {
+        "format": "ND",
+        "shape": [
+          9,
+          4,
+          16,
+          32
+        ],
+        "type": "int8"
+      },
+      {
+        "format": "ND",
+        "shape": [
+          64
+        ],
+        "type": "int32"
+      },
+      {
+        "format": "ND",
+        "shape": [
+          18,
+          6,
+          16,
+          32
+        ],
+        "type": "int8"
+      },
+      {
+        "format": "ND",
+        "shape": [
+          96
+        ],
+        "type": "int32"
+      }
+    ],
+    "output_desc": [
+      {
+        "format": "ND",
+        "shape": [
+          1,
+          96,
+          144,
+          56
+        ],
+        "type": "int8"
+      }
+    ],
+    "attr": [
+      {
+        "name": "quant_scale1",
+        "type": "float",
+        "value": 1.0
+      },
+      {
+        "name": "quant_scale2",
+        "type": "float",
+        "value": 1.0
+      },
+      {
+        "name": "relu1",
+        "type": "bool",
+        "value": true
+      },
+      {
+        "name": "relu2",
+        "type": "bool",
+        "value": true
+      }
+    ]
+  }
+]

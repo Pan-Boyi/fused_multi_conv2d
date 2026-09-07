@@ -16,7 +16,12 @@
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 [ -n "$HERE" ] || HERE="$PWD"
-JSON="$HERE/fused_conv2d_singleop.json"
+# 两条通路各一份 singleop 描述；DTYPE 选哪一条，默认两条都编。
+DTYPE="${DTYPE:-both}"
+JSON_FP16="$HERE/fused_conv2d_singleop_fp16.json"
+JSON_INT8="$HERE/fused_conv2d_singleop_int8.json"
+CASE_FP16="${CASE_FP16:-$HERE/fused_conv2d_case.bin}"
+CASE_INT8="${CASE_INT8:-$HERE/fused_conv2d_case_int8.bin}"
 CASE="${CASE:-$HERE/fused_conv2d_case.bin}"
 OUTDIR="${OUTDIR:-$HERE/om_out}"
 
@@ -30,7 +35,8 @@ echo "  atc  = $(command -v atc)"
 echo "  本机 = $(uname -m)"
 OPP="${ASCEND_OPP_PATH:-$ASCEND_HOME_PATH/opp}"
 echo "  OPP  = $OPP"
-[ -f "$JSON" ] || die "缺 $JSON"
+[ -f "$JSON_FP16" ] || die "缺 $JSON_FP16"
+[ -f "$JSON_INT8" ] || die "缺 $JSON_INT8"
 
 # ---------------------------------------------------------------------------
 # ld.lld 必须是**认识 aicorelinux 的那份**。
@@ -187,62 +193,73 @@ step "4) atc 单算子编译  soc_version=$SOC"
 rm -rf "$OUTDIR" && mkdir -p "$OUTDIR"
 
 # ---------------------------------------------------------------------------
-# 定点定标（fixed_shift1/2）不能在这份 json 里手写死。
+# 属性不能在 json 里手写死 —— 必须从对应的 .bin 现读。
 #
-# ACL 匹配 .om 是拿 **op 类型 + 每个 tensor 的 shape/dtype/format + 全部 attr 的值**
-# 一起匹配的。json 里写 26/22 而脚本按 .bin 的 header 下发 34/37，就匹配不上，而且
-# 报出来的是 100024 / "算子没找到(161001)" —— 看着像算子没装，其实是属性对不上。
-# 这个坑真踩过一次。
+# ACL 匹配 .om 是拿 op 类型 + 每个 tensor 的 shape/dtype/format + **全部 attr 的
+# 值**一起匹配的；json 里的值和脚本下发的对不上，报出来是 100024 / "算子没找到"，
+# 看着像算子没装。这个坑真踩过一次。
 #
-# 所以属性值只有 .bin 的 header 一个来源，这里现读现填，人不参与。
+#   fp16   fixed_shift1/2   来自 .bin header 偏移 48 的 uint64（低 8 位 / 次 8 位）
+#   int8   quant_scale1/2   来自版本 3 header 尾部的两个 float 位型
 # ---------------------------------------------------------------------------
-USED_JSON="$OUTDIR/singleop_used.json"
-if [ -f "$CASE" ] && command -v python3 >/dev/null 2>&1; then
-    python3 - "$JSON" "$CASE" "$USED_JSON" <<'PYSYNC'
+sync_attrs() {  # $1=模板 json  $2=case 文件  $3=输出 json
+    python3 - "$1" "$2" "$3" <<'PYSYNC'
 import json, struct, sys
 tpl, case, out = sys.argv[1], sys.argv[2], sys.argv[3]
 with open(case, "rb") as f:
-    hdr = f.read(56)
+    hdr = f.read(72)
 if len(hdr) < 56 or hdr[:8] != b"FC2DCASE":
-    sys.exit("case 文件头不对，读不出定标")
-attrs = struct.unpack_from("<Q", hdr, 48)[0]     # header 里最后一个 uint64
-shifts = {"fixed_shift1": attrs & 0xFF, "fixed_shift2": (attrs >> 8) & 0xFF}
+    sys.exit("case 文件头不对")
+version = struct.unpack_from("<I", hdr, 8)[0]
 desc = json.load(open(tpl, encoding="utf-8"))
+vals = {}
+if version == 2:
+    a = struct.unpack_from("<Q", hdr, 48)[0]
+    vals = {"fixed_shift1": a & 0xFF, "fixed_shift2": (a >> 8) & 0xFF}
+elif version == 3:
+    if len(hdr) < 72:
+        sys.exit("版本 3 的 header 不完整")
+    mode, scales = struct.unpack_from("<QQ", hdr, 56)
+    f1 = struct.unpack("<f", struct.pack("<I", scales & 0xFFFFFFFF))[0]
+    f2 = struct.unpack("<f", struct.pack("<I", (scales >> 32) & 0xFFFFFFFF))[0]
+    vals = {"quant_scale1": f1, "quant_scale2": f2,
+            "relu1": bool((mode >> 9) & 1), "relu2": bool((mode >> 9) & 1)}
+else:
+    sys.exit("不认识的 case 版本 %d" % version)
 hit = 0
 for op in desc:
-    for a in op.get("attr", []):
-        if a.get("name") in shifts:
-            a["value"] = shifts[a["name"]]
+    for at in op.get("attr", []):
+        if at.get("name") in vals:
+            at["value"] = vals[at["name"]]
             hit += 1
-if hit != 2:
-    sys.exit("模板里没找齐 fixed_shift1/2（找到 %d 个）" % hit)
+if hit != len(vals):
+    sys.exit("模板里的属性和 case 对不上：模板有 %d 个匹配，case 给了 %d 个" % (hit, len(vals)))
 json.dump(desc, open(out, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
-print("  定标取自 %s: fixed_shift1=%d fixed_shift2=%d"
-      % (case, shifts["fixed_shift1"], shifts["fixed_shift2"]))
+print("    属性取自 %s: %s" % (case, ", ".join("%s=%s" % kv for kv in sorted(vals.items()))))
 PYSYNC
-    [ $? -eq 0 ] || die "从 $CASE 同步定标失败。
-    要么 .bin 是旧版本的，要么模板 json 里没有 fixed_shift1/2。"
-    JSON="$USED_JSON"
-else
-    [ -f "$CASE" ] || echo "  [!] 找不到 $CASE"
-    command -v python3 >/dev/null 2>&1 || echo "  [!] 没有 python3"
-    echo "  [!] 没法从 case 文件同步定标，直接用模板里写死的值。"
-    echo "      模板和 .bin 的定标一旦不一致，执行时会报 100024 / 算子没找到 ——"
-    echo "      那不是算子没装，是属性对不上。跑之前先自己核一遍："
-    grep -E 'fixed_shift[12]' "$JSON" | sed 's/^/        /'
-fi
+}
 
-echo "  json   = $JSON"
-echo "  output = $OUTDIR"
-echo
-atc --singleop="$JSON" --soc_version="$SOC" --output="$OUTDIR" --log=error
-RC=$?
-echo
-[ "$RC" -eq 0 ] || die "atc 返回 $RC。
-    常见原因：
-      unknown emulation: aicorelinux -> PATH 上的 ld.lld 不是昇腾那份，见第 0.5 步
-      soc_version 填错          -> 回第 3 步的清单里挑
-      算子不支持这个 shape/dtype -> tiling 只接受一种 shape，见步骤文档"
+build_one() {  # $1=标签  $2=模板 json  $3=case  $4=输出子目录
+    step "4.$1) atc 编 $1"
+    if [ ! -f "$3" ]; then
+        echo "  跳过：缺 $3（先跑 build_case.sh）"
+        return 0
+    fi
+    mkdir -p "$OUTDIR/$4"
+    local used="$OUTDIR/$4/singleop_used.json"
+    sync_attrs "$2" "$3" "$used" || die "从 $3 同步属性失败"
+    echo "  json   = $used"
+    echo "  output = $OUTDIR/$4"
+    atc --singleop="$used" --soc_version="$SOC" --output="$OUTDIR/$4" --log=error || die "atc 返回非 0（$1）"
+}
+
+case "$DTYPE" in
+    fp16) build_one fp16 "$JSON_FP16" "$CASE_FP16" fp16 ;;
+    int8) build_one int8 "$JSON_INT8" "$CASE_INT8" int8 ;;
+    both) build_one fp16 "$JSON_FP16" "$CASE_FP16" fp16
+          build_one int8 "$JSON_INT8" "$CASE_INT8" int8 ;;
+    *)    die "DTYPE 只认 fp16 / int8 / both，收到 $DTYPE" ;;
+esac
 
 step "5) 产物"
 FOUND=$(find "$OUTDIR" -name '*.om' 2>/dev/null)

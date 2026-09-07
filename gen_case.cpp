@@ -28,6 +28,8 @@
 using namespace fc2d_golden;
 
 constexpr uint32_t ACL_DT_FLOAT16 = 1;
+constexpr uint32_t ACL_DT_INT8 = 2;
+constexpr uint32_t ACL_DT_INT32 = 3;
 
 // ---------------------------------------------------------------------------
 // 探针模式。把某一层的权重换成「中心抽头恒等」，用来把两层拆开单独看。
@@ -115,11 +117,80 @@ static bool WriteTensor(std::FILE* f, const char* name, uint32_t dtype, const st
     return true;
 }
 
+
+// ---------------------------------------------------------------------------
+// int8 量化通路的 case。
+//
+// 张量顺序和 fp16 通路完全一样（算子的输入列表是共用的），只有 dtype 不同：
+//   x/filter int8，bias int32，y int8
+// 两个 scale 走 header（版本 3 新增），run 脚本取出来当算子属性 quant_scale1/2
+// 下发 —— 和 fp16 通路的 fixed_shift 走同一条路，不用手填。
+// ---------------------------------------------------------------------------
+static int WriteInt8Case(const char* path, bool withBias, bool relu)
+{
+    namespace Q = fc2d_golden::int8path;
+    Q::Inputs in = Q::GenerateInputs(withBias);
+    Q::Golden g = Q::BuildGolden(in, withBias, relu);
+
+    std::printf("golden(int8): scale1=%.6g scale2=%.6g  bias=%s relu=%s  y 非零 %ld/%zu  饱和 %ld\n",
+                g.scale1, g.scale2, withBias ? "on" : "off", relu ? "on" : "off",
+                g.yNonZero, g.y.size(), g.satCount);
+    if (g.yNonZero == 0) { std::printf("[X] golden 全是 0\n"); return 1; }
+
+    std::FILE* f = std::fopen(path, "wb");
+    if (f == nullptr) { std::printf("[X] 打不开 %s\n", path); return 1; }
+
+    const uint32_t version = 3;
+    const uint32_t ntensors = 6;   // 5 输入 + 1 golden（int8 没有第二个「纯 fp32 参考」）
+    const uint64_t hNonZero = (uint64_t)g.yNonZero;
+    const uint64_t hProbe = 0;
+    const uint64_t hSat = (uint64_t)g.satCount;
+    const uint64_t hYElems = (uint64_t)g.y.size();
+    const uint64_t attrs = 0;      // int8 不用 fixed_shift
+    uint32_t s1b = 0, s2b = 0;
+    std::memcpy(&s1b, &g.scale1, 4);
+    std::memcpy(&s2b, &g.scale2, 4);
+    // 版本 3 新增：dtype 标记 + 两个 scale 的位型 + bias/relu 开关
+    const uint64_t hMode = (uint64_t)1 | ((uint64_t)(withBias ? 1 : 0) << 8) | ((uint64_t)(relu ? 1 : 0) << 9);
+    const uint64_t hScales = (uint64_t)s1b | ((uint64_t)s2b << 32);
+
+    bool ok = std::fwrite("FC2DCASE", 1, 8, f) == 8;
+    ok = ok && std::fwrite(&version, 1, 4, f) == 4;
+    ok = ok && std::fwrite(&ntensors, 1, 4, f) == 4;
+    ok = ok && std::fwrite(&hNonZero, 1, 8, f) == 8;
+    ok = ok && std::fwrite(&hProbe, 1, 8, f) == 8;
+    ok = ok && std::fwrite(&hSat, 1, 8, f) == 8;
+    ok = ok && std::fwrite(&hYElems, 1, 8, f) == 8;
+    ok = ok && std::fwrite(&attrs, 1, 8, f) == 8;
+    ok = ok && std::fwrite(&hMode, 1, 8, f) == 8;
+    ok = ok && std::fwrite(&hScales, 1, 8, f) == 8;
+
+    const int64_t fz1k = (CI / 32) * KH * KW, fz1n = (COUT1 + 15) / 16;
+    const int64_t fz2k = (COUT1 / 32) * KH * KW, fz2n = (COUT2 + 15) / 16;
+
+    ok = ok && WriteTensor(f, "x", ACL_DT_INT8, {1, CI, HI, WI}, in.xNchw.data(), in.xNchw.size());
+    ok = ok && WriteTensor(f, "filter1", ACL_DT_INT8, {fz1k, fz1n, 16, 32}, in.w1Dev.data(), in.w1Dev.size());
+    ok = ok && WriteTensor(f, "bias1", ACL_DT_INT32, {COUT1}, in.b1.data(), in.b1.size() * 4);
+    ok = ok && WriteTensor(f, "filter2", ACL_DT_INT8, {fz2k, fz2n, 16, 32}, in.w2Dev.data(), in.w2Dev.size());
+    ok = ok && WriteTensor(f, "bias2", ACL_DT_INT32, {COUT2}, in.b2.data(), in.b2.size() * 4);
+    ok = ok && WriteTensor(f, "y_expect", ACL_DT_INT8, {1, COUT2, HO2, WO2}, g.y.data(), g.y.size());
+
+    std::fclose(f);
+    if (!ok) { std::printf("[X] 写 %s 失败\n", path); return 1; }
+    std::printf("\n[OK] 写出 %s（int8 通路）\n     5 个输入 + 1 个 golden\n", path);
+    std::printf("     算子属性 quant_scale1 = %.9g, quant_scale2 = %.9g（已打包进 header）\n", g.scale1, g.scale2);
+    std::printf("     bias %s，relu %s\n", withBias ? "带" : "不带", relu ? "开" : "关");
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     const char* path = "fused_conv2d_case.bin";
     Probe probe = Probe::None;
     const char* probeName = "none";
+    bool int8Mode = false;
+    bool withBias = true;   // int8 通路默认带 bias（fp16 通路不带，见算子说明）
+    bool relu = true;
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
         if (std::strncmp(a, "--probe=", 8) == 0) {
@@ -130,11 +201,23 @@ int main(int argc, char** argv)
             else if (std::strcmp(v, "colid") == 0)        { probe = Probe::ColId;       probeName = v; }
             else if (std::strcmp(v, "none") == 0)         { probe = Probe::None;        probeName = v; }
             else { std::printf("[X] --probe 只认 none/passthrough/mid/chanid/colid，收到 %s\n", v); return 1; }
+        } else if (std::strcmp(a, "--dtype=int8") == 0) {
+            int8Mode = true;
+        } else if (std::strcmp(a, "--dtype=fp16") == 0) {
+            int8Mode = false;
+        } else if (std::strcmp(a, "--no-bias") == 0) {
+            withBias = false;
+        } else if (std::strcmp(a, "--no-relu") == 0) {
+            relu = false;
         } else if (a[0] == '-') {
             std::printf("[X] 不认识的参数 %s\n", a); return 1;
         } else {
             path = a;
         }
+    }
+
+    if (int8Mode) {
+        return WriteInt8Case(path, withBias, relu);
     }
 
     Inputs in = GenerateInputs();

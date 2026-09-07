@@ -436,5 +436,181 @@ inline Golden BuildGolden(const Inputs& in, int shiftFor1 = -1, int shiftFor2 = 
     return g;
 }
 
+// ===========================================================================
+// int8 量化通路的 golden
+// ===========================================================================
+//
+// 链路（和 kernel 一一对应）：
+//     acc1_i32 = sum(x_i8 * w1_i8) + bias1_i32           cube，精确整数
+//     mid_i8   = req8( acc1_i32, quant_scale1 )，再 relu  fixpipe 随路
+//     acc2_i32 = sum(mid_i8 * w2_i8) + bias2_i32
+//     y_i8     = req8( acc2_i32, quant_scale2 )，再 relu
+//
+// req8 的语义（5102 上逐位实测，记在 tensorutils.h 的 L0C2L1_VREQ8 注释里）：
+//     取整是 round-half-to-even
+//     [46] = 1 时按有符号饱和到 [-128, 127]；这一位**硬件不从目的类型推**，
+//            包装 PackReq8Scalar<T>() 替调用方设。忘了置它负数会全变成 0。
+//     scale 的低 13 位尾数被丢弃：effective = bitcast<float>(bits & 0xFFFFE000)
+//
+// relu 在重量化**之后**（fixpipe 的 reluEn），所以是对 int8 结果钳 0，不是对
+// int32 累加器钳。int8 没有 -0，直接是 0 —— 和 fp16 通路那条不一样。
+// ---------------------------------------------------------------------------
+namespace int8path {
+
+constexpr int C0_S8 = 32;
+constexpr int C1_S8 = CI / C0_S8;        // 1
+constexpr int MID_C1_S8 = COUT1 / C0_S8; // 2
+
+// scale 的低 13 位尾数会被硬件丢掉，golden 必须照做，否则会出现"只差最后一位"
+// 的不一致，而那种不一致最难判定是谁错。
+inline float EffectiveScale(float s)
+{
+    uint32_t b;
+    std::memcpy(&b, &s, 4);
+    b &= 0xFFFFE000u;
+    float out;
+    std::memcpy(&out, &b, 4);
+    return out;
+}
+
+inline int8_t Req8(int32_t acc, float scale, bool relu)
+{
+    const double v = (double)acc * (double)scale;
+    // round-half-to-even
+    double r = std::nearbyint(v); // 默认舍入模式就是 half-to-even
+    if (r > 127.0) r = 127.0;
+    if (r < -128.0) r = -128.0;
+    int8_t q = (int8_t)r;
+    if (relu && q < 0) q = 0;
+    return q;
+}
+
+// int8 的 FRACTAL_Z：C0 = 32，所以 [cin1*KH*KW][cout1][16][32]。
+inline void WeightToFractalZInt8(const int8_t* nchw, int cin, int cout, std::vector<int8_t>& dev)
+{
+    const int cin1 = cin / C0_S8;
+    const int cout1 = (cout + 15) / 16;
+    dev.assign((size_t)cin1 * KH * KW * cout1 * 16 * C0_S8, 0);
+    for (int co = 0; co < cout; ++co) {
+        for (int ci = 0; ci < cin; ++ci) {
+            for (int kh = 0; kh < KH; ++kh) {
+                for (int kw = 0; kw < KW; ++kw) {
+                    const size_t src = (((size_t)co * cin + ci) * KH + kh) * KW + kw;
+                    const size_t kf = ((size_t)(ci / C0_S8) * KH + kh) * KW + kw;
+                    const size_t dst = kf * cout1 * 16 * C0_S8 + (size_t)(co / 16) * 16 * C0_S8 +
+                                       (size_t)(co % 16) * C0_S8 + (size_t)(ci % C0_S8);
+                    dev[dst] = nchw[src];
+                }
+            }
+        }
+    }
+}
+
+// 精确的整数卷积。int8 x int8 累到 int32：K 最大 576，|a*b| <= 127*128，
+// 576*16256 = 9.4e6，离 int32 远得很，不会溢出。
+inline void ConvInt8(const int8_t* in, const int8_t* wt, const int32_t* bias, const ConvSpec& sp,
+                     std::vector<int32_t>& acc)
+{
+    acc.assign((size_t)sp.cout * sp.ho * sp.wo, 0);
+    for (int co = 0; co < sp.cout; ++co) {
+        for (int oh = 0; oh < sp.ho; ++oh) {
+            for (int ow = 0; ow < sp.wo; ++ow) {
+                int32_t sum = (bias == nullptr) ? 0 : bias[co];
+                for (int ci = 0; ci < sp.cin; ++ci) {
+                    for (int kh = 0; kh < KH; ++kh) {
+                        const int ih = oh * sp.stride + kh - PAD;
+                        if (ih < 0 || ih >= sp.hi) continue;
+                        for (int kw = 0; kw < KW; ++kw) {
+                            const int iw = ow * sp.stride + kw - PAD;
+                            if (iw < 0 || iw >= sp.wi) continue;
+                            sum += (int32_t)in[((size_t)ci * sp.hi + ih) * sp.wi + iw] *
+                                   (int32_t)wt[(((size_t)co * sp.cin + ci) * KH + kh) * KW + kw];
+                        }
+                    }
+                }
+                acc[((size_t)co * sp.ho + oh) * sp.wo + ow] = sum;
+            }
+        }
+    }
+}
+
+struct Inputs {
+    std::vector<int8_t> xNchw, w1Nchw, w2Nchw, w1Dev, w2Dev;
+    std::vector<int32_t> b1, b2;
+};
+
+struct Golden {
+    std::vector<int8_t> mid, y;
+    float scale1 = 0, scale2 = 0;
+    long yNonZero = 0;
+    long satCount = 0; // 有多少个点撞到了 [-128,127] 的边界
+};
+
+inline Inputs GenerateInputs(bool withBias)
+{
+    Inputs in;
+    auto fill = [](std::vector<int8_t>& v, uint64_t salt) {
+        uint64_t st = 0x9E3779B97F4A7C15ULL ^ salt;
+        for (size_t i = 0; i < v.size(); ++i) {
+            st ^= st << 13; st ^= st >> 7; st ^= st << 17;
+            v[i] = (int8_t)((int)(st % 201) - 100); // [-100, 100]，给累加留余量
+        }
+    };
+    in.xNchw.resize((size_t)CI * HI * WI);            fill(in.xNchw, 0x11);
+    in.w1Nchw.resize((size_t)COUT1 * CI * KH * KW);   fill(in.w1Nchw, 0x22);
+    in.w2Nchw.resize((size_t)COUT2 * COUT1 * KH * KW); fill(in.w2Nchw, 0x33);
+    in.b1.assign(COUT1, 0);
+    in.b2.assign(COUT2, 0);
+    if (withBias) {
+        for (int i = 0; i < COUT1; ++i) in.b1[i] = (i - COUT1 / 2) * 137;
+        for (int i = 0; i < COUT2; ++i) in.b2[i] = (i - COUT2 / 2) * 91;
+    }
+    WeightToFractalZInt8(in.w1Nchw.data(), CI, COUT1, in.w1Dev);
+    WeightToFractalZInt8(in.w2Nchw.data(), COUT1, COUT2, in.w2Dev);
+    return in;
+}
+
+// scale 挑法：让重量化之后的动态范围铺满 int8，但饱和点尽量少。
+inline float PickScale(const std::vector<int32_t>& acc, long* sat)
+{
+    int32_t m = 0;
+    for (size_t i = 0; i < acc.size(); ++i) {
+        const int32_t a = acc[i] < 0 ? -acc[i] : acc[i];
+        if (a > m) m = a;
+    }
+    if (m == 0) return EffectiveScale(1.0f);
+    // 127 / peak，再退一档留余量；然后按硬件会丢低 13 位尾数的方式落格
+    const float s = EffectiveScale(127.0f / (float)m);
+    *sat = 0;
+    return s;
+}
+
+inline Golden BuildGolden(const Inputs& in, bool withBias, bool relu)
+{
+    Golden g;
+    const ConvSpec sp1{CI, HI, WI, COUT1, HO1, WO1, STRIDE1};
+    const ConvSpec sp2{COUT1, HO1, WO1, COUT2, HO2, WO2, STRIDE2};
+
+    std::vector<int32_t> acc1;
+    ConvInt8(in.xNchw.data(), in.w1Nchw.data(), withBias ? in.b1.data() : nullptr, sp1, acc1);
+    g.scale1 = PickScale(acc1, &g.satCount);
+    g.mid.resize(acc1.size());
+    for (size_t i = 0; i < acc1.size(); ++i) g.mid[i] = Req8(acc1[i], g.scale1, relu);
+
+    std::vector<int32_t> acc2;
+    // conv2 吃的是 conv1 的 **int8** 结果，和板上这条链一致。
+    ConvInt8(g.mid.data(), in.w2Nchw.data(), withBias ? in.b2.data() : nullptr, sp2, acc2);
+    g.scale2 = PickScale(acc2, &g.satCount);
+    g.y.resize(acc2.size());
+    for (size_t i = 0; i < acc2.size(); ++i) {
+        g.y[i] = Req8(acc2[i], g.scale2, relu);
+        if (g.y[i] != 0) ++g.yNonZero;
+        if (g.y[i] == 127 || g.y[i] == -128) ++g.satCount;
+    }
+    return g;
+}
+
+} // namespace int8path
+
 } // namespace fc2d_golden
 #endif

@@ -58,8 +58,9 @@ DTYPE_SIZE = {0: 4, 1: 2, 2: 1, 3: 4, 10: 8}
 # 0x7F7F —— 一个 fp16 NaN（阶码全 1、尾数非零）。golden 永远算不出 NaN，所以
 # 「有没有被写过」这个判据不需要再论证合法输出取不到哨兵值。
 Y_SENTINEL_BYTE = 0x7F
-Y_SENTINEL_U16 = 0x7F7F
-Y_ELEM_BYTES = 2
+Y_SENTINEL_U16 = 0x7F7F   # fp16 输出的哨兵（两字节）
+Y_SENTINEL_I8 = 0x7F      # int8 输出的哨兵（一字节，正好是 int8 的 127）
+Y_ELEM_BYTES = 2          # fp16 那条；int8 那条用 1，见 decode_y()
 
 HDR_FMT = "<8sIIQQQQQ"          # magic, version, ntensors, nonzero, probe, sat, y_elems, attrs
 
@@ -127,12 +128,23 @@ def load_case(path):
         die("%s 只有 %d 字节，文件不完整（传输中断？）" % (path, len(blob)))
 
     magic, version, ntensors, nonzero, probe, sat, y_elems, attrs = struct.unpack_from(HDR_FMT, blob, 0)
+    # 版本 3 = int8 量化通路：header 尾部多两个 uint64
+    #   mode   低 8 位 dtype（0 fp16 / 1 int8），bit8 带不带 bias，bit9 relu 开不开
+    #   scales 低 32 位 quant_scale1 的 float 位型，高 32 位 quant_scale2
+    mode, scales = 0, 0
+    hdrLen = HDR_LEN
+    if version == 3:
+        if len(blob) < HDR_LEN + 16:
+            die("版本 3 的 header 不完整")
+        mode, scales = struct.unpack_from("<QQ", blob, HDR_LEN)
+        hdrLen = HDR_LEN + 16
     if magic != b"FC2DCASE":
         die("%s 不是 case 文件（magic = %r）" % (path, magic))
-    if version != 2:
-        die("case 文件版本 %d，本脚本只认 2 —— gen_case 和 run_fused_conv2d.py 得配套。\n        版本 1 是上一版的量化接口（8 输入），这一版是定点接口（5 输入 + 2 属性）。" % version)
+    if version not in (2, 3):
+        die("case 文件版本 %d，本脚本认 2（fp16 定点）和 3（int8 量化）。\n"
+            "        版本 1 是更早的量化接口（8 输入），已经不支持。" % version)
 
-    tensors, off = {}, HDR_LEN
+    tensors, off = {}, hdrLen
     for i in range(ntensors):
         if off + REC_LEN > len(blob):
             die("第 %d 个张量的头越界，文件被截断了" % i)
@@ -158,15 +170,23 @@ def load_case(path):
             die("张量 %s: dims=%s dtype=%s 应为 %d 字节，实际 %d"
                 % (name, dims, DTYPE_NAME[dtype], want, len(data)))
 
-    for name in ORDER + GOLDENS:
+    # y_exact（纯 fp32 参考）只有 fp16 定点通路有 —— 那边的定点模型是**近似**，
+    # 需要第二个不依赖模型的参照。int8 通路的 golden 是精确整数运算，没有这个概念。
+    required = list(ORDER) + ["y_expect"] + (["y_exact"] if version == 2 else [])
+    for name in required:
         if name not in tensors:
             die("case 文件里缺张量 %s" % name)
 
     shift1 = int(attrs & 0xFF)
     shift2 = int((attrs >> 8) & 0xFF)
-    if not (0 <= shift1 <= 58 and 0 <= shift2 <= 58):
+    if version == 2 and not (0 <= shift1 <= 58 and 0 <= shift2 <= 58):
         die("header 里的定点定标 %d / %d 超出 [0,58] —— case 文件版本对不上？" % (shift1, shift2))
-    return tensors, nonzero, probe, sat, y_elems, shift1, shift2
+    isInt8 = (version == 3) and ((mode & 0xFF) == 1)
+    qs1 = struct.unpack("<f", struct.pack("<I", scales & 0xFFFFFFFF))[0] if isInt8 else 0.0
+    qs2 = struct.unpack("<f", struct.pack("<I", (scales >> 32) & 0xFFFFFFFF))[0] if isInt8 else 0.0
+    info = {"isInt8": isInt8, "hasBias": bool((mode >> 8) & 1), "relu": bool((mode >> 9) & 1),
+            "qs1": qs1, "qs2": qs2}
+    return tensors, nonzero, probe, sat, y_elems, shift1, shift2, info
 
 
 # ---------------------------------------------------------------- 绑 libascendcl
@@ -244,6 +264,24 @@ def report_times(durs):
     warm = statistics.median(sorted(rest))
     print("  %-14s %.3f us  (第 1 次 %.3f - 稳态中位数 %.3f)"
           % ("冷启动开销≈", durs[0] - warm, durs[0], warm))
+
+
+def decode_y(buf, is_int8):
+    """按输出 dtype 解码成 (值列表, 位模式列表)。
+
+    两条通路的比对逻辑是共用的，只有解码不同：
+      fp16   struct 'e'，位模式是 uint16；哨兵 0x7F7F
+      int8   直接就是整数；位模式就是值本身（无符号形式），哨兵 0x7F
+
+    int8 的哨兵 0x7F 同时也是合法值 127，所以"没写过"的判定在 int8 上不如
+    fp16 强 —— 好在 golden 的 scale 是按 127/峰值 挑的，饱和为 0，正常结果里
+    出现 127 的概率很低。gen_case 会把饱和数打出来，为 0 时这个哨兵才可信。
+    """
+    if not is_int8:
+        return decode_f16(buf)
+    vals = list(struct.unpack("<%db" % len(buf), buf))
+    bits = [v & 0xFF for v in vals]
+    return vals, bits
 
 
 def decode_f16(buf):
@@ -578,7 +616,7 @@ def report_vs_exact(got, exact, n):
 
 
 
-def evaluate(got, want, rel_tol):
+def evaluate(got, want, rel_tol, sentinel=Y_SENTINEL_U16):
     """一趟扫完所有判据。返回 dict。
 
     三个"写没写对"的判据，各挡一类失败，缺一不可：
@@ -604,6 +642,7 @@ def evaluate(got, want, rel_tol):
         "max_rel_idx": -1,
         "zero_golden": 0,
         "hist": dict.fromkeys(buckets, 0),
+        "sentinel": sentinel,
     }
     gv, gb = got
     wv, wb = want
@@ -618,7 +657,7 @@ def evaluate(got, want, rel_tol):
     for i in range(n):
         g, w = gv[i], wv[i]
         g8, w8 = gb[i], wb[i]
-        if g8 == Y_SENTINEL_U16 and w8 != Y_SENTINEL_U16:
+        if g8 == r["sentinel"] and w8 != r["sentinel"]:
             r["unwritten"] += 1
         if g8 != w8:
             if r["first_bad"] < 0:
@@ -715,12 +754,14 @@ def main():
         else:
             die("%s 既不是文件也不是目录" % om_arg)
 
-    tensors, gold_nonzero, probe, sat, y_elems, shift1, shift2 = load_case(case_path)
+    tensors, gold_nonzero, probe, sat, y_elems, shift1, shift2, info = load_case(case_path)
     want_raw = tensors["y_expect"][2]
-    if len(want_raw) != y_elems * Y_ELEM_BYTES:
+    yElemBytes = 1 if info["isInt8"] else 2
+    ySentinel = Y_SENTINEL_I8 if info["isInt8"] else Y_SENTINEL_U16
+    if len(want_raw) != y_elems * yElemBytes:
         die("golden 输出 %d 字节，按 %d 个 fp16 元素应为 %d"
-            % (len(want_raw), y_elems, y_elems * Y_ELEM_BYTES))
-    want = decode_f16(want_raw)
+            % (len(want_raw), y_elems, y_elems * yElemBytes))
+    want = decode_y(want_raw, info["isInt8"])
     print("case 文件 OK：")
     for name in ORDER + GOLDENS:
         dtype, dims, data = tensors[name]
@@ -805,7 +846,7 @@ def main():
     # 输出缓冲预填哨兵 127：kernel 一个字节都没写的话，读回来还是 127，
     # 这是"返回码 0 但什么都没算"唯一能被抓住的地方。
     y_dtype, y_dims, _ = tensors["y_expect"]
-    make_operand(y_dtype, y_dims, bytes([Y_SENTINEL_BYTE]) * (y_elems * Y_ELEM_BYTES))
+    make_operand(y_dtype, y_dims, bytes([Y_SENTINEL_BYTE]) * (y_elems * yElemBytes))
 
     NIN = len(ORDER)
     in_desc = (ctypes.c_void_p * NIN)(*descs[:NIN])
@@ -821,6 +862,14 @@ def main():
     setattr_fn = getattr(acl, "aclopSetAttrInt", None)
     if setattr_fn is None:
         die("这个 CANN 的 libascendcl.so 里没有 aclopSetAttrInt —— 属性传不下去")
+    if info["isInt8"]:
+        # int8 通路：缩放走 quant_scale（float），fixed_shift 不参与。
+        for nm, v in (("quant_scale1", info["qs1"]), ("quant_scale2", info["qs2"])):
+            check(acl.aclopSetAttrFloat(attr, nm, v), "aclopSetAttrFloat(" + nm + ") = %d")
+        for nm, v in (("relu1", info["relu"]), ("relu2", info["relu"])):
+            check(acl.aclopSetAttrBool(attr, nm, v), "aclopSetAttrBool(" + nm + ") = %d")
+        print("算子属性: quant_scale1=%.9g quant_scale2=%.9g relu=%s"
+              % (info["qs1"], info["qs2"], info["relu"]))
     for nm, v in (("fixed_shift1", shift1), ("fixed_shift2", shift2)):
         rc = setattr_fn(attr, nm.encode(), v)
         if rc != ACL_SUCCESS:
@@ -859,14 +908,14 @@ def main():
         print("\n[耗时] host 侧墙钟，含下发和同步；设备侧以 msprof 为准")
         report_times(durs)
 
-    y_bytes = y_elems * Y_ELEM_BYTES
+    y_bytes = y_elems * yElemBytes
     out = ctypes.create_string_buffer(y_bytes)
     check(acl.aclrtMemcpy(ctypes.cast(out, ctypes.c_void_p), y_bytes, dev_ptrs[NIN], y_bytes,   # NIN 号才是输出，别写死
                           ACL_MEMCPY_DEVICE_TO_HOST), "aclrtMemcpy D2H = %d")
-    got = decode_f16(out.raw[:y_bytes])
+    got = decode_y(out.raw[:y_bytes], info["isInt8"])
 
     # ------------------------------------------------------------ 比对
-    r = evaluate(got, want, rel_tol)
+    r = evaluate(got, want, rel_tol, ySentinel)
     nonzero, unwritten, mismatches = r["nonzero"], r["unwritten"], r["mismatches"]
     ratio = r["prec_ok"] / float(r["n"])
 
@@ -910,7 +959,13 @@ def main():
     print("           所以 %g 的判据比逐位相等**宽**：差 1 ULP 也能达标。" % rel_tol)
     print("           以 mismatches == 0 为准；只达标不逐位相等会报 [PASS*]。")
 
-    report_lsb(got, want, r, mismatches, y_dims, shift2)
+    if info["isInt8"]:
+        # int8 的输出就是整数，没有"累加器 LSB"或"输出 ULP"可言 —— 判据只有
+        # 逐位相等。差 1 的个数单独报，那是重量化舍入方向不同的表现。
+        offBy1 = sum(1 for i in range(r["n"]) if abs(got[0][i] - want[0][i]) == 1)
+        print("\n[int8] 差 1 的有 %d 个（重量化舍入方向不同的话会集中在这里）" % offBy1)
+    else:
+        report_lsb(got, want, r, mismatches, y_dims, shift2)
     report_ratio(got, want, r["n"])
     if "y_exact" in tensors:
         exact = decode_f16(tensors["y_exact"][2])
