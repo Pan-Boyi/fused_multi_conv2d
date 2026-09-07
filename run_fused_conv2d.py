@@ -964,6 +964,17 @@ def main():
         # 逐位相等。差 1 的个数单独报，那是重量化舍入方向不同的表现。
         offBy1 = sum(1 for i in range(r["n"]) if abs(got[0][i] - want[0][i]) == 1)
         print("\n[int8] 差 1 的有 %d 个（重量化舍入方向不同的话会集中在这里）" % offBy1)
+        # quant_scale 漏传的表征：输出大面积贴在 ±127。这个属性没有安全的缺省
+        # （OpDef 给的 1.0 在 int32 累加器上必然全饱和），所以专门报一下 ——
+        # 否则它长得像"算子算错了"。
+        satGot = sum(1 for v in got[0] if v == 127 or v == -128)
+        satWant = sum(1 for v in want[0] if v == 127 or v == -128)
+        print("[int8] 饱和（±127/-128）: 设备 %d / %d = %.4f%%   golden %d = %.4f%%"
+              % (satGot, r["n"], satGot * 100.0 / r["n"], satWant, satWant * 100.0 / r["n"]))
+        if satGot > r["n"] // 10 and satWant * 20 < satGot:
+            print("       => 设备侧大面积饱和而 golden 没有 —— 极可能是 quant_scale 没传对。")
+            print("          它是 OPTIONAL，缺省 1.0，而 int8 的累加器量级在 1e6~1e7，")
+            print("          1.0 会让每个点都撞到 ±127。检查 om_out 里的 singleop_used.json。")
     else:
         report_lsb(got, want, r, mismatches, y_dims, shift2)
     report_ratio(got, want, r["n"])
