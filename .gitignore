@@ -1,17 +1,6 @@
-# 构建产物
-gen_case
-golden_selfcheck
-test_aclop_fused_conv2d
-test_aclop_fused_conv2d.aarch64
-fused_conv2d_case.bin
-om_out/
-prof_out/
-
-# onnx_block 的产物
-onnx_block/*.onnx
-onnx_block/io/
-onnx_block/om_out/
-
-# python 缓存
+out/
 __pycache__/
-*.pyc
+gen_case
+fc2d_geom
+*.bin
+*.om

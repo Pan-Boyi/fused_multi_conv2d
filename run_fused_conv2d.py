@@ -62,22 +62,16 @@ Y_SENTINEL_U16 = 0x7F7F   # fp16 输出的哨兵（两字节）
 Y_SENTINEL_I8 = 0x7F      # int8 输出的哨兵（一字节，正好是 int8 的 127）
 Y_ELEM_BYTES = 2          # fp16 那条；int8 那条用 1，见 decode_y()
 
-HDR_FMT = "<8sIIQQQQQ"          # magic, version, ntensors, nonzero, probe, sat, y_elems, attrs
-
-# 第 5 个字段原本恒为 0（int8 时代的 ties 计数），现在放探针 id。
-# 探针 = 把某一层的权重换成中心抽头恒等，用来把两层拆开单独看。
-# 权重是运行时输入不是属性，所以换探针只要换 .bin，不用重编 .om。
-PROBES = {
-    0: "none —— 随机权重，正常用例",
-    1: "passthrough —— conv1/conv2 都恒等、bias 全 0；y 应当 == relu(x[c][2h][2w])，"
-       "c>=32 全 0。纯数据搬运测试，和 fixShiftVal 无关",
-    2: "mid —— 只有 conv2 恒等；y 直接暴露 conv1 的输出（下采样后）",
-    3: "chanid —— 恒等权重 + x[c][h][w] = (c+1)*2^-14；每个输出通道的值直接编码"
-       "「哪个输入通道落到了这里」",
-    4: "colid —— 恒等权重 + x[c][h][w] = (w+1)*2^-14；值编码「哪一列落到了这里」",
-}
-# attrs 的低 8 位是 fixed_shift1，次 8 位是 fixed_shift2。放在文件里而不是脚本
-# 里写死，是因为它由 golden 按数据算出来，主机和设备必须用同一个值。
+# case 文件的头（version 4）。**形状全在 spec 里**，脚本不再写死任何一个维度 ——
+# gen_case 写它，fc2d.py 从它生成 singleop.json，本脚本从它下发属性，三处同源。
+CASE_VERSION = 4
+SPEC_KEYS = [
+    "n", "ci", "hi", "wi", "cout1", "cout2", "kh", "kw", "s1", "s2",
+    "ph1", "pw1", "ph2", "pw2", "elem_bytes", "bias", "relu1", "relu2",
+    "shift1", "shift2", "ho2", "wo2", "safe_f1", "safe_f2",
+]
+SPEC_N = 32
+HDR_FMT = "<8sIIQQQ" + "%di" % SPEC_N + "II"
 HDR_LEN = struct.calcsize(HDR_FMT)
 REC_FMT = "<16sII4qQ"           # name, dtype, ndim, dims[4], nbytes
 REC_LEN = struct.calcsize(REC_FMT)
@@ -121,30 +115,25 @@ def die(msg):
 # ---------------------------------------------------------------- 读 .bin
 def load_case(path):
     if not os.path.isfile(path):
-        die("找不到 %s —— 在能编译的机器上跑 ./gen_case 生成，再拷过来" % path)
+        die("找不到 %s —— 在能编译的机器上跑 ./gen_case（或 fc2d.py --steps case）生成，再拷过来" % path)
     with open(path, "rb") as f:
         blob = f.read()
     if len(blob) < HDR_LEN:
         die("%s 只有 %d 字节，文件不完整（传输中断？）" % (path, len(blob)))
 
-    magic, version, ntensors, nonzero, probe, sat, y_elems, attrs = struct.unpack_from(HDR_FMT, blob, 0)
-    # 版本 3 = int8 量化通路：header 尾部多两个 uint64
-    #   mode   低 8 位 dtype（0 fp16 / 1 int8），bit8 带不带 bias，bit9 relu 开不开
-    #   scales 低 32 位 quant_scale1 的 float 位型，高 32 位 quant_scale2
-    mode, scales = 0, 0
-    hdrLen = HDR_LEN
-    if version == 3:
-        if len(blob) < HDR_LEN + 16:
-            die("版本 3 的 header 不完整")
-        mode, scales = struct.unpack_from("<QQ", blob, HDR_LEN)
-        hdrLen = HDR_LEN + 16
+    vals = struct.unpack_from(HDR_FMT, blob, 0)
+    magic, version, ntensors, nonzero, sat, y_elems = vals[:6]
+    spec_vals = vals[6:6 + SPEC_N]
+    qs1_bits, qs2_bits = vals[6 + SPEC_N], vals[7 + SPEC_N]
     if magic != b"FC2DCASE":
         die("%s 不是 case 文件（magic = %r）" % (path, magic))
-    if version not in (2, 3):
-        die("case 文件版本 %d，本脚本认 2（fp16 定点）和 3（int8 量化）。\n"
-            "        版本 1 是更早的量化接口（8 输入），已经不支持。" % version)
+    if version != CASE_VERSION:
+        die("case 文件版本 %d，本脚本认版本 %d。\n"
+            "        gen_case 和 run_fused_conv2d.py 必须配套 —— 重新生成一次 .bin。"
+            % (version, CASE_VERSION))
+    spec = dict(zip(SPEC_KEYS, spec_vals))
 
-    tensors, off = {}, hdrLen
+    tensors, off = {}, HDR_LEN
     for i in range(ntensors):
         if off + REC_LEN > len(blob):
             die("第 %d 个张量的头越界，文件被截断了" % i)
@@ -161,7 +150,7 @@ def load_case(path):
     if off != len(blob):
         die("文件尾部多出 %d 字节，格式对不上" % (len(blob) - off))
 
-    # 元素数和 dims 必须自洽。这一条能挡住"传了半个文件却刚好没越界"。
+    # 元素数和 dims 必须自洽。这一条能挡住「传了半个文件却刚好没越界」。
     for name, (dtype, dims, data) in tensors.items():
         want = DTYPE_SIZE[dtype]
         for d in dims:
@@ -170,23 +159,31 @@ def load_case(path):
             die("张量 %s: dims=%s dtype=%s 应为 %d 字节，实际 %d"
                 % (name, dims, DTYPE_NAME[dtype], want, len(data)))
 
-    # y_exact（纯 fp32 参考）只有 fp16 定点通路有 —— 那边的定点模型是**近似**，
-    # 需要第二个不依赖模型的参照。int8 通路的 golden 是精确整数运算，没有这个概念。
-    required = list(ORDER) + ["y_expect"] + (["y_exact"] if version == 2 else [])
+    isInt8 = (spec["elem_bytes"] == 1)
+    # y_exact（纯 fp32 参考）只有 fp16 定点通路有 —— 那边的定点模型带假设，需要
+    # 第二个不依赖模型的参照。int8 通路的 golden 是精确整数运算，没有这个概念。
+    required = list(ORDER) + ["y_expect"] + ([] if isInt8 else ["y_exact"])
     for name in required:
         if name not in tensors:
             die("case 文件里缺张量 %s" % name)
 
-    shift1 = int(attrs & 0xFF)
-    shift2 = int((attrs >> 8) & 0xFF)
-    if version == 2 and not (0 <= shift1 <= 58 and 0 <= shift2 <= 58):
-        die("header 里的定点定标 %d / %d 超出 [0,58] —— case 文件版本对不上？" % (shift1, shift2))
-    isInt8 = (version == 3) and ((mode & 0xFF) == 1)
-    qs1 = struct.unpack("<f", struct.pack("<I", scales & 0xFFFFFFFF))[0] if isInt8 else 0.0
-    qs2 = struct.unpack("<f", struct.pack("<I", (scales >> 32) & 0xFFFFFFFF))[0] if isInt8 else 0.0
-    info = {"isInt8": isInt8, "hasBias": bool((mode >> 8) & 1), "relu": bool((mode >> 9) & 1),
-            "qs1": qs1, "qs2": qs2}
-    return tensors, nonzero, probe, sat, y_elems, shift1, shift2, info
+    shift1, shift2 = spec["shift1"], spec["shift2"]
+    if not isInt8 and not (0 <= shift1 <= FIX_SHIFT_LEN and 0 <= shift2 <= FIX_SHIFT_LEN):
+        die("header 里的定点定标 %d / %d 超出 [0,%d]" % (shift1, shift2, FIX_SHIFT_LEN))
+    info = dict(spec)
+    info["isInt8"] = isInt8
+    info["hasBias"] = bool(spec["bias"])
+    info["relu"] = bool(spec["relu1"])   # 兼容旧调用点；两层各自的开关见 relu1/relu2
+    info["qs1"] = struct.unpack("<f", struct.pack("<I", qs1_bits))[0]
+    info["qs2"] = struct.unpack("<f", struct.pack("<I", qs2_bits))[0]
+    info["shape_text"] = (
+        "n%d %d->%d->%d %dx%d k%dx%d s%d/%d p%d,%d/%d,%d -> %dx%d %s"
+        % (spec["n"], spec["ci"], spec["cout1"], spec["cout2"], spec["hi"], spec["wi"],
+           spec["kh"], spec["kw"], spec["s1"], spec["s2"], spec["ph1"], spec["pw1"],
+           spec["ph2"], spec["pw2"], spec["ho2"], spec["wo2"], "int8" if isInt8 else "fp16"))
+    # probe 这一位在版本 4 里没有了：探针权重是运行时输入，要探就直接改 gen_case
+    # 生成的权重，不需要在 header 里留一个字段。
+    return tensors, nonzero, 0, sat, y_elems, shift1, shift2, info
 
 
 # ---------------------------------------------------------------- 绑 libascendcl
@@ -229,6 +226,10 @@ def load_acl():
         # "Don't know how to convert parameter 3"。
         ("aclopSetAttrFloat", [c_vp, ctypes.c_char_p, ctypes.c_float], ctypes.c_int),
         ("aclopSetAttrBool", [c_vp, ctypes.c_char_p, ctypes.c_uint8], ctypes.c_int),
+        # 卷积超参（kernel_size / strides / pads）是 list_int。不注册签名的话
+        # ctypes 会按 int 传指针，报 "Don't know how to convert parameter 4"。
+        ("aclopSetAttrListInt", [c_vp, ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int64)],
+         ctypes.c_int),
         ("aclopSetModelDir", [c_cp], c_i),
         ("aclopLoad", [c_vp, c_sz], c_i),
         ("aclGetRecentErrMsg", [], c_cp),
@@ -714,23 +715,30 @@ def main():
     case_path, op_type, device_id, om_arg = "fused_conv2d_case.bin", "FusedConv2d", 0, None
     positional = []
     for a in argv:
-        if os.path.isdir(a) or ("/" in a) or ("\\" in a):
+        # 按**后缀和类型**认，不按「带不带斜杠」。上一版是「带 / 就当 om 目录」，
+        # 而 case 文件现在都在 out/<名字>/case.bin 这样的子目录里 —— 一进来就被
+        # 当成 om 目录，然后 "FusedConv2d" 落到 case 文件那一位上，报「找不到
+        # case 文件 FusedConv2d」。
+        if a.endswith(".bin"):
+            if case_path != "fused_conv2d_case.bin":
+                die("给了两个 .bin：%s 和 %s" % (case_path, a))
+            case_path = a
+        elif a.endswith(".om") or os.path.isdir(a):
             if om_arg is None:
                 om_arg = a
             else:
-                die("给了两个像目录的参数：%s 和 %s" % (om_arg, a))
+                die("给了两个 om 参数：%s 和 %s" % (om_arg, a))
         elif a.isdigit():
             device_id = int(a)
         else:
             positional.append(a)
     if positional:
-        case_path = positional[0]
+        op_type = positional[0]
     if len(positional) > 1:
-        op_type = positional[1]
-    if len(positional) > 2:
         die("多余的参数：%s\n        用法: %s <case.bin> [算子名] [device_id] [om目录]\n"
-            "        顺序随意 —— 带 / 的当 om 目录，纯数字当 device_id。"
-            % (positional[2:], os.path.basename(sys.argv[0])))
+            "        顺序随意 —— .bin 结尾的当 case，.om 结尾或是目录的当离线模型，"
+            "纯数字当 device_id，剩下的当算子名。"
+            % (positional[1:], os.path.basename(sys.argv[0])))
     # --dry-run：不碰硬件，用 golden 冒充设备输出把主流程走一遍。加它是因为
     # 「只在板上才炸」的问题（比如 int8 没有 y_exact，而下面按 ORDER + GOLDENS
     # 遍历会 KeyError）本地发现不了 —— 单独测 load_case 和 evaluate 不够，
@@ -792,6 +800,7 @@ def main():
             die("%s 既不是文件也不是目录" % om_arg)
 
     tensors, gold_nonzero, probe, sat, y_elems, shift1, shift2, info = load_case(case_path)
+    print("形状（来自 case 文件的 spec）: %s" % info["shape_text"])
     want_raw = tensors["y_expect"][2]
     yElemBytes = 1 if info["isInt8"] else 2
     ySentinel = Y_SENTINEL_I8 if info["isInt8"] else Y_SENTINEL_U16
@@ -818,7 +827,6 @@ def main():
         print("            对应累加器定标 2^%d / 2^%d —— 属性越大定标越小，别搞反"
               % (FIX_SHIFT_LEN - shift1, FIX_SHIFT_LEN - shift2))
     print("golden: nonzero=%d/%d sat=%d" % (gold_nonzero, y_elems, sat))
-    print("探针: %s" % PROBES.get(probe, "未知 id %d —— .bin 和脚本版本可能对不上" % probe))
     if gold_nonzero == 0:
         die("golden 全是 0 —— 先别管设备")
 
@@ -919,31 +927,40 @@ def main():
         setattr_fn = getattr(acl, "aclopSetAttrInt", None)
         if setattr_fn is None:
             die("这个 CANN 的 libascendcl.so 里没有 aclopSetAttrInt —— 属性传不下去")
-        # 下发的属性集必须和编 .om 时那份**完全一致** —— ACL 匹配 .om 是连 attr
-        # 一起匹配的，多设一个或少设一个都会 MatchOpModel fail，而报出来是
-        # 100024 / "算子没找到"。所以两条通路各设各的，不能叠加：
-        #   fp16   fixed_shift1/2                       （singleop_fp16.json）
-        #   int8   quant_scale1/2 + relu1/2             （singleop_int8.json）
-        if info["isInt8"]:
-            for fn in ("aclopSetAttrFloat", "aclopSetAttrBool"):
-                if getattr(acl, fn, None) is None:
-                    die("这个 CANN 的 libascendcl.so 里没有 %s —— int8 通路的属性传不下去。\n"
-                        "        fp16 通路不受影响（它只用 aclopSetAttrInt）。" % fn)
-            for nm, v in (("quant_scale1", info["qs1"]), ("quant_scale2", info["qs2"])):
-                rc = acl.aclopSetAttrFloat(attr, nm.encode(), ctypes.c_float(v))
-                if rc != ACL_SUCCESS:
-                    die("aclopSetAttrFloat(%s=%g) = %d" % (nm, v, rc))
-            for nm, v in (("relu1", info["relu"]), ("relu2", info["relu"])):
-                rc = acl.aclopSetAttrBool(attr, nm.encode(), 1 if v else 0)
-                if rc != ACL_SUCCESS:
-                    die("aclopSetAttrBool(%s=%s) = %d" % (nm, v, rc))
-            print("算子属性: quant_scale1=%.9g quant_scale2=%.9g relu1=relu2=%s"
-                  % (info["qs1"], info["qs2"], info["relu"]))
-        else:
-            for nm, v in (("fixed_shift1", shift1), ("fixed_shift2", shift2)):
-                rc = setattr_fn(attr, nm.encode(), v)
-                if rc != ACL_SUCCESS:
-                    die("aclopSetAttrInt(%s=%d) = %d" % (nm, v, rc))
+        # 下发的属性集必须和编 .om 时那份**完全一致** —— ACL 匹配 .om 是连 attr 一起
+        # 匹配的，多设一个或少设一个都会 MatchOpModel fail，而报出来是 100024 /
+        # 「算子没找到」，那条信息完全不指向真正的原因。
+        #
+        # 所以这里**九个属性一个不少地全设**，fc2d.py 生成 singleop.json 时也全写。
+        # 上一版是两条通路各设一个子集，于是「int8 分支之后又无条件设了 fixed_shift」
+        # 这种事就会炸，而且炸得像算子没装。全集没有这个问题。
+        for fn in ("aclopSetAttrFloat", "aclopSetAttrBool", "aclopSetAttrListInt"):
+            if getattr(acl, fn, None) is None:
+                die("这个 CANN 的 libascendcl.so 里没有 %s —— 属性传不下去" % fn)
+        for nm, v in (("fixed_shift1", shift1), ("fixed_shift2", shift2)):
+            rc = setattr_fn(attr, nm.encode(), v)
+            if rc != ACL_SUCCESS:
+                die("aclopSetAttrInt(%s=%d) = %d" % (nm, v, rc))
+        for nm, v in (("relu1", bool(info["relu1"])), ("relu2", bool(info["relu2"]))):
+            rc = acl.aclopSetAttrBool(attr, nm.encode(), 1 if v else 0)
+            if rc != ACL_SUCCESS:
+                die("aclopSetAttrBool(%s=%s) = %d" % (nm, v, rc))
+        for nm, v in (("quant_scale1", info["qs1"]), ("quant_scale2", info["qs2"])):
+            rc = acl.aclopSetAttrFloat(attr, nm.encode(), ctypes.c_float(v))
+            if rc != ACL_SUCCESS:
+                die("aclopSetAttrFloat(%s=%g) = %d" % (nm, v, rc))
+        for nm, vals in (("kernel_size", [info["kh"], info["kw"]]),
+                         ("strides", [info["s1"], info["s2"]]),
+                         ("pads", [info["ph1"], info["pw1"], info["ph2"], info["pw2"]])):
+            arr = (ctypes.c_int64 * len(vals))(*vals)
+            rc = acl.aclopSetAttrListInt(attr, nm.encode(), len(vals), arr)
+            if rc != ACL_SUCCESS:
+                die("aclopSetAttrListInt(%s=%s) = %d" % (nm, vals, rc))
+        print("算子属性: fixed_shift=%d/%d relu=%s/%s quant_scale=%.9g/%.9g "
+              "kernel=%dx%d strides=%d/%d pads=%d,%d/%d,%d"
+              % (shift1, shift2, bool(info["relu1"]), bool(info["relu2"]), info["qs1"], info["qs2"],
+                 info["kh"], info["kw"], info["s1"], info["s2"],
+                 info["ph1"], info["pw1"], info["ph2"], info["pw2"]))
 
         def launch():
             return acl.aclopExecuteV2(op_type.encode(), NIN, in_desc, in_buf,
@@ -1068,8 +1085,9 @@ def main():
         # 拿真值反推定标。和 y_expect 比没意义 —— 那是按（可能错的）模型算出来的。
         probe_acc_scale(got, exact, r["n"], shift2, y_dims)
         print_sample(got, want, exact, r["n"], y_dims)
-    if probe in (3, 4):
-        report_idmap(got, y_dims, probe)
+    # 版本 4 的 header 没有 probe 这一位了 —— 恒等权重那套探针是运行时输入，
+    # 要用直接改 gen_case 生成的权重即可，不需要在文件格式里留一个字段。
+    # report_idmap 保留着，等哪天真要再探时直接调。
 
     # 设备原始输出落盘。默认**关**：板子那台机器上的文件多半传不出来，存了也是垃圾。
     # 真要离线分析再 FC2D_DUMP=<路径> 打开。分析所需的结论上面几段已经在设备上算完了。

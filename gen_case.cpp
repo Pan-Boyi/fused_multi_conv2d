@@ -1,29 +1,43 @@
 /*
  * 生成上板验证用的 case 文件。在**任何能编译的机器**上跑，不需要 CANN、不需要设备。
  *
- *   ./gen_case fused_conv2d_case.bin
+ *   ./gen_case out.bin --dtype fp16 --n 1 --ci 32 --hi 288 --wi 112 \
+ *              --cout1 64 --cout2 96 --kh 3 --kw 3 --s1 1 --s2 2 \
+ *              --ph1 1 --pw1 1 --ph2 1 --pw2 1 --bias 0 --relu1 1 --relu2 1 \
+ *              --shift1 42 --shift2 42
  *
- * 文件格式（和 run_fused_conv2d.py 配套，version = 2）：
- *   header  magic "FC2DCASE", version, ntensors, nonzero, probe, sat, y_elems,
- *           attrs —— 低 8 位 fixed_shift1，次 8 位 fixed_shift2
- *   然后每个张量：name[16], dtype(u32), ndim(u32), dims[4](i64), nbytes(u64), data
+ * 形状全部从命令行来 —— 上一版是写死的，一个形状一个二进制。现在
+ * fc2d.py 从 cases.json 里读一条就展开成上面这样一行，所以**改 json 就能换形状**。
  *
- * 张量顺序就是算子的 ABI 顺序：
- *   x, filter1, bias1, filter2, bias2  ->  y
- * 外加两个 golden：
- *   y_expect  定点模型算出来的，假设成立时应当**逐位相等**
- *   y_exact   纯 fp32 参考，判「这个算子有没有在算这个卷积」，不受定点假设影响
+ * ---------------------------------------------------------------------------
+ * 文件格式（version = 4，和 run_fused_conv2d.py 配套）
+ * ---------------------------------------------------------------------------
+ *   magic "FC2DCASE" (8B)
+ *   version u32 = 4
+ *   ntensors u32
+ *   nonzero  u64   golden 里非零输出的个数
+ *   sat      u64   落格时撞到边界的个数（fp16 是 int32 饱和，int8 是 ±127）
+ *   y_elems  u64
+ *   spec     32 x i32  —— 完整的形状 + 属性，见下面 SPEC_* 的定义
+ *   qscale   2 x u32   —— int8 通路的两个 quant_scale 的 float 位型
+ *   然后每个张量：name[16], dtype u32, ndim u32, dims[4] i64, nbytes u64, data
  *
- * 两个 golden 都给，是因为定点模型里那个 fixShiftVal 的语义我没有硬件实测过
- * （见 golden.h 顶部）。板上先看 y_exact 的相对误差过不过，再看 y_expect 能不能
- * 逐位对上；只有前者过、后者不过，说明卷积算对了但定点模型猜错了。
+ * **spec 是这个文件里唯一的形状真相。** run_fused_conv2d.py 和 fc2d.py 生成
+ * singleop.json 时都从它读，所以 .bin 和 .om 不可能对不上形状 —— 上一版靠脚本
+ * 里另写一份 shape，改了 golden 忘了改 json，板上报的是「算子没找到」。
+ *
+ * 张量顺序就是算子的 ABI 顺序：x, filter1, bias1, filter2, bias2 -> y
+ * 外加 golden：
+ *   fp16   y_expect（定点模型，假设成立时应逐位相等）+ y_exact（纯 fp32 参考）
+ *   int8   y_expect（精确整数运算 + REQ8，应逐位相等）
  */
-#include <cmath>
-#include "fused_conv2d_golden.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <algorithm>
+#include <string>
+#include <vector>
+
+#include "fused_conv2d_golden.h"
 
 using namespace fc2d_golden;
 
@@ -31,250 +45,301 @@ constexpr uint32_t ACL_DT_FLOAT16 = 1;
 constexpr uint32_t ACL_DT_INT8 = 2;
 constexpr uint32_t ACL_DT_INT32 = 3;
 
-// ---------------------------------------------------------------------------
-// 探针模式。把某一层的权重换成「中心抽头恒等」，用来把两层拆开单独看。
-//
-// 为什么值得做：随机权重下输出错了，分不清是**定点运算**错了还是**数据搬运**
-// （im2col / FRACTAL_Z / L0B 分块 / NZ 排布）错了。恒等权重让卷积退化成一次
-// 取值，搬运一旦错位，结果立刻能看出来；反过来如果恒等下是对的，那搬运没问题，
-// 问题就锁死在定点运算上。
-//
-// 关键：权重是**运行时输入**，不是算子属性 —— 换权重不影响 .om 的匹配
-// （op 类型 + shape/dtype/format + attr 才参与匹配）。所以这些探针只要重生成
-// .bin，**不用重编 .om**。属性仍然固定 S=42，不能动，动了 .om 就对不上。
-//
-//   passthrough  conv1 conv2 都恒等、bias 全 0
-//                y[c][h][w] = relu(x[c][2h][2w])，c < 32；c >= 32 全 0
-//                纯粹的数据搬运测试。这个都不过，说明和 fixShiftVal 无关。
-//   mid          只有 conv2 恒等，conv1 保持随机
-//                y 直接暴露 conv1 的输出（下采样后），把 conv1 单独拎出来看。
-// ---------------------------------------------------------------------------
-enum class Probe { None, Passthrough, Mid, ChanId, ColId };
+constexpr uint32_t CASE_VERSION = 4;
+constexpr int SPEC_N = 32; // spec 数组的长度，留了余量
 
-// NCHW [cout][cin][KH][KW]：co == ci 的中心抽头置 1.0，其余全 0。
-// cout > cin 时多出来的输出通道全 0 —— golden 会照样算出来，不用特殊处理。
-static void MakeIdentityWeight(std::vector<uint16_t>& w, int cout, int cin)
-{
-    std::fill(w.begin(), w.end(), (uint16_t)0);
-    const int n = cout < cin ? cout : cin;
-    for (int c = 0; c < n; ++c) {
-        w[(((size_t)c * cin + c) * KH + (KH / 2)) * KW + (KW / 2)] = 0x3C00u;  // fp16 1.0
+// spec 数组的下标。**只能往后加，不能插**：run_fused_conv2d.py 按同样的下标读。
+enum SpecIdx {
+    SPEC_N_BATCH = 0,
+    SPEC_CI,
+    SPEC_HI,
+    SPEC_WI,
+    SPEC_COUT1,
+    SPEC_COUT2,
+    SPEC_KH,
+    SPEC_KW,
+    SPEC_S1,
+    SPEC_S2,
+    SPEC_PH1,
+    SPEC_PW1,
+    SPEC_PH2,
+    SPEC_PW2,
+    SPEC_ELEM_BYTES, // 2 = fp16, 1 = int8
+    SPEC_BIAS,
+    SPEC_RELU1,
+    SPEC_RELU2,
+    SPEC_SHIFT1,
+    SPEC_SHIFT2,
+    SPEC_HO2,
+    SPEC_WO2,
+    SPEC_SAFE_F1, // 部分和不溢出所允许的最大 F（只有 fp16 有意义）
+    SPEC_SAFE_F2,
+    SPEC_COUNT
+};
+static_assert(SPEC_COUNT <= SPEC_N, "spec 数组放不下");
+
+struct Writer {
+    FILE* f;
+    void U32(uint32_t v) { fwrite(&v, 4, 1, f); }
+    void U64(uint64_t v) { fwrite(&v, 8, 1, f); }
+    void I32(int32_t v) { fwrite(&v, 4, 1, f); }
+    void Raw(const void* p, size_t n) { fwrite(p, 1, n, f); }
+    void Tensor(const char* name, uint32_t dtype, const std::vector<int64_t>& dims, const void* data,
+                size_t nbytes)
+    {
+        char nm[16];
+        std::memset(nm, 0, sizeof(nm));
+        std::snprintf(nm, sizeof(nm), "%s", name);
+        Raw(nm, 16);
+        U32(dtype);
+        U32((uint32_t)dims.size());
+        for (int i = 0; i < 4; ++i) {
+            const int64_t d = i < (int)dims.size() ? dims[i] : 0;
+            fwrite(&d, 8, 1, f);
+        }
+        U64((uint64_t)nbytes);
+        Raw(data, nbytes);
     }
-}
+};
 
-// 把 x 换成「编号斜坡」：每个位置的值只编码它的通道号（或列号），乘上一个很小的
-// 比例因子。恒等权重下正确的输出就是同一个编号，于是设备打出来的数**直接读出**
-// 数据实际落到了哪里 —— 不用再从错误里反推。
-//
-// 比例因子取 2^-14（fp16 最小的正规数，(c+1)*2^-14 到 32 都能精确表示）。选这么
-// 小是为了不饱和：acc = 真值 * 2^E，真值 <= 32*2^-14 时 E 到 39 都还在 int32 内。
-// 上一轮 passthrough 几乎全饱和在 32768，信息被抹掉了，这次要留出读数的余量。
-static void FillRamp(std::vector<uint16_t>& x, bool byChannel)
+static int ArgInt(int argc, char** argv, const char* key, int dflt, bool* found = nullptr)
 {
-    const float unit = std::ldexp(1.0f, -14);
-    for (int c = 0; c < CI; ++c) {
-        for (int h = 0; h < HI; ++h) {
-            for (int w = 0; w < WI; ++w) {
-                const int id = byChannel ? c : w;
-                x[((size_t)c * HI + h) * WI + w] = F32ToF16Bits((float)(id + 1) * unit);
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], key) == 0) {
+            if (found != nullptr) {
+                *found = true;
             }
+            return std::atoi(argv[i + 1]);
         }
     }
+    return dflt;
 }
 
-static void ApplyProbe(Inputs& in, Probe mode)
+static const char* ArgStr(int argc, char** argv, const char* key, const char* dflt)
 {
-    if (mode == Probe::None) return;
-    if (mode == Probe::ChanId || mode == Probe::ColId) {
-        FillRamp(in.xNchw, mode == Probe::ChanId);
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], key) == 0) {
+            return argv[i + 1];
+        }
     }
-    if (mode == Probe::Passthrough || mode == Probe::ChanId || mode == Probe::ColId) {
-        MakeIdentityWeight(in.w1Nchw, COUT1, CI);
-        std::fill(in.b1.begin(), in.b1.end(), (uint16_t)0);
-    }
-    MakeIdentityWeight(in.w2Nchw, COUT2, COUT1);
-    std::fill(in.b2.begin(), in.b2.end(), (uint16_t)0);
-    // 权重改了，设备用的 FRACTAL_Z 副本必须重算 —— 否则 golden 和下发的权重是两份。
-    WeightToFractalZ(in.w1Nchw.data(), CI, COUT1, in.w1Dev);
-    WeightToFractalZ(in.w2Nchw.data(), COUT1, COUT2, in.w2Dev);
-}
-
-
-static bool WriteTensor(std::FILE* f, const char* name, uint32_t dtype, const std::vector<int64_t>& dims,
-                        const void* data, uint64_t nbytes)
-{
-    char nameBuf[16] = {0};
-    std::snprintf(nameBuf, sizeof(nameBuf), "%s", name);
-    uint32_t ndim = (uint32_t)dims.size();
-    int64_t dimBuf[4] = {0, 0, 0, 0};
-    for (size_t i = 0; i < dims.size() && i < 4; ++i) dimBuf[i] = dims[i];
-    if (std::fwrite(nameBuf, 1, sizeof(nameBuf), f) != sizeof(nameBuf)) return false;
-    if (std::fwrite(&dtype, 1, 4, f) != 4) return false;
-    if (std::fwrite(&ndim, 1, 4, f) != 4) return false;
-    if (std::fwrite(dimBuf, 1, sizeof(dimBuf), f) != sizeof(dimBuf)) return false;
-    if (std::fwrite(&nbytes, 1, 8, f) != 8) return false;
-    if (nbytes != 0 && std::fwrite(data, 1, nbytes, f) != nbytes) return false;
-    return true;
-}
-
-
-// ---------------------------------------------------------------------------
-// int8 量化通路的 case。
-//
-// 张量顺序和 fp16 通路完全一样（算子的输入列表是共用的），只有 dtype 不同：
-//   x/filter int8，bias int32，y int8
-// 两个 scale 走 header（版本 3 新增），run 脚本取出来当算子属性 quant_scale1/2
-// 下发 —— 和 fp16 通路的 fixed_shift 走同一条路，不用手填。
-// ---------------------------------------------------------------------------
-static int WriteInt8Case(const char* path, bool withBias, bool relu)
-{
-    namespace Q = fc2d_golden::int8path;
-    Q::Inputs in = Q::GenerateInputs(withBias);
-    Q::Golden g = Q::BuildGolden(in, withBias, relu);
-
-    std::printf("golden(int8): scale1=%.6g scale2=%.6g  bias=%s relu=%s  y 非零 %ld/%zu  饱和 %ld\n",
-                g.scale1, g.scale2, withBias ? "on" : "off", relu ? "on" : "off",
-                g.yNonZero, g.y.size(), g.satCount);
-    if (g.yNonZero == 0) { std::printf("[X] golden 全是 0\n"); return 1; }
-
-    std::FILE* f = std::fopen(path, "wb");
-    if (f == nullptr) { std::printf("[X] 打不开 %s\n", path); return 1; }
-
-    const uint32_t version = 3;
-    const uint32_t ntensors = 6;   // 5 输入 + 1 golden（int8 没有第二个「纯 fp32 参考」）
-    const uint64_t hNonZero = (uint64_t)g.yNonZero;
-    const uint64_t hProbe = 0;
-    const uint64_t hSat = (uint64_t)g.satCount;
-    const uint64_t hYElems = (uint64_t)g.y.size();
-    const uint64_t attrs = 0;      // int8 不用 fixed_shift
-    uint32_t s1b = 0, s2b = 0;
-    std::memcpy(&s1b, &g.scale1, 4);
-    std::memcpy(&s2b, &g.scale2, 4);
-    // 版本 3 新增：dtype 标记 + 两个 scale 的位型 + bias/relu 开关
-    const uint64_t hMode = (uint64_t)1 | ((uint64_t)(withBias ? 1 : 0) << 8) | ((uint64_t)(relu ? 1 : 0) << 9);
-    const uint64_t hScales = (uint64_t)s1b | ((uint64_t)s2b << 32);
-
-    bool ok = std::fwrite("FC2DCASE", 1, 8, f) == 8;
-    ok = ok && std::fwrite(&version, 1, 4, f) == 4;
-    ok = ok && std::fwrite(&ntensors, 1, 4, f) == 4;
-    ok = ok && std::fwrite(&hNonZero, 1, 8, f) == 8;
-    ok = ok && std::fwrite(&hProbe, 1, 8, f) == 8;
-    ok = ok && std::fwrite(&hSat, 1, 8, f) == 8;
-    ok = ok && std::fwrite(&hYElems, 1, 8, f) == 8;
-    ok = ok && std::fwrite(&attrs, 1, 8, f) == 8;
-    ok = ok && std::fwrite(&hMode, 1, 8, f) == 8;
-    ok = ok && std::fwrite(&hScales, 1, 8, f) == 8;
-
-    const int64_t fz1k = (CI / 32) * KH * KW, fz1n = (COUT1 + 15) / 16;
-    const int64_t fz2k = (COUT1 / 32) * KH * KW, fz2n = (COUT2 + 15) / 16;
-
-    ok = ok && WriteTensor(f, "x", ACL_DT_INT8, {1, CI, HI, WI}, in.xNchw.data(), in.xNchw.size());
-    ok = ok && WriteTensor(f, "filter1", ACL_DT_INT8, {fz1k, fz1n, 16, 32}, in.w1Dev.data(), in.w1Dev.size());
-    ok = ok && WriteTensor(f, "bias1", ACL_DT_INT32, {COUT1}, in.b1.data(), in.b1.size() * 4);
-    ok = ok && WriteTensor(f, "filter2", ACL_DT_INT8, {fz2k, fz2n, 16, 32}, in.w2Dev.data(), in.w2Dev.size());
-    ok = ok && WriteTensor(f, "bias2", ACL_DT_INT32, {COUT2}, in.b2.data(), in.b2.size() * 4);
-    ok = ok && WriteTensor(f, "y_expect", ACL_DT_INT8, {1, COUT2, HO2, WO2}, g.y.data(), g.y.size());
-
-    std::fclose(f);
-    if (!ok) { std::printf("[X] 写 %s 失败\n", path); return 1; }
-    std::printf("\n[OK] 写出 %s（int8 通路）\n     5 个输入 + 1 个 golden\n", path);
-    std::printf("     算子属性 quant_scale1 = %.9g, quant_scale2 = %.9g（已打包进 header）\n", g.scale1, g.scale2);
-    std::printf("     bias %s，relu %s\n", withBias ? "带" : "不带", relu ? "开" : "关");
-    return 0;
+    return dflt;
 }
 
 int main(int argc, char** argv)
 {
-    const char* path = "fused_conv2d_case.bin";
-    Probe probe = Probe::None;
-    const char* probeName = "none";
-    bool int8Mode = false;
-    bool withBias = true;   // int8 通路默认带 bias（fp16 通路不带，见算子说明）
-    bool relu = true;
-    for (int i = 1; i < argc; ++i) {
-        const char* a = argv[i];
-        if (std::strncmp(a, "--probe=", 8) == 0) {
-            const char* v = a + 8;
-            if (std::strcmp(v, "passthrough") == 0)      { probe = Probe::Passthrough; probeName = v; }
-            else if (std::strcmp(v, "mid") == 0)          { probe = Probe::Mid;         probeName = v; }
-            else if (std::strcmp(v, "chanid") == 0)       { probe = Probe::ChanId;      probeName = v; }
-            else if (std::strcmp(v, "colid") == 0)        { probe = Probe::ColId;       probeName = v; }
-            else if (std::strcmp(v, "none") == 0)         { probe = Probe::None;        probeName = v; }
-            else { std::printf("[X] --probe 只认 none/passthrough/mid/chanid/colid，收到 %s\n", v); return 1; }
-        } else if (std::strcmp(a, "--dtype=int8") == 0) {
-            int8Mode = true;
-        } else if (std::strcmp(a, "--dtype=fp16") == 0) {
-            int8Mode = false;
-        } else if (std::strcmp(a, "--no-bias") == 0) {
-            withBias = false;
-        } else if (std::strcmp(a, "--no-relu") == 0) {
-            relu = false;
-        } else if (a[0] == '-') {
-            std::printf("[X] 不认识的参数 %s\n", a); return 1;
-        } else {
-            path = a;
+    if (argc < 2) {
+        std::fprintf(stderr,
+                     "用法: %s <out.bin> [--dtype fp16|int8] [--n N] [--ci N] [--hi N] [--wi N]\n"
+                     "        [--cout1 N] [--cout2 N] [--kh N] [--kw N] [--s1 N] [--s2 N]\n"
+                     "        [--ph1 N] [--pw1 N] [--ph2 N] [--pw2 N]\n"
+                     "        [--bias 0|1] [--relu1 0|1] [--relu2 0|1] [--shift1 N] [--shift2 N]\n"
+                     "缺省就是这个算子最早那组固定形状（32->64->96, 288x112, 3x3, s1/2, pad1）。\n",
+                     argv[0]);
+        return 2;
+    }
+    const char* out = argv[1];
+
+    Case c;
+    const std::string dtype = ArgStr(argc, argv, "--dtype", "fp16");
+    if (dtype == "int8") {
+        c.elemBytes = 1;
+    } else if (dtype == "fp16") {
+        c.elemBytes = 2;
+    } else {
+        std::fprintf(stderr, "[X] --dtype 只能是 fp16 或 int8，给的是 %s\n", dtype.c_str());
+        return 2;
+    }
+    c.n = ArgInt(argc, argv, "--n", c.n);
+    c.ci = ArgInt(argc, argv, "--ci", c.ci);
+    c.hi = ArgInt(argc, argv, "--hi", c.hi);
+    c.wi = ArgInt(argc, argv, "--wi", c.wi);
+    c.cout1 = ArgInt(argc, argv, "--cout1", c.cout1);
+    c.cout2 = ArgInt(argc, argv, "--cout2", c.cout2);
+    c.kh = ArgInt(argc, argv, "--kh", c.kh);
+    c.kw = ArgInt(argc, argv, "--kw", c.kw);
+    c.stride1 = ArgInt(argc, argv, "--s1", c.stride1);
+    c.stride2 = ArgInt(argc, argv, "--s2", c.stride2);
+    c.padH1 = ArgInt(argc, argv, "--ph1", c.padH1);
+    c.padW1 = ArgInt(argc, argv, "--pw1", c.padW1);
+    c.padH2 = ArgInt(argc, argv, "--ph2", c.padH2);
+    c.padW2 = ArgInt(argc, argv, "--pw2", c.padW2);
+    c.bias = ArgInt(argc, argv, "--bias", c.bias ? 1 : 0) != 0;
+    c.relu1 = ArgInt(argc, argv, "--relu1", c.relu1 ? 1 : 0) != 0;
+    c.relu2 = ArgInt(argc, argv, "--relu2", c.relu2 ? 1 : 0) != 0;
+    c.shift1 = ArgInt(argc, argv, "--shift1", c.shift1);
+    c.shift2 = ArgInt(argc, argv, "--shift2", c.shift2);
+
+    // 形状的基本自洽性。算子的 tiling 还会再查一遍（而且更严），这里只挡住那些
+    // 会让 golden 本身算不出来的。
+    const int c0 = c.C0();
+    if (c.ci % c0 != 0 || c.cout1 % c0 != 0) {
+        std::fprintf(stderr, "[X] ci(%d) 和 cout1(%d) 必须是 C0=%d 的整数倍\n", c.ci, c.cout1, c0);
+        return 2;
+    }
+    if (c.cout1 % 16 != 0 || c.cout2 % 16 != 0) {
+        std::fprintf(stderr, "[X] cout1(%d) / cout2(%d) 必须是 16 的整数倍\n", c.cout1, c.cout2);
+        return 2;
+    }
+    if (c.Ho1() <= 0 || c.Wo1() <= 0 || c.Ho2() <= 0 || c.Wo2() <= 0) {
+        std::fprintf(stderr, "[X] 卷出来是空的：conv1 -> %dx%d, conv2 -> %dx%d\n", c.Ho1(), c.Wo1(),
+                     c.Ho2(), c.Wo2());
+        return 2;
+    }
+
+    std::printf("形状: %s\n", c.Text().c_str());
+    std::printf("  conv1 -> %dx%d，conv2 -> %dx%d，y 共 %ld 个元素\n", c.Ho1(), c.Wo1(), c.Ho2(), c.Wo2(),
+                c.YElems());
+
+    int32_t spec[SPEC_N];
+    std::memset(spec, 0, sizeof(spec));
+    spec[SPEC_N_BATCH] = c.n;
+    spec[SPEC_CI] = c.ci;
+    spec[SPEC_HI] = c.hi;
+    spec[SPEC_WI] = c.wi;
+    spec[SPEC_COUT1] = c.cout1;
+    spec[SPEC_COUT2] = c.cout2;
+    spec[SPEC_KH] = c.kh;
+    spec[SPEC_KW] = c.kw;
+    spec[SPEC_S1] = c.stride1;
+    spec[SPEC_S2] = c.stride2;
+    spec[SPEC_PH1] = c.padH1;
+    spec[SPEC_PW1] = c.padW1;
+    spec[SPEC_PH2] = c.padH2;
+    spec[SPEC_PW2] = c.padW2;
+    spec[SPEC_ELEM_BYTES] = c.elemBytes;
+    spec[SPEC_BIAS] = c.bias ? 1 : 0;
+    spec[SPEC_RELU1] = c.relu1 ? 1 : 0;
+    spec[SPEC_RELU2] = c.relu2 ? 1 : 0;
+    spec[SPEC_SHIFT1] = c.shift1;
+    spec[SPEC_SHIFT2] = c.shift2;
+    spec[SPEC_HO2] = c.Ho2();
+    spec[SPEC_WO2] = c.Wo2();
+
+    FILE* f = std::fopen(out, "wb");
+    if (f == nullptr) {
+        std::fprintf(stderr, "[X] 打不开 %s\n", out);
+        return 1;
+    }
+    Writer w{f};
+
+    const int64_t fz1k = (int64_t)(c.ci / c0) * c.kh * c.kw;
+    const int64_t fz1n = c.cout1 / 16;
+    const int64_t fz2k = (int64_t)(c.cout1 / c0) * c.kh * c.kw;
+    const int64_t fz2n = c.cout2 / 16;
+    const std::vector<int64_t> xDims = {c.n, c.ci, c.hi, c.wi};
+    const std::vector<int64_t> yDims = {c.n, c.cout2, c.Ho2(), c.Wo2()};
+    const std::vector<int64_t> f1Dims = {fz1k, fz1n, 16, (int64_t)c0};
+    const std::vector<int64_t> f2Dims = {fz2k, fz2n, 16, (int64_t)c0};
+
+    if (c.elemBytes == 2) {
+        f16path::Result g = f16path::Build(c);
+        spec[SPEC_SAFE_F1] = g.safeF1;
+        spec[SPEC_SAFE_F2] = g.safeF2;
+        const int F1 = FIX_SHIFT_LEN_A16W16 - c.shift1;
+        const int F2 = FIX_SHIFT_LEN_A16W16 - c.shift2;
+        std::printf("  定点: S=%d/%d 即 F=%d/%d；部分和不溢出允许到 F<=%d/%d\n", c.shift1, c.shift2, F1, F2,
+                    g.safeF1, g.safeF2);
+        std::printf("  峰值 |最终值| %.3g / %.3g，|部分和| %.3g / %.3g\n", g.peak1, g.peak2, g.peakPartial1,
+                    g.peakPartial2);
+        if (F1 > g.safeF1 || F2 > g.safeF2) {
+            std::printf("  [!] 定标超出安全区间 —— 累加器会溢出，逐位比对不会成立。\n"
+                        "      把 --shift1/--shift2 调大（S 越大定标越小）。\n");
         }
+        std::printf("  golden: 非零 %ld / %ld，落格饱和 %ld 处\n", g.yNonZero, c.YElems(), g.sat);
+
+        // golden 自检：定点模型和纯 fp32 参考必须彼此接近。
+        //
+        // 这不是重复计算 —— 两条路是**独立**的：y_exact 完全不经过定点格，
+        // y_expect 经过 round(sum * 2^F) 再乘回去。F = 16 时定点格比 fp16 的 ULP
+        // 细几千倍，所以两者应当几乎处处相同，个别点差一个 fp16 ULP。
+        // 差得多说明定点模型本身写错了（比如把 F 和 S 搞反），而那种错误在板上
+        // 表现成「算子算错了」，会把人带到完全错误的方向去查。
+        {
+            long bad = 0;
+            double worst = 0.0;
+            for (size_t i = 0; i < g.yExpect.size(); ++i) {
+                const double a = (double)F16BitsToF32(g.yExpect[i]);
+                const double b = (double)F16BitsToF32(g.yExact[i]);
+                const double den = std::fabs(b) > 1e-6 ? std::fabs(b) : 1.0;
+                const double rel = std::fabs(a - b) / den;
+                if (rel > worst) worst = rel;
+                if (rel > 1e-2) ++bad;
+            }
+            // relu 的边界上会有个别点：定点那边正好舍到 0（relu 出 -0），fp32 那边
+            // 是个极小的正数，相对差 = 1。零星几个是正常的，所以判据是「超 1% 的点
+            // 不到总数的 0.1%」，不是「一个都没有」。
+            std::printf("  自检: 定点模型 vs fp32 参考，最大相对差 %.3g，超 1%% 的 %ld 处"
+                        "（relu 边界上零星几个是正常的）\n", worst, bad);
+            if (bad * 1000 > (long)g.yExpect.size()) {
+                std::printf("  [X] 两个 golden 分歧太大 —— 定点模型多半写错了（F 和 S 搞反？）。\n"
+                            "      板上比对之前先把这个查清楚，否则会把算子的问题和 golden 的问题混在一起。\n");
+                // 把半成品删掉：留一个 0 字节的 .bin 在那里，下一步会拿它去跑，
+                // 报出来的错和真正的原因就隔了一层。
+                std::fclose(f);
+                std::remove(out);
+                return 3;
+            }
+        }
+
+        w.Raw("FC2DCASE", 8);
+        w.U32(CASE_VERSION);
+        w.U32(8); // x, f1, b1, f2, b2, y_expect, y_exact + 占位（见下面的 ntensors）
+        w.U64((uint64_t)g.yNonZero);
+        w.U64((uint64_t)g.sat);
+        w.U64((uint64_t)c.YElems());
+        for (int i = 0; i < SPEC_N; ++i) {
+            w.I32(spec[i]);
+        }
+        w.U32(0);
+        w.U32(0); // fp16 通路不用 quant_scale
+
+        w.Tensor("x", ACL_DT_FLOAT16, xDims, g.xNchw.data(), g.xNchw.size() * 2);
+        w.Tensor("filter1", ACL_DT_FLOAT16, f1Dims, g.w1Dev.data(), g.w1Dev.size() * 2);
+        w.Tensor("bias1", ACL_DT_FLOAT16, {(int64_t)c.cout1}, g.b1.data(), g.b1.size() * 2);
+        w.Tensor("filter2", ACL_DT_FLOAT16, f2Dims, g.w2Dev.data(), g.w2Dev.size() * 2);
+        w.Tensor("bias2", ACL_DT_FLOAT16, {(int64_t)c.cout2}, g.b2.data(), g.b2.size() * 2);
+        w.Tensor("y_expect", ACL_DT_FLOAT16, yDims, g.yExpect.data(), g.yExpect.size() * 2);
+        w.Tensor("y_exact", ACL_DT_FLOAT16, yDims, g.yExact.data(), g.yExact.size() * 2);
+        // 第 8 个张量：把 conv1 的 fp16 权重按 NCHW 也存一份，出问题时能在主机上
+        // 重算任何中间量，不用回头再生成一次。
+        w.Tensor("w1_nchw", ACL_DT_FLOAT16, {(int64_t)c.cout1, (int64_t)c.ci, (int64_t)c.kh, (int64_t)c.kw},
+                 g.w1Nchw.data(), g.w1Nchw.size() * 2);
+    } else {
+        int8path::Result g = int8path::Build(c);
+        uint32_t qs1 = 0, qs2 = 0;
+        std::memcpy(&qs1, &g.scale1, 4);
+        std::memcpy(&qs2, &g.scale2, 4);
+        std::printf("  量化: scale1 = %.9g，scale2 = %.9g（低 13 位尾数已按硬件丢掉）\n", g.scale1,
+                    g.scale2);
+        std::printf("  golden: 非零 %ld / %ld，饱和到 ±127 的 %ld 处\n", g.yNonZero, c.YElems(), g.sat);
+        if (g.sat * 20 > c.YElems()) {
+            std::printf("  [!] 饱和比例超过 5%% —— scale 挑得偏大，比对的判别力会下降\n");
+        }
+
+        w.Raw("FC2DCASE", 8);
+        w.U32(CASE_VERSION);
+        w.U32(7); // x, f1, b1, f2, b2, y_expect, w1_nchw
+        w.U64((uint64_t)g.yNonZero);
+        w.U64((uint64_t)g.sat);
+        w.U64((uint64_t)c.YElems());
+        for (int i = 0; i < SPEC_N; ++i) {
+            w.I32(spec[i]);
+        }
+        w.U32(qs1);
+        w.U32(qs2);
+
+        w.Tensor("x", ACL_DT_INT8, xDims, g.xNchw.data(), g.xNchw.size());
+        w.Tensor("filter1", ACL_DT_INT8, f1Dims, g.w1Dev.data(), g.w1Dev.size());
+        w.Tensor("bias1", ACL_DT_INT32, {(int64_t)c.cout1}, g.b1.data(), g.b1.size() * 4);
+        w.Tensor("filter2", ACL_DT_INT8, f2Dims, g.w2Dev.data(), g.w2Dev.size());
+        w.Tensor("bias2", ACL_DT_INT32, {(int64_t)c.cout2}, g.b2.data(), g.b2.size() * 4);
+        w.Tensor("y_expect", ACL_DT_INT8, yDims, g.y.data(), g.y.size());
+        w.Tensor("w1_nchw", ACL_DT_INT8, {(int64_t)c.cout1, (int64_t)c.ci, (int64_t)c.kh, (int64_t)c.kw},
+                 g.w1Nchw.data(), g.w1Nchw.size());
     }
 
-    if (int8Mode) {
-        return WriteInt8Case(path, withBias, relu);
-    }
-
-    Inputs in = GenerateInputs();
-    ApplyProbe(in, probe);
-    if (probe != Probe::None) {
-        std::printf("探针模式 = %s（权重换成恒等；属性仍是 S=42，.om 不用重编）\n", probeName);
-    }
-    Golden g = BuildGolden(in);
-
-    // S 是下发的属性；真正决定定标的是 F = 58 - S，两个都打出来，免得又搞反。
-    std::printf("golden: conv1 峰值 %.4f -> 定标 2^%d (属性 S=%d)   "
-                "conv2 峰值 %.4f -> 定标 2^%d (属性 S=%d)   饱和 %ld\n",
-                g.peak1, g.deqExp1, g.shift1, g.peak2, g.deqExp2, g.shift2, g.sat);
-    std::printf("golden: y 非零 %ld / %zu\n", g.yNonZero, g.yFixed.size());
-    if (g.yNonZero == 0) { std::printf("[X] golden 全是 0\n"); return 1; }
-    if (g.sat != 0) { std::printf("[X] 定点累加溢出了 int32 %ld 次 —— 定标 F 挑大了（即 S 挑小了）\n", g.sat); return 1; }
-
-    std::FILE* f = std::fopen(path, "wb");
-    if (f == nullptr) { std::printf("[X] 打不开 %s\n", path); return 1; }
-
-    const uint32_t version = 2;
-    const uint32_t ntensors = 7;
-    const uint64_t hNonZero = (uint64_t)g.yNonZero;
-    // 这个字段原本恒为 0（int8 时代的 ties 计数），现在用来放探针 id：
-    // 0=none 1=passthrough 2=mid。文件自己说明自己是哪一份，免得搞混。
-    const uint64_t hTies = (uint64_t)probe;
-    const uint64_t hSat = (uint64_t)g.sat;
-    const uint64_t hYElems = (uint64_t)g.yFixed.size();
-    // 两个 shift 打包进 header —— run_fused_conv2d.py 从这里取，当算子属性传下去。
-    // 放在文件里而不是脚本里写死，是因为它由 golden 按数据算出来，两边必须是同一个。
-    const uint64_t attrs = (uint64_t)(uint8_t)g.shift1 | ((uint64_t)(uint8_t)g.shift2 << 8);
-
-    bool ok = std::fwrite("FC2DCASE", 1, 8, f) == 8;
-    ok = ok && std::fwrite(&version, 1, 4, f) == 4;
-    ok = ok && std::fwrite(&ntensors, 1, 4, f) == 4;
-    ok = ok && std::fwrite(&hNonZero, 1, 8, f) == 8;
-    ok = ok && std::fwrite(&hTies, 1, 8, f) == 8;
-    ok = ok && std::fwrite(&hSat, 1, 8, f) == 8;
-    ok = ok && std::fwrite(&hYElems, 1, 8, f) == 8;
-    ok = ok && std::fwrite(&attrs, 1, 8, f) == 8;
-
-    const int64_t fz1k = (CI / C0) * KH * KW, fz1n = (COUT1 + 15) / 16;
-    const int64_t fz2k = (COUT1 / C0) * KH * KW, fz2n = (COUT2 + 15) / 16;
-
-    ok = ok && WriteTensor(f, "x", ACL_DT_FLOAT16, {1, CI, HI, WI}, in.xNchw.data(), in.xNchw.size() * 2);
-    ok = ok && WriteTensor(f, "filter1", ACL_DT_FLOAT16, {fz1k, fz1n, 16, C0}, in.w1Dev.data(), in.w1Dev.size() * 2);
-    ok = ok && WriteTensor(f, "bias1", ACL_DT_FLOAT16, {COUT1}, in.b1.data(), in.b1.size() * 2);
-    ok = ok && WriteTensor(f, "filter2", ACL_DT_FLOAT16, {fz2k, fz2n, 16, C0}, in.w2Dev.data(), in.w2Dev.size() * 2);
-    ok = ok && WriteTensor(f, "bias2", ACL_DT_FLOAT16, {COUT2}, in.b2.data(), in.b2.size() * 2);
-    ok = ok && WriteTensor(f, "y_expect", ACL_DT_FLOAT16, {1, COUT2, HO2, WO2}, g.yFixed.data(), g.yFixed.size() * 2);
-    ok = ok && WriteTensor(f, "y_exact", ACL_DT_FLOAT16, {1, COUT2, HO2, WO2}, g.yExact.data(), g.yExact.size() * 2);
-
+    const long sz = std::ftell(f);
     std::fclose(f);
-    if (!ok) { std::printf("[X] 写 %s 失败\n", path); return 1; }
-    std::printf("\n[OK] 写出 %s\n     5 个输入 + 2 个 golden，共 %u 个张量\n", path, ntensors);
-    std::printf("     算子属性 fixed_shift1 = %d, fixed_shift2 = %d（已打包进 header）\n", g.shift1, g.shift2);
-    std::printf("     对应的累加器定标 2^%d / 2^%d，LSB = %.3g / %.3g\n",
-                g.deqExp1, g.deqExp2, std::ldexp(1.0, -g.deqExp1), std::ldexp(1.0, -g.deqExp2));
+    std::printf("  写出 %s，%ld 字节\n", out, sz);
     return 0;
 }

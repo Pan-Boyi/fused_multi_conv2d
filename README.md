@@ -1,80 +1,121 @@
-# fused_multi_conv2d —— MC62/5102 上融合卷积的上板验证脚本
+# fused_multi_conv2d —— FusedConv2d @ 5102 的上板验证
 
-配套算子:`ops-nn` 的 `conv/fused_conv2d`(分支 `feat/fused-conv2d`)。
-
-```
-x fp16 NCHW ──conv1 3x3 s1 p1 +bias1(fp16) +relu──► mid fp16
-            ──conv2 3x3 s2 p1 +bias2(fp16) +relu──► y fp16 NCHW
-```
-
-全程定点(f162s32),没有量化、没有向量。权重 FRACTAL_Z fp16(C0 = 16)。
-接口是 **5 输入 + 2 属性**:`x, filter1, bias1, filter2, bias2 → y`,
-外加 `fixed_shift1` / `fixed_shift2`。
-
-## 最短路径
+**改一个 json（`cases.json`）就能换形状**，别的地方不用动。
 
 ```bash
-# 1. 造 case（任何能编译的机器，不需要 CANN、不需要设备）
-./build_case.sh                          # 产物 fused_conv2d_case.bin，5,309,240 B
+# 0) 一次性：编两个小工具（只要 g++，不需要 CANN，不需要设备）
+g++ -std=c++17 -O2 -ffp-contract=off gen_case.cpp  -o gen_case  -I.
+g++ -std=c++17 -O2                   fc2d_geom.cpp -o fc2d_geom -I.
 
-# 2. 出 om（装了带 FusedConv2d 算子包的机器）
-SOC=<soc_version> ./build_om.sh
+# 1) 看看清单里有哪些形状、算子能不能服务（不动任何文件）
+python3 fc2d.py cases.json --list
+python3 fc2d.py cases.json --steps check
 
-# 3. 跑（有 5102 的机器，不需要编译器）
-python3 run_fused_conv2d.py fused_conv2d_case.bin FusedConv2d 0
+# 2) 在有 CANN 的机器上：生成 case 数据 + 编离线模型
+source <CANN>/set_env.sh
+python3 fc2d.py cases.json --steps check,case,om --soc <soc_version>
+
+# 3) 把整个目录拷到有 5102 的机器上，跑
+python3 fc2d.py cases.json --steps run
 ```
 
-定点定标由 golden 按数据算出、打包进 `.bin` 的 header,脚本取出来当算子属性下发 ——
-不用手填,主机和设备也不可能用成不同的值。
+产物都在 `out/<name>/`：`case.bin`（输入 + golden）、`singleop.json`、`om/*.om`。
 
-**详细步骤、判据、排障见 [`5102单算子验证步骤.md`](5102单算子验证步骤.md)。**
+## 为什么是一个 json 而不是三处
+
+一个形状要三样东西严丝合缝：
+
+| | 谁产生 |
+| :-- | :-- |
+| `case.bin` 里的输入和 golden | `gen_case` |
+| `.om`（ACL 按 **op 类型 + 每个张量的 shape/dtype/format + 全部属性的值** 匹配） | `atc --singleop` |
+| 执行时下发的属性 | `run_fused_conv2d.py` |
+
+三者只要有一处不一致，板上报的是 `100024` / `MatchOpModel fail`，翻译过来是
+**「算子没找到」** —— 那条信息完全不指向真正的原因。这条链上折过好几次：
+改了 golden 忘了改 json、int8 分支之后又多设了一个属性、om 目录里留着上一个形状的
+`.om`……
+
+所以现在三者**都从同一处派生**：
+
+```
+cases.json 里的一条
+   -> gen_case 的命令行
+   -> case.bin 头部的 spec（32 个 int，形状 + 属性的唯一真相）
+   -> singleop.json（fc2d.py 从 spec 读，不从 json 读）
+   -> 执行时下发的属性（run_fused_conv2d.py 从 spec 读）
+```
+
+中间没有第二份形状。另外属性是**九个一个不少地全设**，两边都一样 —— 不再有
+「这条通路设这几个、那条通路设那几个」的子集，那正是最容易出错的地方。
+
+## cases.json 怎么写
+
+```json
+{
+  "device": 0,
+  "cases": [
+    {"name": "base", "dtype": "both", "ci": 32, "hi": 288, "wi": 112, "cout1": 64, "cout2": 96},
+    {"name": "k5x5", "dtype": "int8", "ci": 32, "hi": 64, "wi": 64, "cout1": 32, "cout2": 32,
+     "kernel": [5, 5], "pads": [2, 2], "bias": true}
+  ]
+}
+```
+
+| 字段 | 缺省 | 说明 |
+| :-- | :-- | :-- |
+| `name` | `caseNN` | 产物落在 `out/<name>/` |
+| `dtype` | `fp16` | `fp16` / `int8` / `both`（`both` 展开成 `<name>_fp16` 和 `<name>_int8`）|
+| `n` `ci` `hi` `wi` | 1 / 32 / 288 / 112 | 输入形状 NCHW |
+| `cout1` `cout2` | 64 / 96 | 两层的输出通道 |
+| `kernel` | `[3, 3]` | `[kh, kw]`，两层共用 |
+| `strides` | `[1, 2]` | `[stride1, stride2]`，两层各一个 |
+| `pads` | `[1, 1]` | `[p1, p2]`（H/W 同值）或 `[padH1, padW1, padH2, padW2]`。非方核必须用长度 4 的那种 |
+| `bias` | `false` | 带不带 bias（两层一起）|
+| `relu` | `[true, true]` | `[relu1, relu2]` |
+| `fixed_shift` | `[42, 42]` | 只有 fp16 通路用，见下 |
+
+写错字段名会直接报错并列出认识的字段 —— 不会静默用缺省值跑一个你没打算跑的形状。
+
+## 两条通路的判据不一样
+
+**fp16 定点**：两个 golden。
+- `y_expect` 定点模型，假设成立时应当**逐位相等**
+- `y_exact` 纯 fp32 参考，判「这个算子有没有在算这个卷积」，不受定点假设影响
+
+板上先看 `y_exact` 的相对误差过不过，再看 `y_expect` 能不能逐位对上。
+只有前者过、后者不过，说明卷积算对了但定点模型猜错了 —— 是两件不同的事。
+
+`fixed_shift` 的语义是 **累加器 = 真值 × 2^(58 − S)**，所以 **S 越大定标越小**，
+和直觉相反。42（F = 16）是厂商工作点。`gen_case` 会打出「部分和不溢出允许到 F ≤ ?」，
+超了会警告 —— 超了的话逐位比对不可能成立，因为累加器真的溢出了。
+
+**int8 量化**：一个 golden，精确整数运算 + REQ8（round-half-to-even + 饱和 + relu），
+应当逐位相等。scale 由 golden 按 `127 / 峰值` 自动挑并按硬件丢掉低 13 位尾数。
+
+**int8 出问题时先看饱和那一行**：设备侧大面积饱和而 golden 没有，是 `quant_scale`
+没传到，不是算子算错了。
+
+## 单独跑一条
+
+```bash
+python3 fc2d.py cases.json --only base_fp16 --steps run
+# 或者直接调 runner（参数顺序随意：.bin 结尾的是 case，目录是 om，数字是 device）
+python3 run_fused_conv2d.py out/base_fp16/case.bin FusedConv2d 0 out/base_fp16/om
+```
+
+`run_fused_conv2d.py` 的环境变量：`REL_TOL`（默认 1e-3）、`RATIO_MIN`（默认 1.0）、
+`REPEAT` / `WARMUP`（计时）。加 `--run-arg --dry-run` 可以不碰硬件把主流程走一遍，
+用来在没有设备的机器上验脚本本身。
 
 ## 文件
 
-| | 跑在哪 | 干什么 |
-| :--- | :--- | :--- |
-| `fused_conv2d_golden.h` | 任意 | CPU 参考。同时给**定点模型**和**纯 fp32 参考**两个 golden |
-| `golden_selfcheck.cpp` | 任意 | fp16 位型穷举往返 + FRACTAL_Z 往返 + 算出该传的定标值 |
-| `gen_case.cpp` | 任意 | 打包成 `fused_conv2d_case.bin` |
-| `build_case.sh` | 任意 | 串起上面三个 |
-| `build_om.sh` / `fused_conv2d_singleop.json` | 有算子包的机器 | 编单算子离线模型 |
-| `run_fused_conv2d.py` | 有 5102 的机器 | 主执行器,ctypes 调 `aclopExecuteV2`,不需要编译器 |
-| `test_aclop_fused_conv2d.cpp` | 有 CANN 的机器 | 同一件事的 C++ 版本 |
-| `build_and_run_aclop.sh` / `build_cross.sh` | | 编上面那个(本地 / 交叉) |
-| `run_om.py` / `run_op.py` | 有 5102 的机器 | **通用**执行器,不绑这个算子 |
-| `singleop2case.py` | 任意 | 从 om 的 json 生成 case 描述,避免手抄 |
-| `run_prof.sh` / `parse_prof.py` | 有 5102 的机器 | msprof 采集与解析 |
-| `onnx_block/` | | 另一件事:把昇腾量化 ONNX 图编成 om,见该目录的 README |
-
-## 两个 golden 怎么用
-
-| 张量 | 是什么 | 怎么判 |
-| :--- | :--- | :--- |
-| `y_expect` | 定点模型 | 应**逐位相等** |
-| `y_exact` | 纯 fp32 参考 | 用相对误差判 |
-
-`fixed_shift` 的语义**已经从 CANN 源码确证**,不再是假设。记属性为 `S`:
-
-```
-acc_int32 = round( 真值 * 2^(58 - S) )
-out_fp16  = fp16( acc_int32 * 2^-(58 - S) )
-```
-
-依据是 DEQF16 模式下 fixpipe 根本不看 `deqScalar`,只按 shift 现搭一个 float
-(`dav_m510/kernel_operator_fixpipe_impl.h:77` `SetDeqScalarDepOnMode`):
-
-```c
-uint64_t newExponent = (127 - shiftVal) & 0xFF;
-uint64_t newScalar   = (floatOne & ~mask) | (newExponent << shift);
-```
-
-指数为 `127-F` 的 float 就是 `2^-F`,而 `F` 正是传给 fixpipe 的 `58 - S`。
-
-> **S 越大,累加器的定标越小 —— 和「shift 越大精度越高」的直觉正好相反。**
-> 这个方向写反了不报任何错。本算子踩过一次:S 按 26/22 下发,硬件实际按
-> `2^32`/`2^36` 定标,几乎每个非零点都撑爆 int32,输出的符号退化成掷硬币。
-> 板上的表征很干脆 —— 非零元素一个都没对上,对上的全部是两边都为零的点。
-
-所以判据是:**先看 `mismatches`(对 `y_expect`,应逐位相等)**。不等时脚本会报一行
-以累加器 LSB 计的偏差 —— 个位数 LSB 说明只是 round 的级别猜得不同,卷积是对的;
-成千上万个 LSB 才是真错了。`y_exact` 那一路不设门槛,只回答「有没有在算这个卷积」。
+| 文件 | 说明 |
+| :-- | :-- |
+| `cases.json` | **你要改的就是这个** |
+| `fc2d.py` | 总驱动：check → case → om → run |
+| `gen_case.cpp` | 按命令行给的形状生成 `case.bin`（输入 + golden） |
+| `fused_conv2d_golden.h` | 两条通路的 CPU golden，按形状参数化 |
+| `fc2d_geom.cpp` | 形状预检。用的是算子共用几何头的**副本**，**顾问性质** |
+| `fused_conv2d_shape.h` | 上面那份副本。**算子那边改了就要重拷** |
+| `run_fused_conv2d.py` | ctypes 直调 `aclopExecuteV2`，目标机不需要编译器 |

@@ -1,183 +1,203 @@
 /*
- * fused_conv2d 的 CPU 参考实现 —— 全 fp16 定点版。
- *
- *   x fp16 NCHW ─conv1 3x3 s1 p1 +bias1(fp16) +relu─► mid fp16
- *               ─conv2 3x3 s2 p1 +bias2(fp16) +relu─► y fp16 NCHW
- *
- * 全程定点（f162s32），没有量化、没有向量。权重 FRACTAL_Z fp16（C0 = 16）。
+ * fused_conv2d 的上板 golden —— **按形状参数化**，两条通路各一套。
  *
  * ===========================================================================
- * 定标语义 —— 已从 CANN 源码确证，不再是假设。
+ * 这个文件和 ops-nn 仓里那份同名文件的分工
  * ===========================================================================
+ * ops-nn 的 tests/ut/op_kernel/fused_conv2d_golden.h 是 CPU 仿真用的：int8 那条
+ * 链能在仿真里整条跑完并逐位比对，fp16 那条在仿真里根本没有 mmad 模型。
  *
- *   * cube 走 f162s32：half x half -> int32，带 fixShiftVal 操作数
- *     (dav_m510/kernel_operator_mm_impl.h:355)
- *   * fixedShiftValue 是算子属性，范围 [0, 58]
- *     (conv2d_v2_base_tiling_check_attrs.cpp:449 CheckFixedShiftValueLegal)
- *   * 三个消费者的方向：mmad 用原值 S，L1->BT 和 fixpipe 用 58 - S
- *     (conv2d_small_kernel.h:354 / :937 / :1111)
- *   * **出口的反缩放系数就是 2^-(58-S)**。DEQF16 模式下 fixpipe 根本不看
- *     deqScalar，只按 shift 现搭一个 float 出来：
- *       (dav_m510/kernel_operator_fixpipe_impl.h:77 SetDeqScalarDepOnMode)
- *         uint64_t newExponent = (127 - shiftVal) & 0xFF;
- *         uint64_t newScalar   = (floatOne & ~mask) | (newExponent << shift);
- *     指数为 127-F 的 float 就是 2^-F，而 F 正是传给 fixpipe 的那个数 58 - S。
+ * 这一份是**上板**用的，所以两条通路都要有数值 golden：
  *
- * 所以定点模型是（记 F = 58 - S）：
- *       acc_int32 = round( sum(a*b) * 2^F ) + round( bias * 2^F )
- *       out_fp16  = fp16( acc_int32 * 2^-F )
+ *   fp16 定点   y_expect  定点模型：acc_i32 = round(sum(a*b) * 2^F)，F = 58 - S
+ *               y_exact   纯 fp32 参考，只在每层末尾窄化到 fp16
+ *   int8 量化   y         精确整数卷积 + REQ8（round-half-even + 饱和 + relu）
  *
- * **S 越大，累加器的定标越小。** 上一版把这个方向写反了（拿 S 直接当 2 的指
- * 数），于是 S=26 在板上实际跑成 2^32：几乎每个非零点都溢出 int32 并回绕，符
- * 号退化成掷硬币。板上的表征很干脆 —— 非零元素一个都没对上，对上的 216604 个
- * **全部**是两边都为零的点。那不是缩放错了，是回绕了。
+ * fp16 给两个 golden 是因为定点模型带假设（累加器的定标语义），而 y_exact 不带。
+ * 板上先看 y_exact 的相对误差过不过 —— 那判的是「这个算子有没有在算这个卷积」；
+ * 再看 y_expect 能不能逐位对上 —— 那判的是「定点模型对不对」。只有前者过、后者
+ * 不过，说明卷积算对了但定点模型猜错了，是两件不同的事。
  *
- * 还没实测的只剩一件事：那次 round 发生在哪一级 —— 每个乘积各 round 一次、每
- * 条 mmad 指令一次、还是整条 K 累完再 round。下面按「累完再 round」建模（误差
- * 最小的那种）。三者的差别至多是累加器的几十个 LSB，对靠近峰值的输出远在 fp16
- * 的 1 个 ULP 之下，只有接近零的输出才可能差最后几位。所以比对脚本会额外报一
- * 行「以累加器 LSB 计的偏差」：偏差全在个位数 LSB 以内，就说明只是 round 的级
- * 别猜得不同，卷积本身是对的。
- *
- * 两个 golden 都仍然给：
- *   GoldenExact()  纯 fp32 参考 —— 「这个算子到底有没有在算这个卷积」，用相对
- *                  误差判，完全不依赖定点模型；
- *   GoldenFixed(S) 定点模型 —— 上面那条链成立时应当逐位相等。
+ * int8 只有一个 golden：那条链上的运算全是精确整数，没有需要第二个参照的假设。
  */
 #ifndef FUSED_CONV2D_GOLDEN_H
 #define FUSED_CONV2D_GOLDEN_H
 
-#include <cstdint>
-#include <cstring>
 #include <cmath>
-#include <vector>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
 
 namespace fc2d_golden {
 
-// ---------------------------------------------------------------------------
-// 形状（和 op_kernel/arch35/fused_conv2d_geometry.h 必须一致）
-// ---------------------------------------------------------------------------
-constexpr int CI = 32, HI = 288, WI = 112;
-constexpr int COUT1 = 64, HO1 = 288, WO1 = 112, STRIDE1 = 1;
-constexpr int COUT2 = 96, HO2 = 144, WO2 = 56, STRIDE2 = 2;
-constexpr int KH = 3, KW = 3, PAD = 1;
-constexpr int C0 = 16;                 // fp16 -> 32B / 2
 constexpr int FIX_SHIFT_LEN_A16W16 = 58;
 
-// 元素数。放在这里而不是让每个消费者自己乘，是因为它们要和 kernel 的几何一致，
-// 只该有一个出处。
-constexpr int X_ELEMS = CI * HI * WI;          // 1,032,192
-constexpr int Y_ELEMS = COUT2 * HO2 * WO2;     //   774,144
-constexpr int MID_ELEMS = COUT1 * HO1 * WO1;   // 2,064,384
+// 厂商的默认工作点。CANN 自己的 matmul 在 5102 上就用这个值：
+//   matmul/common/cmct/block/block_mmad_pingpong_without_que.h:144
+//       #if __NPU_ARCH__ == 5102
+//           uint8_t shiftValue_{42};
+//   58 - 42 = 16
+// 权重 int8 的那条路（weight_quant_batch_matmul_v2_tiling.cpp:33）默认 13，
+// FIX_SHIFT_LEN_A16W8 = 29，29 - 13 也是 16。旧版 API 里 DEQF16 的系数干脆写死成
+// 0x37800000 = 2^-16，注释就是 "fix point 1/2^16"。三条独立证据都落在 F = 16。
+constexpr int DEFAULT_ATTR_SHIFT = 42;
 
 // ---------------------------------------------------------------------------
-// fp16 <-> fp32。自己写而不是用 _Float16，是为了在任何编译器上位型都一样 ——
-// 板上和主机上比对的是**位**，不是近似值。
-//
-// 上一版这里的 F16ToFloat 有个次正规数的指数 bug（2046/65536 个值不对），是靠
-// 对 _Float16 做穷举自检抓出来的。下面这两个函数同样有穷举自检，见 main()。
+// 一个测试形状。和算子的 Params 一一对应。
+// ---------------------------------------------------------------------------
+struct Case {
+    int n = 1, ci = 32, hi = 288, wi = 112;
+    int cout1 = 64, cout2 = 96;
+    int kh = 3, kw = 3;
+    int stride1 = 1, stride2 = 2;
+    int padH1 = 1, padW1 = 1, padH2 = 1, padW2 = 1;
+    bool bias = false;
+    bool relu1 = true, relu2 = true;
+    int elemBytes = 2; // 2 = fp16 定点，1 = int8 量化
+    int shift1 = DEFAULT_ATTR_SHIFT, shift2 = DEFAULT_ATTR_SHIFT;
+
+    int C0() const { return 32 / elemBytes; }
+    int Ho1() const { return (hi + 2 * padH1 - kh) / stride1 + 1; }
+    int Wo1() const { return (wi + 2 * padW1 - kw) / stride1 + 1; }
+    int Ho2() const { return (Ho1() + 2 * padH2 - kh) / stride2 + 1; }
+    int Wo2() const { return (Wo1() + 2 * padW2 - kw) / stride2 + 1; }
+    long XElems() const { return (long)n * ci * hi * wi; }
+    long YElems() const { return (long)n * cout2 * Ho2() * Wo2(); }
+    long W1Elems() const { return (long)cout1 * ci * kh * kw; }
+    long W2Elems() const { return (long)cout2 * cout1 * kh * kw; }
+    std::string Text() const
+    {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "n%d %d->%d->%d %dx%d k%dx%d s%d/%d p%d,%d/%d,%d %s%s%s -> %dx%d %s", n,
+                 ci, cout1, cout2, hi, wi, kh, kw, stride1, stride2, padH1, padW1, padH2, padW2,
+                 bias ? "bias " : "", relu1 ? "relu1 " : "", relu2 ? "relu2" : "", Ho2(), Wo2(),
+                 elemBytes == 2 ? "fp16" : "int8");
+        return std::string(buf);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// fp16 的位型转换。不用编译器的 _Float16：同一份 golden 要在开发机和板子上给出
+// **逐位相同**的结果，自己实现才能保证舍入模式一致。
 // ---------------------------------------------------------------------------
 inline uint16_t F32ToF16Bits(float v)
 {
-    uint32_t u;
-    std::memcpy(&u, &v, 4);
-    const uint32_t sign = (u >> 16) & 0x8000u;
-    int32_t exp = (int32_t)((u >> 23) & 0xFF) - 127 + 15;
-    uint32_t man = u & 0x7FFFFFu;
-    if (((u >> 23) & 0xFF) == 0xFF) {                       // Inf / NaN
-        return (uint16_t)(sign | 0x7C00u | (man ? 0x200u : 0u));
+    uint32_t b;
+    std::memcpy(&b, &v, 4);
+    const uint32_t sign = (b >> 16) & 0x8000u;
+    int32_t exp = (int32_t)((b >> 23) & 0xFF);
+    uint32_t man = b & 0x7FFFFFu;
+    if (exp == 0xFF) {
+        return (uint16_t)(sign | 0x7C00u | (man ? 0x200u : 0u)); // inf / nan
     }
-    if (exp >= 0x1F) {                                       // 上溢 -> Inf
-        return (uint16_t)(sign | 0x7C00u);
+    exp = exp - 127 + 15;
+    if (exp >= 31) {
+        return (uint16_t)(sign | 0x7C00u); // 溢出到 inf
     }
-    if (exp <= 0) {                                          // 次正规 / 下溢
+    if (exp <= 0) {
+        // 次正规：把隐含的 1 补回去再右移
         if (exp < -10) {
             return (uint16_t)sign;
         }
         man |= 0x800000u;
-        const int shift = 14 - exp;
-        uint32_t q = man >> shift;
-        const uint32_t rem = man & ((1u << shift) - 1);
+        const int shift = 14 - exp; // exp<=0 时 shift >= 14
+        const uint32_t keep = man >> shift;
+        const uint32_t rest = man & ((1u << shift) - 1u);
         const uint32_t half = 1u << (shift - 1);
-        if (rem > half || (rem == half && (q & 1))) {        // 向最近偶数
-            ++q;
+        uint32_t out = keep;
+        if (rest > half || (rest == half && (keep & 1u))) {
+            ++out;
         }
-        return (uint16_t)(sign | q);
+        return (uint16_t)(sign | out);
     }
-    uint32_t q = man >> 13;
-    const uint32_t rem = man & 0x1FFFu;
-    if (rem > 0x1000u || (rem == 0x1000u && (q & 1))) {
-        ++q;
-        if (q == 0x400u) { q = 0; ++exp; if (exp >= 0x1F) return (uint16_t)(sign | 0x7C00u); }
+    // round-half-to-even
+    const uint32_t keep = man >> 13;
+    const uint32_t rest = man & 0x1FFFu;
+    uint32_t out = keep;
+    if (rest > 0x1000u || (rest == 0x1000u && (keep & 1u))) {
+        ++out;
+        if (out == 0x400u) {
+            out = 0;
+            ++exp;
+            if (exp >= 31) {
+                return (uint16_t)(sign | 0x7C00u);
+            }
+        }
     }
-    return (uint16_t)(sign | ((uint32_t)exp << 10) | q);
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | out);
 }
 
 inline float F16BitsToF32(uint16_t h)
 {
     const uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
-    const uint32_t exp = (h >> 10) & 0x1Fu;
-    const uint32_t man = h & 0x3FFu;
-    uint32_t u;
+    uint32_t exp = (h >> 10) & 0x1Fu;
+    uint32_t man = h & 0x3FFu;
+    uint32_t b;
     if (exp == 0) {
-        if (man == 0) { u = sign; }
-        else {
-            // 次正规：值 = man * 2^-24。直接用这个式子，不要去凑指数域 —— 上一
-            // 版就是在这里错的。
-            float f = (float)man * 1.0f / 16777216.0f;
-            uint32_t fu; std::memcpy(&fu, &f, 4);
-            u = sign | fu;
+        if (man == 0) {
+            b = sign;
+        } else {
+            // 次正规：规格化
+            int e = -1;
+            do {
+                ++e;
+                man <<= 1;
+            } while ((man & 0x400u) == 0);
+            man &= 0x3FFu;
+            b = sign | ((uint32_t)(127 - 15 - e) << 23) | (man << 13);
         }
-    } else if (exp == 0x1F) {
-        u = sign | 0x7F800000u | (man << 13);
+    } else if (exp == 31) {
+        b = sign | 0x7F800000u | (man << 13);
     } else {
-        u = sign | ((exp - 15 + 127) << 23) | (man << 13);
+        b = sign | ((exp - 15 + 127) << 23) | (man << 13);
     }
-    float out; std::memcpy(&out, &u, 4);
-    return out;
+    float f;
+    std::memcpy(&f, &b, 4);
+    return f;
 }
 
 inline float F16(float v) { return F16BitsToF32(F32ToF16Bits(v)); }
 
 // ---------------------------------------------------------------------------
-// 确定性伪随机（和上一版同一套，换 shape 不换数）
+// 确定性随机。不用 <random>：同一个 seed 在不同 libstdc++ 上可能给不同的序列，
+// 而这份 golden 要在开发机和板子上给出**同一批数据**。
 // ---------------------------------------------------------------------------
 inline uint64_t Mix64(uint64_t i, uint64_t salt)
 {
-    uint64_t z = i * 0x9E3779B97F4A7C15ull + salt;
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    uint64_t z = i + salt + 0x9E3779B97F4A7C15ULL;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
     return z ^ (z >> 31);
 }
-// 返回 [-1, 1] 里一个 fp16 可精确表示的值
+
+// [-1, 1) 上的 1/256 网格：fp16 能精确表示，定点累加也不容易溢出。
 inline uint16_t RandF16Unit(uint64_t i, uint64_t salt)
 {
-    const int q = (int)(Mix64(i, salt) % 2001) - 1000;   // -1000..1000
-    return F32ToF16Bits((float)q / 1000.0f);
+    const int q = (int)(Mix64(i, salt) % 512u) - 256;
+    return F32ToF16Bits((float)q / 256.0f);
 }
 
 // ---------------------------------------------------------------------------
-// FRACTAL_Z（fp16，C0 = 16）
-//
-// 排布 [Cin1*KH*KW][ceil(Cout/16)][16][C0]，展平后就是 L0B 要的 NZ 块，所以
-// kernel 的 GM->L1 是一次连续拷贝，没有格式转换。
-//   下标 = ((cin/C0)*KH*KW + kh*KW + kw) * ceil(Cout/16)*16*C0
-//          + (cout/16)*16*C0 + (cout%16)*C0 + (cin%C0)
+// FRACTAL_Z 打包。[Cin/C0 * kh * kw][ceil(Cout/16)][16][C0]，摊平之后就是 kernel
+// 要的 L0B NZ 块 —— GM->L1 是一条连续拷贝，中间没有任何格式转换。
+// C0 由元素宽度定（fp16 16 / int8 32），所以以 C0 为参数。
 // ---------------------------------------------------------------------------
-inline void WeightToFractalZ(const uint16_t* nchw, int cin, int cout, std::vector<uint16_t>& dev)
+template <typename T>
+inline void WeightToFractalZ(const T* nchw, int cin, int cout, int kh, int kw, int c0, std::vector<T>& dev)
 {
-    const int cin1 = cin / C0;
-    const int cout1 = (cout + 15) / 16;
-    dev.assign((size_t)cin1 * KH * KW * cout1 * 16 * C0, 0);
+    const int cin1 = cin / c0;
+    const int coutBlk = (cout + 15) / 16;
+    dev.assign((size_t)cin1 * kh * kw * coutBlk * 16 * c0, (T)0);
     for (int co = 0; co < cout; ++co) {
         for (int ci = 0; ci < cin; ++ci) {
-            for (int kh = 0; kh < KH; ++kh) {
-                for (int kw = 0; kw < KW; ++kw) {
-                    const size_t src = (((size_t)co * cin + ci) * KH + kh) * KW + kw;
-                    const size_t kf = ((size_t)(ci / C0) * KH + kh) * KW + kw;
-                    const size_t dst = kf * cout1 * 16 * C0 + (size_t)(co / 16) * 16 * C0 + (size_t)(co % 16) * C0 +
-                                       (size_t)(ci % C0);
+            for (int i = 0; i < kh; ++i) {
+                for (int j = 0; j < kw; ++j) {
+                    const size_t src = (((size_t)co * cin + ci) * kh + i) * kw + j;
+                    const size_t kf = ((size_t)(ci / c0) * kh + i) * kw + j;
+                    const size_t dst = kf * (size_t)coutBlk * 16 * c0 + (size_t)(co / 16) * 16 * c0 +
+                                       (size_t)(co % 16) * c0 + (size_t)(ci % c0);
                     dev[dst] = nchw[src];
                 }
             }
@@ -185,89 +205,65 @@ inline void WeightToFractalZ(const uint16_t* nchw, int cin, int cout, std::vecto
     }
 }
 
-inline void WeightFromFractalZ(const uint16_t* dev, int cin, int cout, std::vector<uint16_t>& nchw)
-{
-    const int cout1 = (cout + 15) / 16;
-    nchw.assign((size_t)cout * cin * KH * KW, 0);
-    for (int co = 0; co < cout; ++co) {
-        for (int ci = 0; ci < cin; ++ci) {
-            for (int kh = 0; kh < KH; ++kh) {
-                for (int kw = 0; kw < KW; ++kw) {
-                    const size_t kf = ((size_t)(ci / C0) * KH + kh) * KW + kw;
-                    const size_t src = kf * cout1 * 16 * C0 + (size_t)(co / 16) * 16 * C0 + (size_t)(co % 16) * C0 +
-                                       (size_t)(ci % C0);
-                    nchw[(((size_t)co * cin + ci) * KH + kh) * KW + kw] = dev[src];
-                }
-            }
-        }
-    }
-}
+// ===========================================================================
+// fp16 定点通路
+// ===========================================================================
+namespace f16path {
 
-
-// ---------------------------------------------------------------------------
-// 卷积。两条路：
-//   ConvFwdExact  纯 fp32 累加 —— 「这个算子有没有在算这个卷积」的判据，不受
-//                 定点模型的假设影响。
-//   ConvFwdFixed  定点模型 —— acc_int32 = round(sum(a*b) * 2^F)，F = 58 - S。
-//
-// 两条都在 fp32 里做乘加（fp16 输入本来就能精确转 fp32），差别只在结果怎么落格。
-// 输入输出都是 NCHW 的 fp16 位型。
-// ---------------------------------------------------------------------------
-struct ConvSpec {
-    int cin, hi, wi, cout, ho, wo, stride;
-};
-
-// 返回每个输出点的精确 sum(a*b)（不含 bias），供上层落格用。
+// 一层卷积的精确 sum(a*b)（不含 bias），在 double 里累加。
 // absAcc 非空时同时返回 sum|a*b| —— 累加器里跑的是**部分和**，最终值不溢出不代表
-// 中途不溢出。sum|a*b| 是任何 mmad 次序下部分和的保守上界，定标就按它挑。
-inline void ConvFwdRaw(const uint16_t* in, const uint16_t* wt, const ConvSpec& sp, std::vector<double>& acc,
-                       std::vector<double>* absAcc = nullptr)
+// 中途不溢出。sum|a*b| 是任何 mmad 次序下部分和的保守上界，定标校验按它做。
+inline void ConvRaw(const uint16_t* in, const uint16_t* wt, int cin, int hi, int wi, int cout, int ho, int wo,
+                    int kh, int kw, int stride, int padH, int padW, std::vector<double>& acc,
+                    std::vector<double>* absAcc)
 {
-    acc.assign((size_t)sp.cout * sp.ho * sp.wo, 0.0);
-    if (absAcc != nullptr) absAcc->assign((size_t)sp.cout * sp.ho * sp.wo, 0.0);
-    for (int co = 0; co < sp.cout; ++co) {
-        for (int oh = 0; oh < sp.ho; ++oh) {
-            for (int ow = 0; ow < sp.wo; ++ow) {
-                double sum = 0.0;
-                double asum = 0.0;
-                for (int ci = 0; ci < sp.cin; ++ci) {
-                    for (int kh = 0; kh < KH; ++kh) {
-                        const int ih = oh * sp.stride + kh - PAD;
-                        if (ih < 0 || ih >= sp.hi) continue;
-                        for (int kw = 0; kw < KW; ++kw) {
-                            const int iw = ow * sp.stride + kw - PAD;
-                            if (iw < 0 || iw >= sp.wi) continue;
-                            const float a = F16BitsToF32(in[((size_t)ci * sp.hi + ih) * sp.wi + iw]);
-                            const float b = F16BitsToF32(wt[(((size_t)co * sp.cin + ci) * KH + kh) * KW + kw]);
-                            sum += (double)a * (double)b;
-                            asum += std::fabs((double)a * (double)b);
+    acc.assign((size_t)cout * ho * wo, 0.0);
+    if (absAcc != nullptr) {
+        absAcc->assign((size_t)cout * ho * wo, 0.0);
+    }
+    for (int co = 0; co < cout; ++co) {
+        for (int oh = 0; oh < ho; ++oh) {
+            for (int ow = 0; ow < wo; ++ow) {
+                double sum = 0.0, asum = 0.0;
+                for (int ci = 0; ci < cin; ++ci) {
+                    for (int i = 0; i < kh; ++i) {
+                        const int ih = oh * stride + i - padH;
+                        if (ih < 0 || ih >= hi) {
+                            continue;
+                        }
+                        for (int j = 0; j < kw; ++j) {
+                            const int iw = ow * stride + j - padW;
+                            if (iw < 0 || iw >= wi) {
+                                continue;
+                            }
+                            const double a = (double)F16BitsToF32(in[((size_t)ci * hi + ih) * wi + iw]);
+                            const double b =
+                                (double)F16BitsToF32(wt[(((size_t)co * cin + ci) * kh + i) * kw + j]);
+                            sum += a * b;
+                            asum += std::fabs(a * b);
                         }
                     }
                 }
-                acc[((size_t)co * sp.ho + oh) * sp.wo + ow] = sum;
-                if (absAcc != nullptr) (*absAcc)[((size_t)co * sp.ho + oh) * sp.wo + ow] = asum;
+                acc[((size_t)co * ho + oh) * wo + ow] = sum;
+                if (absAcc != nullptr) {
+                    (*absAcc)[((size_t)co * ho + oh) * wo + ow] = asum;
+                }
             }
         }
     }
 }
 
-// 报告 int32 不溢出所允许的最大**反缩放指数 F**。
+// int32 不溢出所允许的最大**反缩放指数 F**。约束取在部分和上，不是最终值上：
+// L0C 一路累加，中途能到 sum|a*b| + |bias|，而 L0C 溢出后是回绕还是饱和无从确证，
+// 所以直接按上界挑，把这个问题消掉。
 //
-// 约束取在**部分和**上，不是最终值上：L0C 一路累加，中途的部分和最大能到
-// sum|a*b| + |bias|，这个 shape 下它比 |最终值| 大 3 倍还多。最终值不溢出而部分
-// 和溢出时，结果对不对取决于 L0C 的加法器是回绕还是饱和 —— 我没有依据断定是哪
-// 一种，所以直接按上界挑，把这个问题消掉。代价是 conv1 少 2 位、conv2 少 1 位
-// 精度，而定点格本来就比 fp16 的 ULP 细上千倍，这点损失看不见。
-//
-// 注意 F 不是算子属性：属性是 S = 58 - F（见文件头）。要属性值请过一道
-// AttrFromDeqExp()，别把这个返回值直接当 fixed_shift 下发 —— 上一版就是这么错的。
-inline int MaxSafeDeqExp(const std::vector<double>& acc, const std::vector<double>& absAcc, const uint16_t* bias,
-                         int cout, int hw, double* peak, double* peakPartial)
+// 注意 F 不是算子属性：属性是 S = 58 - F。要属性值请过 AttrFromDeqExp()。
+inline int MaxSafeDeqExp(const std::vector<double>& acc, const std::vector<double>& absAcc,
+                         const uint16_t* bias, int cout, int hw, double* peak, double* peakPartial)
 {
-    double m = 0.0;
-    double mp = 0.0;
+    double m = 0.0, mp = 0.0;
     for (int co = 0; co < cout; ++co) {
-        const double b = (double)F16BitsToF32(bias[co]);
+        const double b = bias == nullptr ? 0.0 : (double)F16BitsToF32(bias[co]);
         const double ab = std::fabs(b);
         for (int i = 0; i < hw; ++i) {
             const double v = std::fabs(acc[(size_t)co * hw + i] + b);
@@ -278,28 +274,16 @@ inline int MaxSafeDeqExp(const std::vector<double>& acc, const std::vector<doubl
     }
     *peak = m;
     *peakPartial = mp;
-    if (mp <= 0.0) return FIX_SHIFT_LEN_A16W16;
+    if (mp <= 0.0) {
+        return FIX_SHIFT_LEN_A16W16;
+    }
     int F = 0;
-    while (F < FIX_SHIFT_LEN_A16W16 && mp * std::ldexp(1.0, F + 1) < 2147483000.0) ++F;
+    while (F < FIX_SHIFT_LEN_A16W16 && mp * std::ldexp(1.0, F + 1) < 2147483000.0) {
+        ++F;
+    }
     return F;
 }
 
-// 厂商的默认工作点。CANN 自己的 matmul 在 5102 上就用这个值：
-//   matmul/common/cmct/block/block_mmad_pingpong_without_que.h:144
-//   matmul/common/cmct/block/block_mmad_iterbatch.h:85
-//       #if __NPU_ARCH__ == 5102
-//           uint8_t shiftValue_{42};
-//   58 - 42 = 16
-// 权重 int8 的那条路（weight_quant_batch_matmul_v2_tiling.cpp:33）默认 13，
-// FIX_SHIFT_LEN_A16W8 = 29，29 - 13 也是 16。旧版 API 里 DEQF16 的系数干脆写死成
-// 0x37800000 = 2^-16，注释就是 "fix point 1/2^16"。三条独立证据都落在 F=16。
-//
-// 上一版自作主张挑「最大安全 F」（24/21），偏离了这个工作点，上板结果不成立：
-// 按部分和算本不该溢出的定标却出现了 int32 饱和，而且饱和与否和 |真值| 无关。
-// 所以定标不再自己挑，跟厂商走。MaxSafeDeqExp 保留，只用来校验 F=16 有没有余量。
-constexpr int DEFAULT_ATTR_SHIFT = 42;
-
-// 反缩放指数 F -> 算子属性 S。两者之和恒为 58。
 inline int AttrFromDeqExp(int deqExp)
 {
     const int S = FIX_SHIFT_LEN_A16W16 - deqExp;
@@ -307,27 +291,33 @@ inline int AttrFromDeqExp(int deqExp)
 }
 
 // 定点落格 + bias + relu -> fp16 位型。
-// attrShift 是**算子属性 S**；实际用的反缩放指数是 F = 58 - S（推导见文件头）。
+// attrShift 是**算子属性 S**；实际用的反缩放指数是 F = 58 - S。
 //   acc_i32 = round(sum * 2^F) + round(bias * 2^F)
 //   out     = fp16(acc_i32 * 2^-F)，再 relu
 // bias 的那一次 round 对应 kernel 里 L1->BT 带 fixShiftVal = 58 - S 的那条搬运。
-inline void FixedEpilogue(const std::vector<double>& acc, const uint16_t* bias, int cout, int hw, int attrShift,
-                          bool relu, std::vector<uint16_t>& out, long* satCount)
+inline void FixedEpilogue(const std::vector<double>& acc, const uint16_t* bias, int cout, int hw,
+                          int attrShift, bool relu, std::vector<uint16_t>& out, long* satCount)
 {
     out.assign((size_t)cout * hw, 0);
     const int deqExp = FIX_SHIFT_LEN_A16W16 - attrShift;
     const double scale = std::ldexp(1.0, deqExp);
     for (int co = 0; co < cout; ++co) {
-        const double bq = std::nearbyint((double)F16BitsToF32(bias[co]) * scale);
+        const double bq = bias == nullptr ? 0.0 : std::nearbyint((double)F16BitsToF32(bias[co]) * scale);
         for (int i = 0; i < hw; ++i) {
             double q = std::nearbyint(acc[(size_t)co * hw + i] * scale) + bq;
-            if (q > 2147483647.0) { q = 2147483647.0; ++*satCount; }
-            if (q < -2147483648.0) { q = -2147483648.0; ++*satCount; }
-            float v = (float)(q / scale);
+            if (q > 2147483647.0) {
+                q = 2147483647.0;
+                ++*satCount;
+            }
+            if (q < -2147483648.0) {
+                q = -2147483648.0;
+                ++*satCount;
+            }
+            const float v = (float)(q / scale);
             if (relu && !(v > 0.0f)) {
-                // fixpipe 的 relu 是保号钳位：负数出来是 -0（0x8000），不是 +0。
-                // 这一条是上一版在板上实测出来的，不是从定义推的 —— 383,242 个
-                // 「不一致」全是零的符号。数值上 -0 == +0，但逐位比对必须照做。
+                // fixpipe 的 relu 是保号钳位：负数出来是 **-0**（0x8000），不是 +0。
+                // 这条是上板实测出来的，不是从定义推的 —— 当时 383,242 个「不一致」
+                // 全是零的符号。数值上 -0 == +0，但逐位比对必须照做。
                 out[(size_t)co * hw + i] = (uint16_t)(F32ToF16Bits(v) & 0x8000u);
             } else {
                 out[(size_t)co * hw + i] = F32ToF16Bits(v);
@@ -342,127 +332,109 @@ inline void ExactEpilogue(const std::vector<double>& acc, const uint16_t* bias, 
 {
     out.assign((size_t)cout * hw, 0);
     for (int co = 0; co < cout; ++co) {
-        const double b = (double)F16BitsToF32(bias[co]);
+        const double b = bias == nullptr ? 0.0 : (double)F16BitsToF32(bias[co]);
         for (int i = 0; i < hw; ++i) {
             float v = (float)(acc[(size_t)co * hw + i] + b);
-            if (relu && !(v > 0.0f)) v = 0.0f;
-            out[(size_t)co * hw + i] = F32ToF16Bits(v);
+            if (relu && !(v > 0.0f)) {
+                out[(size_t)co * hw + i] = (uint16_t)(F32ToF16Bits(v) & 0x8000u);
+            } else {
+                out[(size_t)co * hw + i] = F32ToF16Bits(v);
+            }
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// 输入与 golden
-// ---------------------------------------------------------------------------
-struct Inputs {
-    std::vector<uint16_t> xNchw;   // [1, CI, HI, WI]
-    std::vector<uint16_t> w1Nchw;  // [COUT1, CI, 3, 3]
-    std::vector<uint16_t> w2Nchw;  // [COUT2, COUT1, 3, 3]
-    std::vector<uint16_t> b1;      // [COUT1]
-    std::vector<uint16_t> b2;      // [COUT2]
-    std::vector<uint16_t> w1Dev;   // FRACTAL_Z
-    std::vector<uint16_t> w2Dev;
-};
-
-struct Golden {
-    std::vector<uint16_t> midFixed, yFixed;   // 定点模型
-    std::vector<uint16_t> midExact, yExact;   // 纯 fp32 参考
-    int shift1 = 0, shift2 = 0;      // 算子属性 S（下发给 fixed_shift1/2）
-    int deqExp1 = 0, deqExp2 = 0;    // 实际定标指数 F = 58 - S
-    double peak1 = 0, peak2 = 0;              // |最终值 + bias| 的峰值
-    double peakPartial1 = 0, peakPartial2 = 0; // sum|a*b| + |bias| 的峰值
-    int safeExp1 = 0, safeExp2 = 0;            // 部分和不溢出所允许的最大 F（只作校验）
-    long sat = 0;
+struct Result {
+    std::vector<uint16_t> xNchw, w1Nchw, w2Nchw, w1Dev, w2Dev, b1, b2;
+    std::vector<uint16_t> yExpect, yExact;
     long yNonZero = 0;
+    long sat = 0;
+    int safeF1 = 0, safeF2 = 0; // 部分和不溢出所允许的最大 F，用来判 shift 有没有余量
+    double peak1 = 0, peak2 = 0, peakPartial1 = 0, peakPartial2 = 0;
 };
 
-inline Inputs GenerateInputs()
+inline Result Build(const Case& c)
 {
-    Inputs in;
-    in.xNchw.resize((size_t)CI * HI * WI);
-    for (size_t i = 0; i < in.xNchw.size(); ++i) in.xNchw[i] = RandF16Unit(i, 0x11);
-    in.w1Nchw.resize((size_t)COUT1 * CI * KH * KW);
-    for (size_t i = 0; i < in.w1Nchw.size(); ++i) in.w1Nchw[i] = RandF16Unit(i, 0x22);
-    in.w2Nchw.resize((size_t)COUT2 * COUT1 * KH * KW);
-    for (size_t i = 0; i < in.w2Nchw.size(); ++i) in.w2Nchw[i] = RandF16Unit(i, 0x33);
-    in.b1.resize(COUT1);
-    for (int i = 0; i < COUT1; ++i) in.b1[i] = RandF16Unit((uint64_t)i, 0x44);
-    in.b2.resize(COUT2);
-    for (int i = 0; i < COUT2; ++i) in.b2[i] = RandF16Unit((uint64_t)i, 0x55);
-    WeightToFractalZ(in.w1Nchw.data(), CI, COUT1, in.w1Dev);
-    WeightToFractalZ(in.w2Nchw.data(), COUT1, COUT2, in.w2Dev);
-    return in;
-}
-
-// shiftFor* 是**算子属性 S**。传 -1 表示按数据自动挑（先算安全的 F，再取 58-F）。
-inline Golden BuildGolden(const Inputs& in, int shiftFor1 = -1, int shiftFor2 = -1)
-{
-    Golden g;
-    const ConvSpec sp1{CI, HI, WI, COUT1, HO1, WO1, STRIDE1};
-    std::vector<double> acc1, abs1;
-    ConvFwdRaw(in.xNchw.data(), in.w1Nchw.data(), sp1, acc1, &abs1);
-    const int hw1 = HO1 * WO1;
-    const int autoExp1 = MaxSafeDeqExp(acc1, abs1, in.b1.data(), COUT1, hw1, &g.peak1, &g.peakPartial1);
-    g.safeExp1 = autoExp1;
-    // 跟厂商的工作点走；只有当 F=16 都装不下时才退到自己算的安全值。
-    g.shift1 = shiftFor1 >= 0 ? shiftFor1
-             : (autoExp1 >= FIX_SHIFT_LEN_A16W16 - DEFAULT_ATTR_SHIFT ? DEFAULT_ATTR_SHIFT
-                                                                      : AttrFromDeqExp(autoExp1));
-    g.deqExp1 = FIX_SHIFT_LEN_A16W16 - g.shift1;
-    FixedEpilogue(acc1, in.b1.data(), COUT1, hw1, g.shift1, true, g.midFixed, &g.sat);
-    ExactEpilogue(acc1, in.b1.data(), COUT1, hw1, true, g.midExact);
-
-    const ConvSpec sp2{COUT1, HO1, WO1, COUT2, HO2, WO2, STRIDE2};
-    std::vector<double> acc2, abs2;
-    // conv2 吃的是 conv1 的**定点**结果 —— 板上就是这条链，不能拿 exact 的中间值。
-    ConvFwdRaw(g.midFixed.data(), in.w2Nchw.data(), sp2, acc2, &abs2);
-    const int hw2 = HO2 * WO2;
-    const int autoExp2 = MaxSafeDeqExp(acc2, abs2, in.b2.data(), COUT2, hw2, &g.peak2, &g.peakPartial2);
-    g.safeExp2 = autoExp2;
-    g.shift2 = shiftFor2 >= 0 ? shiftFor2
-             : (autoExp2 >= FIX_SHIFT_LEN_A16W16 - DEFAULT_ATTR_SHIFT ? DEFAULT_ATTR_SHIFT
-                                                                      : AttrFromDeqExp(autoExp2));
-    g.deqExp2 = FIX_SHIFT_LEN_A16W16 - g.shift2;
-    FixedEpilogue(acc2, in.b2.data(), COUT2, hw2, g.shift2, true, g.yFixed, &g.sat);
-
-    std::vector<double> acc2e;
-    ConvFwdRaw(g.midExact.data(), in.w2Nchw.data(), sp2, acc2e);
-    ExactEpilogue(acc2e, in.b2.data(), COUT2, hw2, true, g.yExact);
-
-    for (size_t i = 0; i < g.yFixed.size(); ++i) {
-        // -0 也算「写过但为零」，所以掩掉符号位再判非零。
-        g.yNonZero += ((g.yFixed[i] & 0x7FFFu) != 0);
+    Result r;
+    const int ho1 = c.Ho1(), wo1 = c.Wo1(), ho2 = c.Ho2(), wo2 = c.Wo2();
+    r.xNchw.resize((size_t)c.XElems());
+    for (size_t i = 0; i < r.xNchw.size(); ++i) {
+        r.xNchw[i] = RandF16Unit(i, 0x41);
     }
-    return g;
+    r.w1Nchw.resize((size_t)c.W1Elems());
+    for (size_t i = 0; i < r.w1Nchw.size(); ++i) {
+        r.w1Nchw[i] = RandF16Unit(i, 0x42);
+    }
+    r.w2Nchw.resize((size_t)c.W2Elems());
+    for (size_t i = 0; i < r.w2Nchw.size(); ++i) {
+        r.w2Nchw[i] = RandF16Unit(i, 0x43);
+    }
+    r.b1.assign(c.cout1, F32ToF16Bits(0.0f));
+    r.b2.assign(c.cout2, F32ToF16Bits(0.0f));
+    if (c.bias) {
+        for (int i = 0; i < c.cout1; ++i) {
+            r.b1[i] = F32ToF16Bits((float)(i - c.cout1 / 2) / 64.0f);
+        }
+        for (int i = 0; i < c.cout2; ++i) {
+            r.b2[i] = F32ToF16Bits((float)(i - c.cout2 / 2) / 64.0f);
+        }
+    }
+    WeightToFractalZ<uint16_t>(r.w1Nchw.data(), c.ci, c.cout1, c.kh, c.kw, 16, r.w1Dev);
+    WeightToFractalZ<uint16_t>(r.w2Nchw.data(), c.cout1, c.cout2, c.kh, c.kw, 16, r.w2Dev);
+
+    r.yExpect.assign((size_t)c.YElems(), 0);
+    r.yExact.assign((size_t)c.YElems(), 0);
+    // 不带 bias 时 b1/b2 已经全是 0，FixedEpilogue 的 bq 也就是 0 —— 数值上和
+    // 「不加 bias」完全一样，所以下面不用再分一支。
+    for (int b = 0; b < c.n; ++b) {
+        std::vector<double> acc1, abs1;
+        ConvRaw(r.xNchw.data() + (size_t)b * c.ci * c.hi * c.wi, r.w1Nchw.data(), c.ci, c.hi, c.wi, c.cout1,
+                ho1, wo1, c.kh, c.kw, c.stride1, c.padH1, c.padW1, acc1, &abs1);
+        double p, pp;
+        const int f1 = MaxSafeDeqExp(acc1, abs1, r.b1.data(), c.cout1, ho1 * wo1, &p, &pp);
+        if (b == 0 || f1 < r.safeF1) {
+            r.safeF1 = f1;
+        }
+        if (p > r.peak1) r.peak1 = p;
+        if (pp > r.peakPartial1) r.peakPartial1 = pp;
+
+        // conv2 吃的是 conv1 的 **fp16** 输出 —— 和板上这条链一致（mid 是 fp16）。
+        std::vector<uint16_t> mid;
+        FixedEpilogue(acc1, r.b1.data(), c.cout1, ho1 * wo1, c.shift1, c.relu1, mid, &r.sat);
+        std::vector<double> acc2, abs2;
+        ConvRaw(mid.data(), r.w2Nchw.data(), c.cout1, ho1, wo1, c.cout2, ho2, wo2, c.kh, c.kw, c.stride2,
+                c.padH2, c.padW2, acc2, &abs2);
+        const int f2 = MaxSafeDeqExp(acc2, abs2, r.b2.data(), c.cout2, ho2 * wo2, &p, &pp);
+        if (b == 0 || f2 < r.safeF2) {
+            r.safeF2 = f2;
+        }
+        if (p > r.peak2) r.peak2 = p;
+        if (pp > r.peakPartial2) r.peakPartial2 = pp;
+
+        std::vector<uint16_t> ye, yx;
+        FixedEpilogue(acc2, r.b2.data(), c.cout2, ho2 * wo2, c.shift2, c.relu2, ye, &r.sat);
+        ExactEpilogue(acc2, r.b2.data(), c.cout2, ho2 * wo2, c.relu2, yx);
+        const size_t base = (size_t)b * c.cout2 * ho2 * wo2;
+        for (size_t i = 0; i < ye.size(); ++i) {
+            r.yExpect[base + i] = ye[i];
+            r.yExact[base + i] = yx[i];
+            if ((ye[i] & 0x7FFFu) != 0) {
+                ++r.yNonZero;
+            }
+        }
+    }
+    return r;
 }
 
+} // namespace f16path
+
 // ===========================================================================
-// int8 量化通路的 golden
+// int8 量化通路
 // ===========================================================================
-//
-// 链路（和 kernel 一一对应）：
-//     acc1_i32 = sum(x_i8 * w1_i8) + bias1_i32           cube，精确整数
-//     mid_i8   = req8( acc1_i32, quant_scale1 )，再 relu  fixpipe 随路
-//     acc2_i32 = sum(mid_i8 * w2_i8) + bias2_i32
-//     y_i8     = req8( acc2_i32, quant_scale2 )，再 relu
-//
-// req8 的语义（5102 上逐位实测，记在 tensorutils.h 的 L0C2L1_VREQ8 注释里）：
-//     取整是 round-half-to-even
-//     [46] = 1 时按有符号饱和到 [-128, 127]；这一位**硬件不从目的类型推**，
-//            包装 PackReq8Scalar<T>() 替调用方设。忘了置它负数会全变成 0。
-//     scale 的低 13 位尾数被丢弃：effective = bitcast<float>(bits & 0xFFFFE000)
-//
-// relu 在重量化**之后**（fixpipe 的 reluEn），所以是对 int8 结果钳 0，不是对
-// int32 累加器钳。int8 没有 -0，直接是 0 —— 和 fp16 通路那条不一样。
-// ---------------------------------------------------------------------------
 namespace int8path {
 
-constexpr int C0_S8 = 32;
-constexpr int C1_S8 = CI / C0_S8;        // 1
-constexpr int MID_C1_S8 = COUT1 / C0_S8; // 2
-
-// scale 的低 13 位尾数会被硬件丢掉，golden 必须照做，否则会出现"只差最后一位"
-// 的不一致，而那种不一致最难判定是谁错。
+// scale 的低 13 位尾数会被硬件丢掉（REQ8 的 deqScalar 只有 [31:13] 这 19 位），
+// golden 必须照做，否则会出现「只差最后一位」的不一致，而那种不一致最难判定谁错。
 inline float EffectiveScale(float s)
 {
     uint32_t b;
@@ -476,141 +448,155 @@ inline float EffectiveScale(float s)
 inline int8_t Req8(int32_t acc, float scale, bool relu)
 {
     const double v = (double)acc * (double)scale;
-    // round-half-to-even
-    double r = std::nearbyint(v); // 默认舍入模式就是 half-to-even
+    double r = std::nearbyint(v); // 默认舍入模式就是 round-half-to-even
     if (r > 127.0) r = 127.0;
     if (r < -128.0) r = -128.0;
     int8_t q = (int8_t)r;
-    if (relu && q < 0) q = 0;
+    if (relu && q < 0) {
+        q = 0;
+    }
     return q;
 }
 
-// int8 的 FRACTAL_Z：C0 = 32，所以 [cin1*KH*KW][cout1][16][32]。
-inline void WeightToFractalZInt8(const int8_t* nchw, int cin, int cout, std::vector<int8_t>& dev)
-{
-    const int cin1 = cin / C0_S8;
-    const int cout1 = (cout + 15) / 16;
-    dev.assign((size_t)cin1 * KH * KW * cout1 * 16 * C0_S8, 0);
-    for (int co = 0; co < cout; ++co) {
-        for (int ci = 0; ci < cin; ++ci) {
-            for (int kh = 0; kh < KH; ++kh) {
-                for (int kw = 0; kw < KW; ++kw) {
-                    const size_t src = (((size_t)co * cin + ci) * KH + kh) * KW + kw;
-                    const size_t kf = ((size_t)(ci / C0_S8) * KH + kh) * KW + kw;
-                    const size_t dst = kf * cout1 * 16 * C0_S8 + (size_t)(co / 16) * 16 * C0_S8 +
-                                       (size_t)(co % 16) * C0_S8 + (size_t)(ci % C0_S8);
-                    dev[dst] = nchw[src];
-                }
-            }
-        }
-    }
-}
-
-// 精确的整数卷积。int8 x int8 累到 int32：K 最大 576，|a*b| <= 127*128，
-// 576*16256 = 9.4e6，离 int32 远得很，不会溢出。
-inline void ConvInt8(const int8_t* in, const int8_t* wt, const int32_t* bias, const ConvSpec& sp,
+// 精确的整数卷积。int8 x int8 累到 int32：|a*b| <= 127*128 = 16,256，K 就算到
+// 4,608 也才 7.5e7，离 int32 的 2.1e9 远得很。
+inline void ConvInt8(const int8_t* in, const int8_t* wt, const int32_t* bias, int cin, int hi, int wi,
+                     int cout, int ho, int wo, int kh, int kw, int stride, int padH, int padW,
                      std::vector<int32_t>& acc)
 {
-    acc.assign((size_t)sp.cout * sp.ho * sp.wo, 0);
-    for (int co = 0; co < sp.cout; ++co) {
-        for (int oh = 0; oh < sp.ho; ++oh) {
-            for (int ow = 0; ow < sp.wo; ++ow) {
+    acc.assign((size_t)cout * ho * wo, 0);
+    for (int co = 0; co < cout; ++co) {
+        for (int oh = 0; oh < ho; ++oh) {
+            for (int ow = 0; ow < wo; ++ow) {
                 int32_t sum = (bias == nullptr) ? 0 : bias[co];
-                for (int ci = 0; ci < sp.cin; ++ci) {
-                    for (int kh = 0; kh < KH; ++kh) {
-                        const int ih = oh * sp.stride + kh - PAD;
-                        if (ih < 0 || ih >= sp.hi) continue;
-                        for (int kw = 0; kw < KW; ++kw) {
-                            const int iw = ow * sp.stride + kw - PAD;
-                            if (iw < 0 || iw >= sp.wi) continue;
-                            sum += (int32_t)in[((size_t)ci * sp.hi + ih) * sp.wi + iw] *
-                                   (int32_t)wt[(((size_t)co * sp.cin + ci) * KH + kh) * KW + kw];
+                for (int ci = 0; ci < cin; ++ci) {
+                    for (int i = 0; i < kh; ++i) {
+                        const int ih = oh * stride + i - padH;
+                        if (ih < 0 || ih >= hi) {
+                            continue;
+                        }
+                        for (int j = 0; j < kw; ++j) {
+                            const int iw = ow * stride + j - padW;
+                            if (iw < 0 || iw >= wi) {
+                                continue;
+                            }
+                            sum += (int32_t)in[((size_t)ci * hi + ih) * wi + iw] *
+                                   (int32_t)wt[(((size_t)co * cin + ci) * kh + i) * kw + j];
                         }
                     }
                 }
-                acc[((size_t)co * sp.ho + oh) * sp.wo + ow] = sum;
+                acc[((size_t)co * ho + oh) * wo + ow] = sum;
             }
         }
     }
 }
 
-struct Inputs {
-    std::vector<int8_t> xNchw, w1Nchw, w2Nchw, w1Dev, w2Dev;
-    std::vector<int32_t> b1, b2;
-};
-
-struct Golden {
-    std::vector<int8_t> mid, y;
-    float scale1 = 0, scale2 = 0;
-    long yNonZero = 0;
-    long satCount = 0; // 有多少个点撞到了 [-128,127] 的边界
-};
-
-inline Inputs GenerateInputs(bool withBias)
-{
-    Inputs in;
-    auto fill = [](std::vector<int8_t>& v, uint64_t salt) {
-        uint64_t st = 0x9E3779B97F4A7C15ULL ^ salt;
-        for (size_t i = 0; i < v.size(); ++i) {
-            st ^= st << 13; st ^= st >> 7; st ^= st << 17;
-            v[i] = (int8_t)((int)(st % 201) - 100); // [-100, 100]，给累加留余量
-        }
-    };
-    in.xNchw.resize((size_t)CI * HI * WI);            fill(in.xNchw, 0x11);
-    in.w1Nchw.resize((size_t)COUT1 * CI * KH * KW);   fill(in.w1Nchw, 0x22);
-    in.w2Nchw.resize((size_t)COUT2 * COUT1 * KH * KW); fill(in.w2Nchw, 0x33);
-    in.b1.assign(COUT1, 0);
-    in.b2.assign(COUT2, 0);
-    if (withBias) {
-        for (int i = 0; i < COUT1; ++i) in.b1[i] = (i - COUT1 / 2) * 137;
-        for (int i = 0; i < COUT2; ++i) in.b2[i] = (i - COUT2 / 2) * 91;
-    }
-    WeightToFractalZInt8(in.w1Nchw.data(), CI, COUT1, in.w1Dev);
-    WeightToFractalZInt8(in.w2Nchw.data(), COUT1, COUT2, in.w2Dev);
-    return in;
-}
-
-// scale 挑法：让重量化之后的动态范围铺满 int8，但饱和点尽量少。
-inline float PickScale(const std::vector<int32_t>& acc, long* sat)
+// scale 挑法：让重量化之后的动态范围铺满 int8。**不能不挑** —— 累加器量级在
+// 1e6~1e7，scale = 1.0 会让每个点都饱和到 ±127，那样比对全 127 = 全对，什么也
+// 验不出来。板上漏传 quant_scale 的表征就是输出大面积贴在 ±127 上。
+inline float PickScale(const std::vector<int32_t>& acc)
 {
     int32_t m = 0;
     for (size_t i = 0; i < acc.size(); ++i) {
         const int32_t a = acc[i] < 0 ? -acc[i] : acc[i];
-        if (a > m) m = a;
+        if (a > m) {
+            m = a;
+        }
     }
-    if (m == 0) return EffectiveScale(1.0f);
-    // 127 / peak，再退一档留余量；然后按硬件会丢低 13 位尾数的方式落格
-    const float s = EffectiveScale(127.0f / (float)m);
-    *sat = 0;
-    return s;
+    if (m == 0) {
+        return EffectiveScale(1.0f);
+    }
+    return EffectiveScale(127.0f / (float)m);
 }
 
-inline Golden BuildGolden(const Inputs& in, bool withBias, bool relu)
+struct Result {
+    std::vector<int8_t> xNchw, w1Nchw, w2Nchw, w1Dev, w2Dev, y;
+    std::vector<int32_t> b1, b2;
+    float scale1 = 0, scale2 = 0;
+    long yNonZero = 0;
+    long sat = 0;
+};
+
+inline Result Build(const Case& c)
 {
-    Golden g;
-    const ConvSpec sp1{CI, HI, WI, COUT1, HO1, WO1, STRIDE1};
-    const ConvSpec sp2{COUT1, HO1, WO1, COUT2, HO2, WO2, STRIDE2};
-
-    std::vector<int32_t> acc1;
-    ConvInt8(in.xNchw.data(), in.w1Nchw.data(), withBias ? in.b1.data() : nullptr, sp1, acc1);
-    g.scale1 = PickScale(acc1, &g.satCount);
-    g.mid.resize(acc1.size());
-    for (size_t i = 0; i < acc1.size(); ++i) g.mid[i] = Req8(acc1[i], g.scale1, relu);
-
-    std::vector<int32_t> acc2;
-    // conv2 吃的是 conv1 的 **int8** 结果，和板上这条链一致。
-    ConvInt8(g.mid.data(), in.w2Nchw.data(), withBias ? in.b2.data() : nullptr, sp2, acc2);
-    g.scale2 = PickScale(acc2, &g.satCount);
-    g.y.resize(acc2.size());
-    for (size_t i = 0; i < acc2.size(); ++i) {
-        g.y[i] = Req8(acc2[i], g.scale2, relu);
-        if (g.y[i] != 0) ++g.yNonZero;
-        if (g.y[i] == 127 || g.y[i] == -128) ++g.satCount;
+    Result r;
+    const int ho1 = c.Ho1(), wo1 = c.Wo1(), ho2 = c.Ho2(), wo2 = c.Wo2();
+    auto fill = [](std::vector<int8_t>& v, uint64_t salt) {
+        for (size_t i = 0; i < v.size(); ++i) {
+            // [-100, 100]：给累加留余量，也保证有足够多的负数去验 REQ8 的 bit 46
+            // （有符号饱和）—— 忘了置那一位的话负数会被静默清零。
+            v[i] = (int8_t)((int)(Mix64(i, salt) % 201u) - 100);
+        }
+    };
+    r.xNchw.resize((size_t)c.XElems());
+    fill(r.xNchw, 0x11);
+    r.w1Nchw.resize((size_t)c.W1Elems());
+    fill(r.w1Nchw, 0x22);
+    r.w2Nchw.resize((size_t)c.W2Elems());
+    fill(r.w2Nchw, 0x33);
+    r.b1.assign(c.cout1, 0);
+    r.b2.assign(c.cout2, 0);
+    if (c.bias) {
+        for (int i = 0; i < c.cout1; ++i) {
+            r.b1[i] = (i - c.cout1 / 2) * 137;
+        }
+        for (int i = 0; i < c.cout2; ++i) {
+            r.b2[i] = (i - c.cout2 / 2) * 91;
+        }
     }
-    return g;
+    WeightToFractalZ<int8_t>(r.w1Nchw.data(), c.ci, c.cout1, c.kh, c.kw, 32, r.w1Dev);
+    WeightToFractalZ<int8_t>(r.w2Nchw.data(), c.cout1, c.cout2, c.kh, c.kw, 32, r.w2Dev);
+
+    const int32_t* pb1 = c.bias ? r.b1.data() : nullptr;
+    const int32_t* pb2 = c.bias ? r.b2.data() : nullptr;
+
+    // scale 是 per-tensor 的，整个 batch 共用，所以先把所有图的累加器算出来。
+    std::vector<std::vector<int32_t>> acc1(c.n), acc2(c.n);
+    for (int b = 0; b < c.n; ++b) {
+        ConvInt8(r.xNchw.data() + (size_t)b * c.ci * c.hi * c.wi, r.w1Nchw.data(), pb1, c.ci, c.hi, c.wi,
+                 c.cout1, ho1, wo1, c.kh, c.kw, c.stride1, c.padH1, c.padW1, acc1[b]);
+    }
+    {
+        std::vector<int32_t> all;
+        for (int b = 0; b < c.n; ++b) {
+            all.insert(all.end(), acc1[b].begin(), acc1[b].end());
+        }
+        r.scale1 = PickScale(all);
+    }
+    for (int b = 0; b < c.n; ++b) {
+        std::vector<int8_t> mid(acc1[b].size());
+        for (size_t i = 0; i < mid.size(); ++i) {
+            mid[i] = Req8(acc1[b][i], r.scale1, c.relu1);
+        }
+        ConvInt8(mid.data(), r.w2Nchw.data(), pb2, c.cout1, ho1, wo1, c.cout2, ho2, wo2, c.kh, c.kw,
+                 c.stride2, c.padH2, c.padW2, acc2[b]);
+    }
+    {
+        std::vector<int32_t> all;
+        for (int b = 0; b < c.n; ++b) {
+            all.insert(all.end(), acc2[b].begin(), acc2[b].end());
+        }
+        r.scale2 = PickScale(all);
+    }
+    r.y.assign((size_t)c.YElems(), 0);
+    for (int b = 0; b < c.n; ++b) {
+        const size_t base = (size_t)b * c.cout2 * ho2 * wo2;
+        for (size_t i = 0; i < acc2[b].size(); ++i) {
+            const int8_t q = Req8(acc2[b][i], r.scale2, c.relu2);
+            r.y[base + i] = q;
+            if (q != 0) {
+                ++r.yNonZero;
+            }
+            if (q == 127 || q == -128) {
+                ++r.sat;
+            }
+        }
+    }
+    return r;
 }
 
 } // namespace int8path
 
 } // namespace fc2d_golden
-#endif
+
+#endif // FUSED_CONV2D_GOLDEN_H
