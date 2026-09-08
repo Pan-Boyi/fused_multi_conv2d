@@ -290,8 +290,14 @@ int main(int argc, char** argv)
         for (int i = 0; i < SPEC_N; ++i) {
             w.I32(spec[i]);
         }
-        w.U32(0);
-        w.U32(0); // fp16 通路不用 quant_scale
+        // fp16 通路不用 quant_scale，但**不能写 0**：这两个数会原样进 singleop.json
+        // 当属性值，而 ACL 是按属性的值匹配 .om 的。写算子声明里的缺省 1.0，
+        // 让 .om 上登记的和一个"没传这个属性"的调用方看到的是同一个值。
+        const float one = 1.0f;
+        uint32_t oneBits = 0;
+        std::memcpy(&oneBits, &one, 4);
+        w.U32(oneBits);
+        w.U32(oneBits);
 
         w.Tensor("x", ACL_DT_FLOAT16, xDims, g.xNchw.data(), g.xNchw.size() * 2);
         w.Tensor("filter1", ACL_DT_FLOAT16, f1Dims, g.w1Dev.data(), g.w1Dev.size() * 2);

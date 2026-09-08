@@ -21,6 +21,65 @@ python3 fc2d.py cases.json --steps run
 
 产物都在 `out/<name>/`：`case.bin`（输入 + golden）、`singleop.json`、`om/*.om`。
 
+## 上板 + profiling：run_profile.py
+
+`fc2d.py` 假设你在同一台机器上出 `.om` 又跑。真实情况常常是两台：一台有 CANN 和
+`atc`，另一台插着 5102。`run_profile.py` 覆盖这种情况,并且把 profiling 一起做了。
+
+```bash
+export FC2D_REMOTE_PASSWORD='...'          # 配了免密就不用这一步
+python3 run_profile.py profile.json
+```
+
+八个步骤,`--steps` 可以只挑其中几个:
+
+| 步骤 | 在哪跑 | 做什么 |
+| :-- | :-- | :-- |
+| `check` | 本地 | 形状预检 |
+| `case` | 本地 | 生成 `case.bin` |
+| `om` | 本地 | 写 `singleop.json`,跑 `atc --singleop` |
+| `push` | 本地 -> 远端 | 每条 case 一个干净目录,拷 `case.bin`、`.om`、`run_fused_conv2d.py` |
+| `prof` | 远端 | `msprof python3 run_fused_conv2d.py ...`,并找出**本次**新生成的 `PROF_*` |
+| `pull` | 远端 -> 本地 | 把那个 `PROF_*` 拉回 `prof_out/<json 名>/<case 名>/` |
+| `export` | 本地 | `TbeWorkTestSuit` 的 `msprof.py export summary` |
+| `parse` | 本地 | 解析 `op_summary_*.csv`,每条打明细,最后打一张横向对比表 |
+
+几个不显眼但要紧的点:
+
+- **`run_fused_conv2d.py` 每次都重新拷过去。** 它和 `case.bin` 的格式是配套的,
+  远端留着一份旧的会报「case 文件版本 N,本脚本认 M」,而那时人往往已经在查算子了。
+- **每条 case 在远端有自己的干净目录,不复用。** `aclopSetModelDir` 会把目录下所有
+  `.om` 都装进去,留着上一个形状的那个,它可能反而先匹配上,跑出来的是上个形状的
+  结果,而且不报错。
+- **新 `PROF_*` 靠执行前后的差集找,不靠"取最新"。** 目录名里带时间戳,并发或重跑
+  时"最新"会拿错。一次冒出多个也会直接报错而不是随便挑一个。
+- **kernel 跑挂了照样导 PROF。** 挂掉时的流水图往往正是要看的东西。
+- **`REPEAT` 次会得到多行,汇总表取最小值。** host 侧抖动和别的进程抢核只会让某几次
+  变慢,不会让它变快,所以最小值是对"这个 kernel 本身有多快"掺杂噪声最少的估计。
+  行数和均值也一并给出,好判断抖动有多大。
+- **密码不写进 json。** 那份 json 是要进仓的。密码从 `remote.password_env` 指定的
+  环境变量读,没设就走密钥。
+
+`profile.json` 比 `cases.json` 多三段:
+
+```json
+{
+  "soc_version": "MC62CM12AA",
+  "local_cann_env": "/home/p84341448/Ascend-52/cann/set_env.sh",
+  "remote": {"host": "...", "user": "...", "dir": "/home/p84341448/fc2d_run",
+             "device": 0, "repeat": 10},
+  "profile": {"tbe_work_test_suit": "/home/p84341448/TbeWorkTestSuit"},
+  "cases": [ ... 和 cases.json 完全一样的写法 ... ]
+}
+```
+
+`local_cann_env` 会被 source 进脚本自己的环境,所以调用前不必先 source。
+只想验功能不想 profiling 就加 `--no-msprof`,它会自动跳过 `pull` / `export` / `parse`。
+想看远端到底会执行什么,加 `--print-remote-script`。
+
+产物按 json 的文件名分目录:`out/<json 名>/<case 名>/` 和 `prof_out/<json 名>/<case 名>/`。
+两份 json 里同名但形状不同的 case 因此不会互相覆盖。
+
 ## 为什么是一个 json 而不是三处
 
 一个形状要三样东西严丝合缝：
@@ -113,7 +172,9 @@ python3 run_fused_conv2d.py out/base_fp16/case.bin FusedConv2d 0 out/base_fp16/o
 | 文件 | 说明 |
 | :-- | :-- |
 | `cases.json` | **你要改的就是这个** |
-| `fc2d.py` | 总驱动：check → case → om → run |
+| `fc2d.py` | 单机总驱动：check → case → om → run |
+| `run_profile.py` | 两台机器 + profiling：check → case → om → push → prof → pull → export → parse |
+| `profile.json` | `run_profile.py` 的配置，比 `cases.json` 多 remote / profile 两段 |
 | `gen_case.cpp` | 按命令行给的形状生成 `case.bin`（输入 + golden） |
 | `fused_conv2d_golden.h` | 两条通路的 CPU golden，按形状参数化 |
 | `fc2d_geom.cpp` | 形状预检。用的是算子共用几何头的**副本**，**顾问性质** |

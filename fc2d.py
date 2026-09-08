@@ -366,7 +366,11 @@ def main():
         die("--steps 里不认识的步骤 %s，只能是 check / case / om / run" % bad)
 
     device = args.device if args.device is not None else int(doc.get("device", 0))
-    outdir = args.outdir or os.path.join(os.path.dirname(os.path.abspath(args.cases)), "out")
+    # 产物按 json 的文件名分目录。两份 json 里可能有同名的 case（比如 cases.json
+    # 和 profile.json 都有 base_fp16）而形状不同，共用一个 out/ 会互相覆盖，
+    # 然后单跑 --steps om 时拿到的是另一份 json 的数据 —— 而且不报错。
+    stem = os.path.splitext(os.path.basename(args.cases))[0]
+    outdir = args.outdir or os.path.join(os.path.dirname(os.path.abspath(args.cases)), "out", stem)
     extra = list(args.run_arg)
 
     print("清单: %s" % args.cases)
