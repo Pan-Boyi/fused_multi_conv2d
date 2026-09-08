@@ -169,14 +169,34 @@ python3 run_fused_conv2d.py out/base_fp16/case.bin FusedConv2d 0 out/base_fp16/o
 
 ## 文件
 
-| 文件 | 说明 |
+跑用例**需要且仅需要**这些：
+
+| 文件 | 角色 |
 | :-- | :-- |
-| `cases.json` | **你要改的就是这个** |
-| `fc2d.py` | 单机总驱动：check → case → om → run |
-| `run_profile.py` | 两台机器 + profiling：check → case → om → push → prof → pull → export → parse |
-| `profile.json` | `run_profile.py` 的配置，比 `cases.json` 多 remote / profile 两段 |
-| `gen_case.cpp` | 按命令行给的形状生成 `case.bin`（输入 + golden） |
-| `fused_conv2d_golden.h` | 两条通路的 CPU golden，按形状参数化 |
-| `fc2d_geom.cpp` | 形状预检。用的是算子共用几何头的**副本**，**顾问性质** |
-| `fused_conv2d_shape.h` | 上面那份副本。**算子那边改了就要重拷**：<br>`python3 fc2d.py --sync-shape-header <ops-nn>/conv/fused_conv2d/op_kernel/fused_conv2d_shape.h`<br>然后重编 `fc2d_geom` |
-| `run_fused_conv2d.py` | ctypes 直调 `aclopExecuteV2`，目标机不需要编译器 |
+| `profile.json` | **你要改的就是这个**：dtype、形状、可选属性、远端信息 |
+| `run_profile.py` | 总驱动，八步 |
+| `fc2d.py` | 被 `run_profile.py` import；也能单独跑单机流程 |
+| `gen_case.cpp` | 编成 `gen_case`，按形状生成 `case.bin`（输入 + golden）|
+| `fused_conv2d_golden.h` | 两条通路的 CPU golden，被 `gen_case.cpp` include |
+| `fc2d_geom.cpp` | 编成 `fc2d_geom`，形状预检 |
+| `fused_conv2d_shape.h` | 算子共用几何头的**副本**，被 `fc2d_geom.cpp` include |
+| `run_fused_conv2d.py` | 在板子上执行的那一端，由 `run_profile.py` 自动拷过去 |
+| `cases.json` | 可选。28 个形状 x 两条通路的功能清单。它只有形状、没有 remote 段，所以要这样接进来：<br>`python3 run_profile.py profile.json --cases cases.json --no-msprof` |
+
+两个要编的：
+
+```bash
+g++ -std=c++17 -O2 -ffp-contract=off gen_case.cpp  -o gen_case  -I.
+g++ -std=c++17 -O2                   fc2d_geom.cpp -o fc2d_geom -I.
+```
+
+`fused_conv2d_shape.h` 是算子那份的副本。**算子那边改了几何就要重拷**：
+
+```bash
+python3 fc2d.py --sync-shape-header <ops-nn>/conv/fused_conv2d/op_kernel/fused_conv2d_shape.h
+```
+
+然后重编 `fc2d_geom`。它是顾问性质的：真正说了算的永远是算子的 tiling，两边不一致时
+预检的结论会和 `atc` 不同,那本身就是「该重拷了」的信号。
+
+产物 `out/` 和 `prof_out/` 都在 `.gitignore` 里,不进仓。

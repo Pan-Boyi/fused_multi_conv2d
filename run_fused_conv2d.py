@@ -26,8 +26,8 @@ gen_case 生成的 .bin。所以这台机器只要有 python3 + CANN 就够了�
     WARMUP=0         正式计时前先空跑多少次（不计入统计）。总次数 = WARMUP + REPEAT
 
 设备上没装带 FusedConv2d 的算子包时，传第 4 个参数：那是在有算子包的机器上用
-build_om.sh 编出来的单算子离线模型。运行时就从它里面找算子，不再要求本机的算子
-信息库里有这个算子。
+fc2d.py / run_profile.py 的 om 步骤编出来的单算子离线模型。运行时就从它里面找算子，
+不再要求本机的算子信息库里有这个算子。
 
 注意 aclopSetModelDir 只吃**目录**，而且会把目录下所有 .om 都加载进来。所以给单个
 文件时走的是 aclopLoad(把文件读进内存再注册)，只注册你指定的这一个 —— 目录里有多个
@@ -791,7 +791,9 @@ def main():
             om_dir = os.path.abspath(om_arg)
             oms = [f for f in os.listdir(om_dir) if f.endswith(".om")]
             if not oms:
-                die("%s 下没有 .om —— 在有算子包的机器上跑 build_om.sh 生成，拷过来" % om_dir)
+                die("%s 下没有 .om —— 在有算子包的机器上跑\n"
+                    "        python3 fc2d.py <配置>.json --steps om --soc <soc_version>\n"
+                    "        生成，再拷过来（run_profile.py 会自动拷）" % om_dir)
             print("  离线模型目录: %s，共 %d 个 .om: %s"
                   % (om_dir, len(oms), ", ".join(sorted(oms))))
             if len(oms) > 1:
@@ -978,8 +980,9 @@ def main():
                         "          ACL 拿 op 类型 + 每个 tensor 的 shape/dtype/format + **全部 attr 的值**\n"
                         "          一起去匹配 .om，任何一项对不上都报成这个「算子没找到」。\n"
                         "          本次下发的属性: fixed_shift1=%d fixed_shift2=%d\n"
-                        "          编 .om 时用的值在 om_out/singleop_used.json 里，先比这两个数。\n"
-                        "          对不上 -> 重跑 build_om.sh（它会从 .bin 的 header 现读，不用手改）\n"
+                        "          编 .om 时用的值在同目录的 singleop.json 里，先比这两个数。\n"
+                        "          对不上 -> 重跑 om 那一步（singleop.json 是从这个 .bin 的 spec 现生成的，\n"
+                        "                    所以只要用同一个 .bin 就不会对不上）\n"
                         "        真的没装 -> grep -ri '\"%s\"' $ASCEND_OPP_PATH/built-in/op_impl/ai_core/tbe/config/\n"
                         "        装了但选不出 kernel -> shape/dtype 和 binary.json 里登记的组合对不上"
                         % (op_type, ret, shift1, shift2, op_type))

@@ -405,6 +405,28 @@ def parse_summary(csv_path, columns):
 
 
 # ---------------------------------------------------------------- 配置
+def load_cases(raw):
+    """把 json 里的 cases 数组归一化 + 展开 dtype: both。"""
+    cases = []
+    for i, one in enumerate(raw):
+        c = fc2d.normalise(one, i)
+        if c["dtype"] == "both":
+            # dtype: "both" 展开成两条。同一个形状在两条通路上各跑一遍是常态，
+            # 写两遍 json 只会让它们慢慢长歪。
+            for dt in ("fp16", "int8"):
+                d = dict(c)
+                d["dtype"] = dt
+                d["name"] = "%s_%s" % (c["name"], dt)
+                cases.append(d)
+        else:
+            cases.append(c)
+    names = [c["name"] for c in cases]
+    dup = sorted({n for n in names if names.count(n) > 1})
+    if dup:
+        die("case 的 name 有重复: %s" % dup)
+    return cases
+
+
 def load_config(path):
     if not os.path.isfile(path):
         die("找不到 %s" % path)
@@ -431,25 +453,7 @@ def load_config(path):
     raw = doc.get("cases")
     if not isinstance(raw, list) or not raw:
         die("%s 里没有 cases 数组" % path)
-
-    cases = []
-    for i, one in enumerate(raw):
-        c = fc2d.normalise(one, i)
-        if c["dtype"] == "both":
-            # dtype: "both" 展开成两条。同一个形状在两条通路上各跑一遍是常态，
-            # 写两遍 json 只会让它们慢慢长歪。
-            for dt in ("fp16", "int8"):
-                d = dict(c)
-                d["dtype"] = dt
-                d["name"] = "%s_%s" % (c["name"], dt)
-                cases.append(d)
-        else:
-            cases.append(c)
-    names = [c["name"] for c in cases]
-    dup = sorted({n for n in names if names.count(n) > 1})
-    if dup:
-        die("case 的 name 有重复: %s" % dup)
-    return doc, remote, prof, cases
+    return doc, remote, prof, load_cases(raw)
 
 
 def main():
@@ -457,6 +461,9 @@ def main():
     ap.add_argument("config", nargs="?", default=os.path.join(HERE, "profile.json"),
                     help="配置 json（默认 profile.json）")
     ap.add_argument("--only", action="append", default=[], help="只做名字匹配的这些 case，可给多次")
+    ap.add_argument("--cases", metavar="JSON", default=None,
+                    help="从另一个 json 取 cases 数组，remote / profile / soc 仍用主配置里的。"
+                         "比如拿 profile.json 的远端信息去跑 cases.json 的那批功能用例。")
     ap.add_argument("--steps", default=",".join(ALL_STEPS),
                     help="做哪几步，逗号分隔：" + " / ".join(ALL_STEPS))
     ap.add_argument("--soc", default=None, help="atc 的 soc_version，覆盖 json 里的 soc_version")
@@ -469,6 +476,17 @@ def main():
     args = ap.parse_args()
 
     doc, remote_cfg, prof_cfg, cases = load_config(args.config)
+    if args.cases:
+        # cases.json 那种只有形状清单、没有 remote 段的文件，用这条把它接进来。
+        if not os.path.isfile(args.cases):
+            die("找不到 %s" % args.cases)
+        with open(args.cases) as f:
+            other = json.load(f)
+        raw = other.get("cases") if isinstance(other, dict) else other
+        if not isinstance(raw, list) or not raw:
+            die("%s 里没有 cases 数组" % args.cases)
+        cases = load_cases(raw)
+        print("case 清单来自 %s（remote / profile / soc 仍用 %s）" % (args.cases, args.config))
     if args.only:
         want = set(args.only)
         miss = want - {c["name"] for c in cases}
@@ -487,7 +505,7 @@ def main():
     soc = args.soc or doc.get("soc_version", "") or os.environ.get("FC2D_SOC", "")
     # 产物按 json 的文件名分目录：两份 json 里同名但形状不同的 case 不会互相覆盖。
     cfg_dir = os.path.dirname(os.path.abspath(args.config))
-    stem = os.path.splitext(os.path.basename(args.config))[0]
+    stem = os.path.splitext(os.path.basename(args.cases or args.config))[0]
     out_root = doc.get("outdir") or os.path.join(cfg_dir, "out", stem)
     prof_root = doc.get("profdir") or os.path.join(cfg_dir, "prof_out", stem)
     rt = Remote(remote_cfg)
