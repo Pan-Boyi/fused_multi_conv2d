@@ -295,6 +295,9 @@ def main():
     ap.add_argument("--device", type=int, default=None, help="设备号，默认取 json 里的 device")
     ap.add_argument("--outdir", default=None, help="产物目录，默认 <json 所在目录>/out")
     ap.add_argument("--list", action="store_true", help="只列出会做哪些")
+    ap.add_argument("--sync-shape-header", metavar="PATH", default=None,
+                    help="从 ops-nn 重拷一份 fused_conv2d_shape.h（形状预检用的副本）。"
+                         "算子那边改了几何就跑一次，否则预检的结论会和 atc 不一致。")
     ap.add_argument("--keep-going", action="store_true",
                     help="某条失败了继续做下一条（默认第一条失败就停）")
     # 不用 argparse.REMAINDER：位置参数 cases 之后的**所有**东西都会被它吞掉，
@@ -302,6 +305,25 @@ def main():
     ap.add_argument("--run-arg", action="append", default=[],
                     help="原样转给 run_fused_conv2d.py 的参数，可给多次（如 --run-arg --dry-run）")
     args = ap.parse_args()
+
+    if args.sync_shape_header:
+        src = args.sync_shape_header
+        if not os.path.isfile(src):
+            die("找不到 %s" % src)
+        dst = os.path.join(HERE, "fused_conv2d_shape.h")
+        with open(dst) as f:
+            old = f.read()
+        # 保留副本顶上那段说明（它讲的是「这是副本、怎么重拷」），只换正文。
+        marker = "// ==========================================================================="
+        end = old.find(marker, old.find(marker) + 1)
+        banner = old[:end + len(marker) + 1] if end > 0 else ""
+        with open(src) as f:
+            body = f.read()
+        with open(dst, "w") as f:
+            f.write(banner + body)
+        print("已从 %s 重拷 fused_conv2d_shape.h" % src)
+        print("记得重编预检工具: g++ -std=c++17 -O2 -o fc2d_geom fc2d_geom.cpp -I.")
+        return 0
 
     if not os.path.isfile(args.cases):
         die("找不到 %s" % args.cases)

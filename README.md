@@ -117,5 +117,5 @@ python3 run_fused_conv2d.py out/base_fp16/case.bin FusedConv2d 0 out/base_fp16/o
 | `gen_case.cpp` | 按命令行给的形状生成 `case.bin`（输入 + golden） |
 | `fused_conv2d_golden.h` | 两条通路的 CPU golden，按形状参数化 |
 | `fc2d_geom.cpp` | 形状预检。用的是算子共用几何头的**副本**，**顾问性质** |
-| `fused_conv2d_shape.h` | 上面那份副本。**算子那边改了就要重拷** |
+| `fused_conv2d_shape.h` | 上面那份副本。**算子那边改了就要重拷**：<br>`python3 fc2d.py --sync-shape-header <ops-nn>/conv/fused_conv2d/op_kernel/fused_conv2d_shape.h`<br>然后重编 `fc2d_geom` |
 | `run_fused_conv2d.py` | ctypes 直调 `aclopExecuteV2`，目标机不需要编译器 |
