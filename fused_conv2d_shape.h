@@ -145,10 +145,49 @@ struct Params {
     int elemBytes; // 2 = fp16, 1 = int8
 };
 
-// M 方向的分块表。手写表在形状一变就全废，所以一律从行数直接推：
+// M 方向的分块。**整个算子只有这一条分块公式**：把 total 行按 gran 切成 units 个
+// 单位，均分成 n 块，余数摊给靠前的块。
 //   maxRows  一块最多几行 —— 由 L0A 一槽和 L0C 共同定
 //   gran     行数粒度 —— rows*Wo 必须 16 对齐，所以 gran = 16 / gcd(Wo, 16)
-// 均分，余数摊给靠前的块。
+//
+// 上一版把它展开成一张 129 个 int 的定长表（TileTable）在 host 和 device 之间传，
+// 而且**每个 band 现搭两张**。上板量出来这条路很贵：MakeTiles 每次要清 128 个 int、
+// 按值返回又是 516 字节的拷贝，几何推导整体把 scalar 从 3.8us 抬到 18.9us。
+// 现在 device 侧只拿三个标量（n / base / extra），第 i 块的行数和起点用两次乘法
+// 现算 —— 表只在 host 和 UT 里展开，那边多花几百条指令无所谓。
+struct TileSpec {
+    int n;     // 分几块。**0 表示这个组合不成立**，调用方必须判
+    int base;  // 每块至少几个单位
+    int extra; // 前 extra 块各多一个单位
+    int gran;  // 一个单位几行
+};
+
+FC2D_GEOM_CE TileSpec MakeTileSpec(int total, int maxRows, int gran)
+{
+    // 聚合初始化，不是先声明再赋值：constexpr 函数里默认初始化的局部量
+    // 「永远产生不了常量表达式」，clang 直接把整个函数判成非法的 constexpr。
+    TileSpec s = {0, 0, 0, gran};
+    if (total <= 0 || gran <= 0 || maxRows < gran || (total % gran) != 0) {
+        return s;
+    }
+    const int units = total / gran;
+    const int maxUnits = maxRows / gran;
+    const int n = CeilDiv(units, maxUnits);
+    if (n > MAX_M_TILES) {
+        return s;
+    }
+    s.n = n;
+    s.base = units / n;
+    s.extra = units % n;
+    return s;
+}
+
+// 第 i 块有几行 / 从第几行开始。device 侧就用这两个，不建表。
+FC2D_GEOM_CE int TileRows(const TileSpec& s, int i) { return (s.base + (i < s.extra ? 1 : 0)) * s.gran; }
+FC2D_GEOM_CE int TileRow0(const TileSpec& s, int i) { return (s.base * i + MinI(i, s.extra)) * s.gran; }
+
+// 展开的表。**只有 host 和 UT 用**（tiling 的逐 band 校验、golden 对账）。
+// 它必须和 TileRows/TileRow0 逐项相等 —— 这一条由 UT 钉住，不靠人看。
 struct TileTable {
     int n;
     int rows[MAX_M_TILES];
@@ -157,29 +196,12 @@ struct TileTable {
 
 FC2D_GEOM_FN TileTable MakeTiles(int total, int maxRows, int gran)
 {
+    const TileSpec s = MakeTileSpec(total, maxRows, gran);
     TileTable t;
-    t.n = 0;
+    t.n = s.n;
     for (int i = 0; i < MAX_M_TILES; ++i) {
-        t.rows[i] = 0;
-        t.row0[i] = 0;
-    }
-    if (total <= 0 || gran <= 0 || maxRows < gran || (total % gran) != 0) {
-        return t; // n == 0 就是「这个组合不成立」，调用方必须判
-    }
-    const int units = total / gran;
-    const int maxUnits = maxRows / gran;
-    const int n = CeilDiv(units, maxUnits);
-    if (n > MAX_M_TILES) {
-        return t;
-    }
-    const int base = units / n;
-    const int extra = units % n;
-    t.n = n;
-    int acc = 0;
-    for (int i = 0; i < n; ++i) {
-        t.rows[i] = (base + (i < extra ? 1 : 0)) * gran;
-        t.row0[i] = acc;
-        acc += t.rows[i];
+        t.rows[i] = (i < s.n) ? TileRows(s, i) : 0;
+        t.row0[i] = (i < s.n) ? TileRow0(s, i) : 0;
     }
     return t;
 }
@@ -361,6 +383,225 @@ FC2D_GEOM_FN bool PickL0bChunks(int cout, int k, int elemBytes, int tileK, int& 
 }
 
 // ---------------------------------------------------------------------------
+// tiling 下发的**扁平几何**。
+//
+// 上一版下发的是 Params + hb，kernel 自己调 DeriveWithHb() 复原整套几何。那在
+// 「一个二进制服务所有形状」这件事上是对的，但代价上板才看得见：DeriveWithHb 里
+// 有两轮 PickTileK（各几十次试探，每次四五个整数除法）、两轮 PickL0bChunks、
+// 一遍逐 band 校验，加起来五百多个标量除法 —— scalar 耗时从 3.8us 涨到 18.9us，
+// 而这些数**对一次 launch 而言全是常量**。
+//
+// 所以现在：host 把 Geometry 里 kernel 用得到的字段全抄进这个结构体下发，kernel
+// 逐字段读成 const 局部量，一次除法都不做。
+//
+// 「host 和 device 只有一份几何」这条纪律没有松动，只是搬了个位置：算它的仍然只有
+// DeriveWithHb() 一处，kernel 不再重算，也就更不可能算出和 host 不同的答案。
+// 逐 band 那点窗口算术（四个 pad、行数、conv1 的分块）留在 device 上现算 ——
+// 它随 chunk 变，本来就不是一个常量，而且只有加减乘和三次除法。
+//
+// 下面的 FC2D_FLAT_FIELDS 是这些字段的**唯一清单**：tiling 的下发、kernel 的解包、
+// kernel UT 那份手抄的 tiling 结构体，三处都由它展开。漏一个字段或写错一个名字都
+// 编不过，不会变成「读到相邻字段的值、不报错只算错」。
+// ---------------------------------------------------------------------------
+struct FlatGeom {
+    // ---- 形状（img2col / Dn2Nz 直接要）----
+    int n, ci, hi, wi, cout1, cout2, kh, kw, stride1, stride2;
+    int padH1, padW1, padH2, padW2, elemBytes;
+    // ---- 由形状推出来的 ----
+    int c0, ho1, wo1, ho2, wo2, k1, k2;
+    int hb, nchunk, chunkTotal, chunksPerCore;
+    int midRows;                 // 一个 band 的窗口跨度（含补零）
+    int gran1, rowsMax1;         // conv1 的 M 分块参数（逐 band 现算用）
+    int tileK1, tileK2;
+    int l0bChunks1, l0bChunkK1, tilesPerChunk1;
+    int l0bChunks2, l0bChunkK2, tilesPerChunk2;
+    int l0bElems, l0cElems;
+    // ---- L1 地址表（字节地址）----
+    int fmAddr, fmElems, midAddr, midElems, w1Addr, w1Elems, w2Addr, w2Elems, b1Addr, b2Addr;
+    // ---- GM 侧 ----
+    int xPlane, yPlane, yPlaneM;
+    // ---- conv2 的 M 分块表：每个 band 都一样，直接下发展开好的三个标量 ----
+    int t2n, t2base, t2extra, gran2;
+};
+
+// FlatGeom 的字段清单：X(FlatGeom 里的名字, tiling 里的名字)。
+// 顺序就是 tiling 结构体的声明顺序 —— kernel UT 那份手抄的 packed 结构体靠它对齐
+// 布局（那边是按字节 memcpy 的，顺序错了就全错）。host tiling 和 kernel 走的是
+// 具名的 set_/成员访问，顺序对它们无所谓，但一处清单总比三处手抄可靠。
+#define FC2D_FLAT_FIELDS(X)   \
+    X(n, batch)               \
+    X(ci, cin)                \
+    X(hi, hin)                \
+    X(wi, win)                \
+    X(cout1, cout1)           \
+    X(cout2, cout2)           \
+    X(kh, kh)                 \
+    X(kw, kw)                 \
+    X(stride1, stride1)       \
+    X(stride2, stride2)       \
+    X(padH1, padH1)           \
+    X(padW1, padW1)           \
+    X(padH2, padH2)           \
+    X(padW2, padW2)           \
+    X(elemBytes, elemBytes)   \
+    X(c0, c0)                 \
+    X(ho1, ho1)               \
+    X(wo1, wo1)               \
+    X(ho2, ho2)               \
+    X(wo2, wo2)               \
+    X(k1, k1)                 \
+    X(k2, k2)                 \
+    X(hb, hb)                 \
+    X(nchunk, nchunk)         \
+    X(chunkTotal, chunkTotal) \
+    X(chunksPerCore, chunksPerCore) \
+    X(midRows, midRows)       \
+    X(gran1, gran1)           \
+    X(rowsMax1, rowsMax1)     \
+    X(tileK1, tileK1)         \
+    X(tileK2, tileK2)         \
+    X(l0bChunks1, l0bChunks1) \
+    X(l0bChunkK1, l0bChunkK1) \
+    X(tilesPerChunk1, tilesPerChunk1) \
+    X(l0bChunks2, l0bChunks2) \
+    X(l0bChunkK2, l0bChunkK2) \
+    X(tilesPerChunk2, tilesPerChunk2) \
+    X(l0bElems, l0bElems)     \
+    X(l0cElems, l0cElems)     \
+    X(fmAddr, fmAddr)         \
+    X(fmElems, fmElems)       \
+    X(midAddr, midAddr)       \
+    X(midElems, midElems)     \
+    X(w1Addr, w1Addr)         \
+    X(w1Elems, w1Elems)       \
+    X(w2Addr, w2Addr)         \
+    X(w2Elems, w2Elems)       \
+    X(b1Addr, b1Addr)         \
+    X(b2Addr, b2Addr)         \
+    X(xPlane, xPlane)         \
+    X(yPlane, yPlane)         \
+    X(yPlaneM, yPlaneM)       \
+    X(t2n, t2n)               \
+    X(t2base, t2base)         \
+    X(t2extra, t2extra)       \
+    X(gran2, gran2)
+
+FC2D_GEOM_FN void Flatten(const Geometry& g, int chunksPerCore, FlatGeom& f)
+{
+    f.n = g.p.n;
+    f.ci = g.p.ci;
+    f.hi = g.p.hi;
+    f.wi = g.p.wi;
+    f.cout1 = g.p.cout1;
+    f.cout2 = g.p.cout2;
+    f.kh = g.p.kh;
+    f.kw = g.p.kw;
+    f.stride1 = g.p.stride1;
+    f.stride2 = g.p.stride2;
+    f.padH1 = g.p.padH1;
+    f.padW1 = g.p.padW1;
+    f.padH2 = g.p.padH2;
+    f.padW2 = g.p.padW2;
+    f.elemBytes = g.p.elemBytes;
+
+    f.c0 = g.c0;
+    f.ho1 = g.ho1;
+    f.wo1 = g.wo1;
+    f.ho2 = g.ho2;
+    f.wo2 = g.wo2;
+    f.k1 = g.k1;
+    f.k2 = g.k2;
+
+    f.hb = g.hb;
+    f.nchunk = g.nchunk;
+    f.chunkTotal = g.chunkTotal;
+    f.chunksPerCore = chunksPerCore;
+
+    f.midRows = g.midRows;
+    f.gran1 = g.gran1;
+    f.rowsMax1 = g.rowsMax1;
+    f.tileK1 = g.tileK1;
+    f.tileK2 = g.tileK2;
+    f.l0bChunks1 = g.l0bChunks1;
+    f.l0bChunkK1 = g.l0bChunkK1;
+    f.tilesPerChunk1 = g.tilesPerChunk1;
+    f.l0bChunks2 = g.l0bChunks2;
+    f.l0bChunkK2 = g.l0bChunkK2;
+    f.tilesPerChunk2 = g.tilesPerChunk2;
+    f.l0bElems = g.l0bElems;
+    f.l0cElems = g.l0cElems;
+
+    f.fmAddr = g.fmAddr;
+    f.fmElems = g.fmElems;
+    f.midAddr = g.midAddr;
+    f.midElems = g.midElems;
+    f.w1Addr = g.w1Addr;
+    f.w1Elems = g.w1Elems;
+    f.w2Addr = g.w2Addr;
+    f.w2Elems = g.w2Elems;
+    f.b1Addr = g.b1Addr;
+    f.b2Addr = g.b2Addr;
+
+    f.xPlane = g.xPlane;
+    f.yPlane = g.yPlane;
+    f.yPlaneM = g.ho2 * g.wo2;
+
+    const TileSpec t2 = MakeTileSpec(g.hb, g.rowsMax2, g.gran2);
+    f.t2n = t2.n;
+    f.t2base = t2.base;
+    f.t2extra = t2.extra;
+    f.gran2 = g.gran2;
+}
+
+// ---------------------------------------------------------------------------
+// 某一个 band 的运行期窗口。**device 侧每个 chunk 算一次的就是这个**，全部是
+// 加减乘和三次除法（MakeTileSpec 里的），没有数组、没有大结构体拷贝。
+//
+// 分带算术：
+//   band b 出 conv2 的输出行 [b*hb, (b+1)*hb)
+//   这些行的窗口覆盖 conv1 的输出行 [aMid, aMid + midRows)，raw = stride2*hb*b - pad2
+//   其中真实存在的是和 [0, ho1) 的交集 —— 头尾两端各有可能被钳
+//
+// mid 在 L1 里只放这个 band 真实存在的那些行（midReal 行），所以
+//   conv1 的 fixpipe   dst_M = midReal * wo1
+//   conv2 的 img2col   l1H   = midReal，上下用 padT2 / padB2 补回 midRows
+// 两者必须同时改 —— 这是「融合点的布局恒等式」，写偏一个 strip 就全错位。
+// ---------------------------------------------------------------------------
+struct BandLite {
+    int aMid;     // 这个 band 的第一行 conv1 输出（全局行号）
+    int midReal;  // 这个 band 真正算出来的 conv1 行数
+    int padT2, padB2;
+    int xRow0, xRows, padT1, padB1;
+    int outRow0;  // 这个 band 的第一行 conv2 输出（图内行号）
+    int m1;       // midReal * wo1
+    TileSpec t1;  // conv1 的 M 分块（对 midReal 行）
+};
+
+FC2D_GEOM_FN void MakeBandLite(const FlatGeom& f, int band, BandLite& b)
+{
+    b.outRow0 = band * f.hb;
+
+    const int raw = f.stride2 * f.hb * band - f.padH2;
+    b.aMid = MaxI(0, raw);
+    b.padT2 = b.aMid - raw;
+    const int wantRows = f.midRows - b.padT2;          // 窗口里还需要几行真实的 conv1 输出
+    b.midReal = MinI(wantRows, f.ho1 - b.aMid);
+    b.padB2 = f.midRows - b.padT2 - b.midReal;
+    b.m1 = b.midReal * f.wo1;
+
+    // conv1 侧：产出 mid 行 [aMid, aMid+midReal) 需要的 x 行区间，两头都可能被钳。
+    const int xRaw = f.stride1 * b.aMid - f.padH1;
+    const int xSpan = f.stride1 * (b.midReal - 1) + f.kh;
+    b.xRow0 = MaxI(0, xRaw);
+    b.padT1 = b.xRow0 - xRaw;
+    const int xEnd = MinI(f.hi, xRaw + xSpan);
+    b.xRows = xEnd - b.xRow0;
+    b.padB1 = xRaw + xSpan - xEnd;
+
+    b.t1 = MakeTileSpec(b.midReal, f.rowsMax1, f.gran1);
+}
+
+// ---------------------------------------------------------------------------
 // 某一个 chunk 的运行期窗口。**host 和 device 都调这个**，band 的 pad / 行数 /
 // 分块表只有这一份定义。
 //
@@ -389,29 +630,25 @@ struct Band {
 
 FC2D_GEOM_FN Band MakeBand(const Geometry& g, int chunk)
 {
+    FlatGeom f;
+    Flatten(g, 1, f);
+    BandLite lb;
+    MakeBandLite(f, chunk % g.nchunk, lb);
+
     Band b;
     b.img = chunk / g.nchunk;
     b.band = chunk % g.nchunk;
-    b.outRow0 = b.band * g.hb;
-
-    const int raw = g.p.stride2 * g.hb * b.band - g.p.padH2;
-    b.aMid = MaxI(0, raw);
-    b.padT2 = b.aMid - raw;
-    const int wantRows = g.midRows - b.padT2;             // 窗口里还需要几行真实的 conv1 输出
-    b.midReal = MinI(wantRows, g.ho1 - b.aMid);
-    b.padB2 = g.midRows - b.padT2 - b.midReal;
-    b.m1 = b.midReal * g.wo1;
-
-    // conv1 侧：产出 mid 行 [aMid, aMid+midReal) 需要的 x 行区间，两头都可能被钳。
-    const int xRaw = g.p.stride1 * b.aMid - g.p.padH1;
-    const int xSpan = g.p.stride1 * (b.midReal - 1) + g.p.kh;
-    b.xRow0 = MaxI(0, xRaw);
-    b.padT1 = b.xRow0 - xRaw;
-    const int xEnd = MinI(g.p.hi, xRaw + xSpan);
-    b.xRows = xEnd - b.xRow0;
-    b.padB1 = xRaw + xSpan - xEnd;
-
-    b.t1 = MakeTiles(b.midReal, g.rowsMax1, g.gran1);
+    b.aMid = lb.aMid;
+    b.midReal = lb.midReal;
+    b.padT2 = lb.padT2;
+    b.padB2 = lb.padB2;
+    b.xRow0 = lb.xRow0;
+    b.xRows = lb.xRows;
+    b.padT1 = lb.padT1;
+    b.padB1 = lb.padB1;
+    b.outRow0 = lb.outRow0;
+    b.m1 = lb.m1;
+    b.t1 = MakeTiles(lb.midReal, g.rowsMax1, g.gran1);
     b.t2 = MakeTiles(g.hb, g.rowsMax2, g.gran2);
     return b;
 }
@@ -520,16 +757,12 @@ FC2D_GEOM_FN int DeriveWithHb(const Params& p, int hb, int l1Budget, Geometry& g
         if ((midReal % g.gran1) != 0) {
             return RJ_MID_GRAN;
         }
-        const TileTable t = MakeTiles(midReal, g.rowsMax1, g.gran1);
-        if (t.n == 0) {
+        if (MakeTileSpec(midReal, g.rowsMax1, g.gran1).n == 0) {
             return RJ_M_TILES;
         }
     }
-    {
-        const TileTable t2 = MakeTiles(hb, g.rowsMax2, g.gran2);
-        if (t2.n == 0) {
-            return RJ_M_TILES;
-        }
+    if (MakeTileSpec(hb, g.rowsMax2, g.gran2).n == 0) {
+        return RJ_M_TILES;
     }
 
     // 片上缓冲。L0A 按最大的那个子块分，两个卷积取大。
