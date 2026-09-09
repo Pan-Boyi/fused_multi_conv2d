@@ -195,6 +195,43 @@ def singleop_json(spec):
     }]
 
 
+# ---------------------------------------------------------------- 两个 C++ 工具
+# 源码进仓，二进制不进（.gitignore 里就写着 gen_case / fc2d_geom）。所以
+# **每一次新克隆的第一次运行都会缺它们**，而且改过 fused_conv2d_shape.h 之后
+# 旧二进制还在、还能跑，只是按过期的几何算 —— 那种错比编译失败难查得多。
+#
+# 与其在报错里写一行「先编：g++ ...」让人照抄，不如脚本自己编：缺了就编，
+# 源码或任何一个头比二进制新也重编。两个工具都是单文件，几秒钟的事。
+TOOLS = {
+    # gen_case 要算 fp32 参考模型并和定点模型对账，**必须关掉 FMA 合并**，
+    # 否则参考值本身会随编译器优化漂，自检的容差就没有意义了。
+    "gen_case": ("gen_case.cpp", ["-ffp-contract=off"]),
+    "fc2d_geom": ("fc2d_geom.cpp", []),
+}
+
+
+def ensure_tool(name):
+    """返回可执行文件的路径，必要时先编出来。"""
+    exe = os.path.join(HERE, name)
+    srcname, extra = TOOLS[name]
+    src = os.path.join(HERE, srcname)
+    if not os.path.isfile(src):
+        die("找不到 %s —— 这个文件是进仓的，克隆不完整？" % src)
+    # 依赖就是同目录下所有头文件。两个工具各自只 include 其中一两个，但多编
+    # 几次的代价是几秒钟，漏编一次的代价是一批按旧几何算出来的结论。
+    deps = [src] + [os.path.join(HERE, h) for h in os.listdir(HERE) if h.endswith(".h")]
+    newest = max(os.path.getmtime(d) for d in deps)
+    if os.path.isfile(exe) and os.path.getmtime(exe) >= newest:
+        return exe
+    why = "还没编" if not os.path.isfile(exe) else "比源码旧"
+    cxx = os.environ.get("CXX", "g++")
+    argv = [cxx, "-std=c++17", "-O2"] + extra + [src, "-o", exe, "-I", HERE]
+    print("  [build] %s %s: %s" % (name, why, " ".join(argv)))
+    if run(argv) != 0:
+        die("编 %s 失败。手动跑一遍看完整报错：\n    %s" % (name, " ".join(argv)))
+    return exe
+
+
 # ---------------------------------------------------------------- 形状预检
 def do_check(c, l1):
     """在生成 case、编 .om 之前先问一句「这个形状算子能不能跑」。
@@ -206,11 +243,7 @@ def do_check(c, l1):
     没有这一步的话，形状不合法要等到 atc 失败才知道，而 atc 的原因只在
     ~/ascend/log/ 里，找起来很费劲。
     """
-    exe = os.path.join(HERE, "fc2d_geom")
-    if not os.path.isfile(exe):
-        print("  [!] 没有 fc2d_geom，跳过形状预检"
-              "（要用就编：g++ -std=c++17 -O2 -o fc2d_geom fc2d_geom.cpp -I.）")
-        return
+    exe = ensure_tool("fc2d_geom")
     ph1, pw1, ph2, pw2 = c["pads"]
     argv = [exe, "--dtype", c["dtype"],
             "--n", str(c["n"]), "--ci", str(c["ci"]), "--hi", str(c["hi"]), "--wi", str(c["wi"]),
@@ -225,9 +258,8 @@ def do_check(c, l1):
 
 # ---------------------------------------------------------------- 三个步骤
 def do_case(c, paths):
+    ensure_tool("gen_case")
     argv = gen_case_argv(c, paths["bin"])
-    if not os.path.isfile(argv[0]):
-        die("找不到 %s —— 先编：g++ -std=c++17 -O2 -ffp-contract=off gen_case.cpp -o gen_case -I." % argv[0])
     print("  " + " ".join(argv[1:]))
     rc = run(argv)
     if rc != 0:
@@ -322,7 +354,7 @@ def main():
         with open(dst, "w") as f:
             f.write(banner + body)
         print("已从 %s 重拷 fused_conv2d_shape.h" % src)
-        print("记得重编预检工具: g++ -std=c++17 -O2 -o fc2d_geom fc2d_geom.cpp -I.")
+        print("两个 C++ 工具会在下次用到时自动重编（头比二进制新）")
         return 0
 
     if not os.path.isfile(args.cases):

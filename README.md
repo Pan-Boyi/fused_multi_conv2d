@@ -2,11 +2,10 @@
 
 **改一个 json（`cases.json`）就能换形状**，别的地方不用动。
 
-```bash
-# 0) 一次性：编两个小工具（只要 g++，不需要 CANN，不需要设备）
-g++ -std=c++17 -O2 -ffp-contract=off gen_case.cpp  -o gen_case  -I.
-g++ -std=c++17 -O2                   fc2d_geom.cpp -o fc2d_geom -I.
+两个 C++ 小工具（`gen_case` / `fc2d_geom`）**不进仓**，脚本用到时自己编 ——
+缺了就编，源码或任何一个头比二进制新也重编。要 `g++`，不要 CANN，不要设备。
 
+```bash
 # 1) 看看清单里有哪些形状、算子能不能服务（不动任何文件）
 python3 fc2d.py cases.json --list
 python3 fc2d.py cases.json --steps check
@@ -183,12 +182,17 @@ python3 run_fused_conv2d.py out/base_fp16/case.bin FusedConv2d 0 out/base_fp16/o
 | `run_fused_conv2d.py` | 在板子上执行的那一端，由 `run_profile.py` 自动拷过去 |
 | `cases.json` | 可选。28 个形状 x 两条通路的功能清单。它只有形状、没有 remote 段，所以要这样接进来：<br>`python3 run_profile.py profile.json --cases cases.json --no-msprof` |
 
-两个要编的：
+两个 C++ 工具是**编出来的，不进仓**（`.gitignore` 里就是 `gen_case` / `fc2d_geom`）。
+不用手动编：`fc2d.py` 在用到它们之前会检查 —— 缺了就编，源码或同目录任何一个 `.h`
+比二进制新也重编，编译行会打在日志里。想自己编也行：
 
 ```bash
 g++ -std=c++17 -O2 -ffp-contract=off gen_case.cpp  -o gen_case  -I.
 g++ -std=c++17 -O2                   fc2d_geom.cpp -o fc2d_geom -I.
 ```
+
+`gen_case` 的 `-ffp-contract=off` 不是可选的：它要拿 fp32 参考模型和定点模型对账，
+开着 FMA 合并的话参考值本身会随编译器优化漂，自检的容差就没意义了。
 
 `fused_conv2d_shape.h` 是算子那份的副本。**算子那边改了几何就要重拷**：
 
@@ -196,7 +200,8 @@ g++ -std=c++17 -O2                   fc2d_geom.cpp -o fc2d_geom -I.
 python3 fc2d.py --sync-shape-header <ops-nn>/conv/fused_conv2d/op_kernel/fused_conv2d_shape.h
 ```
 
-然后重编 `fc2d_geom`。它是顾问性质的：真正说了算的永远是算子的 tiling，两边不一致时
-预检的结论会和 `atc` 不同,那本身就是「该重拷了」的信号。
+重拷之后不用管重编 —— 头变新了，下次用到 `fc2d_geom` 时会自动重来。它是顾问性质的：
+真正说了算的永远是算子的 tiling，两边不一致时预检的结论会和 `atc` 不同，那本身就是
+「该重拷了」的信号。
 
 产物 `out/` 和 `prof_out/` 都在 `.gitignore` 里,不进仓。
