@@ -173,6 +173,7 @@ class Remote(object):
         self.ssh_opts = list(cfg["ssh_opts"])
         self.target = "%s@%s" % (self.user, self.host) if self.user else self.host
         # 密码只从环境变量取，json 里不放 —— 那份 json 是要进仓的。
+        self.password_env = cfg["password_env"]
         self.password = os.environ.get(cfg["password_env"], "")
         self.use_sshpass = bool(self.password) and shutil.which("sshpass") is not None
         if self.password and not self.use_sshpass:
@@ -205,6 +206,31 @@ class Remote(object):
         how = "密码（sshpass）" if self.use_sshpass else "密钥"
         return "%s:%s  device=%d  repeat=%d  登录方式=%s" % (
             self.target, self.dir, self.device, self.repeat, how)
+
+
+def preflight(rt):
+    """在做任何本地重活之前先确认远端进得去。
+
+    没有这一步的话，一次 ssh 认证失败要等 check / case / om 全跑完（om 那步几十秒
+    起，还要 atc）才在 push 里冒出来，而且报出来是「远端建目录失败（rc=255）」——
+    255 是 ssh 自己没连上，和「建目录」一点关系都没有，看着像远端权限问题。
+    """
+    rc, _ = rt.ssh("true")
+    if rc == 0:
+        return
+    print()
+    print("[X] 连不上远端 %s（ssh 返回 %d）" % (rt.target, rc))
+    if rc == 255:
+        print("    255 是 **ssh 自己**没进去（认证失败 / 主机连不上），不是远端命令跑挂了。")
+        print("    ssh 自己的报错在上面几行，说明了是哪一种。")
+        print("    这个脚本认两种登录方式，这次选的是「%s」："
+              % ("密码（sshpass）" if rt.use_sshpass else "密钥"))
+        print("      密码 -> export %s='...'   （json 里不放密码，它是要进仓的）" % rt.password_env)
+        print("              本机还得有 sshpass，没有的话会**静默**退回密钥。")
+        print("      密钥 -> ssh-copy-id %s，之后手工 ssh 能免密进去就行。" % rt.target)
+    else:
+        print("    ssh 连上了，但远端连一条 `true` 都没跑通 —— 登录 shell 有问题？")
+    raise SystemExit(1)
 
 
 # ---------------------------------------------------------------- 远端脚本
@@ -283,7 +309,10 @@ def do_push(rt, c, paths, om_file):
     wd = "%s/%s" % (rt.dir.rstrip("/"), c["name"])
     rc, _ = rt.ssh("rm -rf %s && mkdir -p %s" % (shlex.quote(wd), shlex.quote(wd)))
     if rc != 0:
-        raise RuntimeError("远端建目录失败（rc=%d）" % rc)
+        raise RuntimeError(
+            "远端建目录失败（rc=%d）%s" % (rc,
+            "—— 255 是 ssh 自己没连上（认证失败/主机不可达），不是 mkdir 失败" if rc == 255
+            else "—— ssh 进去了，是远端 mkdir 没成功：%s 下有写权限吗？" % rt.dir))
     # 每条 case 一个干净目录。**不复用**：aclopSetModelDir 会把目录下所有 .om 都
     # 装进去，留着上一个形状的那个，它可能反而先匹配上，跑出来的是上个形状的结果，
     # 而且不报错。
@@ -527,6 +556,10 @@ def main():
                  c["fixed_shift"][0], c["fixed_shift"][1]))
     if args.list:
         return 0
+
+    # 远端先探一次。放在 om 之前 —— 进不去的话没必要先花几十秒编 .om。
+    if {"push", "prof", "pull"} & set(steps):
+        preflight(rt)
 
     # 本地 CANN。出 om 要 atc，所以在这里 source，调用方不必自己先 source。
     if "om" in steps:
