@@ -52,18 +52,26 @@ FusedConv2d 上板执行 + profiling 的总驱动 —— **全部配置来自一
 中间没有第二份形状。前四步的实现直接复用 fc2d.py，不另写一份。
 
 ================================================================================
-密码
+登录远端
 ================================================================================
 **json 里不放密码。** 原来的 run_profile.sh 把密码写在脚本里，那份脚本是要进仓的。
-这里改成：
-    有 sshpass 且环境变量（默认 FC2D_REMOTE_PASSWORD）里有密码  -> 用密码
-    否则                                                        -> 直接 ssh，走密钥
-所以用法是
+这里密码只从环境变量取（默认 FC2D_REMOTE_PASSWORD），用 sshpass -e 传给 ssh ——
+不是 -p，-p 会把密码放进**命令行参数**，同一台机器上任何人 ps 一下就看见了。
 
-    export FC2D_REMOTE_PASSWORD='...'
+方式由 remote.auth 定，三个值：
+
+    "password"  这台机器**只认密码**，公钥登录是禁掉的（板子机常见）。
+                缺环境变量或缺 sshpass 时直接停下并说缺什么。
+    "key"       免密登录。
+    "auto"      有密码且有 sshpass 就用密码，否则走密钥。**有陷阱**：在只认密码
+                的机器上，没装 sshpass 会不声不响地退回密钥，而那条路必然失败，
+                报出来是一句和认证毫无关系的「远端建目录失败（rc=255）」。
+
+    read -s -p '远端密码: ' FC2D_REMOTE_PASSWORD && export FC2D_REMOTE_PASSWORD
     python3 run_profile.py profile.json
 
-或者配好免密登录，什么都不用设。
+用 read 是为了不让密码进 shell 历史。凭据只在真要连远端时才检查 ——
+--steps check,case,om 那几步不碰远端，不设密码也能跑。
 """
 import argparse
 import csv
@@ -95,6 +103,12 @@ REMOTE_DEFAULTS = {
     "host": "",
     "user": "",
     "password_env": "FC2D_REMOTE_PASSWORD",
+    # 登录方式。"password" / "key" / "auto"。
+    # **有些板子机禁掉了公钥登录，只认密码。** 那种环境下 "auto" 是个陷阱：本机
+    # 没装 sshpass 时它会不声不响地退回密钥，而密钥在那儿根本不可能成功 ——
+    # 表现是一句和认证毫无关系的「远端建目录失败（rc=255）」。写死 "password"
+    # 就会在开工之前直接说清楚缺什么。
+    "auth": "auto",
     "dir": "",                 # 远端工作目录，脚本会在下面建 fc2d_run/<name>/
     "cann_env": "",            # 远端要 source 的 set_env.sh，空 = 不 source
     "device": 0,
@@ -175,35 +189,78 @@ class Remote(object):
         # 密码只从环境变量取，json 里不放 —— 那份 json 是要进仓的。
         self.password_env = cfg["password_env"]
         self.password = os.environ.get(cfg["password_env"], "")
-        self.use_sshpass = bool(self.password) and shutil.which("sshpass") is not None
-        if self.password and not self.use_sshpass:
-            print("[!] 设了密码但找不到 sshpass，改走密钥登录")
+        self.auth = cfg["auth"]
+        if self.auth not in ("auto", "password", "key"):
+            die("remote.auth 只能是 auto / password / key，当前是 %r" % self.auth)
+        has_sshpass = shutil.which("sshpass") is not None
+
+        # **不在这里 die。** 只跑本地几步（check / case / om，「在有 CANN 的机器上
+        # 出数据和 .om，再把目录整个搬到板子机上」正是 README 写的用法）时根本不
+        # 需要凭据，构造函数里一刀切会把那条路也堵死。缺什么先记下来，等 preflight
+        # 真要连远端时再报。
+        self.auth_missing = []
+        if self.auth == "key":
+            self.use_sshpass = False
+        elif self.auth == "password":
+            # 声明了只能走密码，就没有「退回密钥」这一说 —— 那条路在这种机器上
+            # 必然失败，退回去只是把失败推迟成一条看不出原因的报错。
+            missing = []
+            if not self.password:
+                missing.append("环境变量 %s 没设（json 里不放密码，那份 json 要进仓）"
+                               % self.password_env)
+            if not has_sshpass:
+                missing.append("本机没有 sshpass（Ubuntu/Debian: sudo apt install -y sshpass;"
+                               " CentOS/openEuler: sudo yum install -y sshpass）")
+            self.auth_missing = missing
+            self.use_sshpass = not missing
+        else:  # auto
+            self.use_sshpass = bool(self.password) and has_sshpass
+            if self.password and not has_sshpass:
+                print("[!] 设了 %s 但本机没有 sshpass，只能退回密钥。\n"
+                      "    那台机器要是禁了公钥登录，这一步注定失败 —— 把 profile.json 的\n"
+                      "    remote.auth 改成 \"password\"，就会在这里直接停下并说缺什么。"
+                      % self.password_env)
 
     def _prefix(self):
-        return ["sshpass", "-p", self.password] if self.use_sshpass else []
+        # -e 从环境变量 SSHPASS 读，不是 -p。-p 会把密码放进**命令行参数**，
+        # 同一台机器上任何人 ps 一下就看见了。
+        return ["sshpass", "-e"] if self.use_sshpass else []
+
+    def _env(self):
+        """给子进程的环境。只有走密码时才多一个 SSHPASS。"""
+        if not self.use_sshpass:
+            return None
+        e = dict(os.environ)
+        e["SSHPASS"] = self.password
+        return e
 
     def ssh(self, remote_cmd, stdin_script=None, capture=False):
         argv = self._prefix() + ["ssh"] + self.ssh_opts + [self.target, remote_cmd]
         sys.stdout.flush()
         if stdin_script is not None:
-            p = subprocess.run(argv, input=stdin_script.encode(),
+            p = subprocess.run(argv, input=stdin_script.encode(), env=self._env(),
                                stdout=subprocess.PIPE if capture else None, check=False)
             return p.returncode, (p.stdout.decode(errors="replace") if capture else "")
-        p = subprocess.run(argv, stdout=subprocess.PIPE if capture else None, check=False)
+        p = subprocess.run(argv, env=self._env(),
+                           stdout=subprocess.PIPE if capture else None, check=False)
         return p.returncode, (p.stdout.decode(errors="replace") if capture else "")
 
     def scp_to(self, local, remote_path, recursive=False):
         argv = self._prefix() + ["scp"] + (["-r"] if recursive else []) + self.ssh_opts + \
             [local, "%s:%s" % (self.target, remote_path)]
-        return run(argv)
+        return run(argv, env=self._env())
 
     def scp_from(self, remote_path, local, recursive=False):
         argv = self._prefix() + ["scp"] + (["-r"] if recursive else []) + self.ssh_opts + \
             ["%s:%s" % (self.target, remote_path), local]
-        return run(argv)
+        return run(argv, env=self._env())
 
     def describe(self):
-        how = "密码（sshpass）" if self.use_sshpass else "密钥"
+        how = "密码（sshpass -e）" if self.use_sshpass else "密钥"
+        if self.auth == "password" and self.auth_missing:
+            how = "密码（**还不能用**，见下）"
+        if self.auth != "auto":
+            how += "，auth=%s" % self.auth
         return "%s:%s  device=%d  repeat=%d  登录方式=%s" % (
             self.target, self.dir, self.device, self.repeat, how)
 
@@ -215,6 +272,13 @@ def preflight(rt):
     起，还要 atc）才在 push 里冒出来，而且报出来是「远端建目录失败（rc=255）」——
     255 是 ssh 自己没连上，和「建目录」一点关系都没有，看着像远端权限问题。
     """
+    if rt.auth_missing:
+        die("remote.auth = \"password\"（这台机器只认密码，公钥是禁掉的），但还缺：\n    - "
+            + "\n    - ".join(rt.auth_missing) +
+            "\n\n  设密码用 read，别让它进 shell 历史：\n"
+            "    read -s -p '远端密码: ' %s && export %s\n\n"
+            "  只想在本机出数据和 .om、之后手工搬过去的话，加 --steps check,case,om 就行，"
+            "那几步不碰远端。" % (rt.password_env, rt.password_env))
     rc, _ = rt.ssh("true")
     if rc == 0:
         return
@@ -223,11 +287,19 @@ def preflight(rt):
     if rc == 255:
         print("    255 是 **ssh 自己**没进去（认证失败 / 主机连不上），不是远端命令跑挂了。")
         print("    ssh 自己的报错在上面几行，说明了是哪一种。")
-        print("    这个脚本认两种登录方式，这次选的是「%s」："
-              % ("密码（sshpass）" if rt.use_sshpass else "密钥"))
-        print("      密码 -> export %s='...'   （json 里不放密码，它是要进仓的）" % rt.password_env)
-        print("              本机还得有 sshpass，没有的话会**静默**退回密钥。")
-        print("      密钥 -> ssh-copy-id %s，之后手工 ssh 能免密进去就行。" % rt.target)
+        if rt.use_sshpass:
+            print("    这次走的是密码（sshpass -e），密码取自环境变量 %s。" % rt.password_env)
+            print("    密码错了 ssh 会说 Permission denied；主机不通会说 Connection timed out。")
+        elif rt.auth == "key":
+            print("    这次走的是密钥（remote.auth = \"key\"）。")
+            print("    手工 ssh %s 能免密进去吗？不能的话先 ssh-copy-id。" % rt.target)
+        else:
+            print("    这次走的是**密钥** —— 因为 %s 没设，或者本机没有 sshpass。" % rt.password_env)
+            print("    那台机器要是禁了公钥登录（不少板子机是这样），这条路怎么试都不会成功：")
+            print("      1) profile.json 里把 remote.auth 写成 \"password\"")
+            print("      2) sudo apt install -y sshpass   （或 yum install -y sshpass）")
+            print("      3) read -s -p '远端密码: ' %s && export %s"
+                  % (rt.password_env, rt.password_env))
     else:
         print("    ssh 连上了，但远端连一条 `true` 都没跑通 —— 登录 shell 有问题？")
     raise SystemExit(1)

@@ -26,7 +26,9 @@ python3 fc2d.py cases.json --steps run
 `atc`，另一台插着 5102。`run_profile.py` 覆盖这种情况,并且把 profiling 一起做了。
 
 ```bash
-export FC2D_REMOTE_PASSWORD='...'          # 配了免密就不用这一步
+# 远端登录。profile.json 里 remote.auth = "password"：那台机器只认密码，公钥禁掉了。
+# 用 read 是为了不让密码进 shell 历史；还需要本机有 sshpass（apt/yum install sshpass）。
+read -s -p '远端密码: ' FC2D_REMOTE_PASSWORD && export FC2D_REMOTE_PASSWORD
 python3 run_profile.py profile.json
 ```
 
@@ -57,7 +59,10 @@ python3 run_profile.py profile.json
   变慢,不会让它变快,所以最小值是对"这个 kernel 本身有多快"掺杂噪声最少的估计。
   行数和均值也一并给出,好判断抖动有多大。
 - **密码不写进 json。** 那份 json 是要进仓的。密码从 `remote.password_env` 指定的
-  环境变量读,没设就走密钥。
+  环境变量读,用 sshpass -e 传（不是 -p —— 那会把密码放进命令行，ps 一下就看见）。
+  方式由 remote.auth 定：password / key / auto。只认密码的机器要写 password，
+  auto 在那种机器上会不声不响地退回密钥然后失败。
+  凭据只在真要连远端时才查,--steps check,case,om 不设密码也能跑。
 
 `profile.json` 比 `cases.json` 多三段:
 
