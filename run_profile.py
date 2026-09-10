@@ -121,6 +121,11 @@ REMOTE_DEFAULTS = {
 
 PROFILE_DEFAULTS = {
     "enabled": True,
+    # 远端 msprof 的**绝对路径，写死，不搜 PATH**。
+    # 搜 PATH 有两种错法，而且都不响：远端那个 ssh 是非交互 shell，读不到
+    # ~/.bashrc 里 source 的 set_env.sh，于是明明装了也说「PATH 里没有」；
+    # 或者机器上有好几套 CANN，搜到的不是这次要用的那一套，数据照出、来源不明。
+    "msprof": "/var/msprof",
     "tbe_work_test_suit": "",  # 本地 TbeWorkTestSuit，用它的 msprof.py export summary
     "columns": DEFAULT_COLUMNS,
 }
@@ -306,11 +311,12 @@ def preflight(rt):
 
 
 # ---------------------------------------------------------------- 远端脚本
-def remote_script(rt, case_name, om_name, use_msprof):
+def remote_script(rt, case_name, om_name, use_msprof, msprof):
     """生成在远端跑的那段 bash。
 
     它自己做三件本地做不了的事：
-      1. 检查 msprof / case / om 在不在，不在就明确说哪个不在
+      1. 检查 msprof / case / om 在不在，不在就明确说哪个不在。msprof 用的是
+         profile.msprof 给死的绝对路径，**不搜 PATH**
       2. 执行前后各记一次 PROF_* 目录，用差集找出**本次**新生成的那个 ——
          目录名里带时间戳，靠"最新"去猜在并发或重跑时会拿错
       3. 只往 stdout 打一行 PROF 目录名，别的全走 stderr，这样调用方能直接读
@@ -332,10 +338,15 @@ def remote_script(rt, case_name, om_name, use_msprof):
         "done",
     ]
     if use_msprof:
+        q = shlex.quote(msprof)
         lines += [
-            "command -v msprof >/dev/null 2>&1 || { "
-            "echo '[REMOTE ERROR] PATH 里没有 msprof' >&2; echo \"PATH=$PATH\" >&2; exit 127; }",
-            "echo \"[REMOTE] msprof = $(command -v msprof)\" >&2",
+            # 路径是配置给死的，不搜 PATH。只做一件事：确认它真的能执行。
+            # 顺手认一下「给的是目录」这种写法（有的安装把 msprof 放在一个目录里）。
+            "MSPROF=%s" % q,
+            "if [ -d \"$MSPROF\" ]; then MSPROF=\"$MSPROF/msprof\"; fi",
+            "[ -x \"$MSPROF\" ] || { echo \"[REMOTE ERROR] $MSPROF 不存在或不可执行\" >&2; "
+            "echo '  这个路径来自 profile.json 的 profile.msprof，改那里' >&2; exit 127; }",
+            "echo \"[REMOTE] msprof = $MSPROF\" >&2",
             "BEFORE=$(mktemp); AFTER=$(mktemp)",
             "trap 'rm -f \"$BEFORE\" \"$AFTER\"' EXIT",
             "find . -maxdepth 1 -mindepth 1 -type d -name 'PROF_*' -printf '%f\\n' | sort > \"$BEFORE\"",
@@ -348,7 +359,7 @@ def remote_script(rt, case_name, om_name, use_msprof):
     exec_cmd = "python3 run_fused_conv2d.py case.bin FusedConv2d %d %s" % (
         rt.device, shlex.quote(om_name))
     if use_msprof:
-        exec_cmd = "msprof " + exec_cmd
+        exec_cmd = "\"$MSPROF\" " + exec_cmd
     lines += [
         "%s >&2" % exec_cmd,
         "RC=$?",
@@ -402,8 +413,8 @@ def do_push(rt, c, paths, om_file):
     print("[OK] 已拷到 %s:%s" % (rt.target, wd))
 
 
-def do_prof(rt, c, om_file, use_msprof, show_script=False):
-    script = remote_script(rt, c["name"], os.path.basename(om_file), use_msprof)
+def do_prof(rt, c, om_file, use_msprof, msprof, show_script=False):
+    script = remote_script(rt, c["name"], os.path.basename(om_file), use_msprof, msprof)
     if show_script:
         print("---- 远端将执行 ----")
         print(script)
@@ -672,7 +683,8 @@ def main():
                 do_push(rt, c, paths, om_file)
             prof = None
             if "prof" in steps:
-                prof = do_prof(rt, c, om_file, use_msprof, args.print_remote_script)
+                prof = do_prof(rt, c, om_file, use_msprof, prof_cfg["msprof"],
+                               args.print_remote_script)
             if "pull" in steps and prof:
                 local_prof = do_pull(rt, c, prof, prof_root)
                 if "export" in steps:

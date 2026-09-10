@@ -21,7 +21,12 @@
     "remote.auth = password 是说这台机器**只能**密码登录，公钥是禁掉的。所以",
     "缺环境变量或缺 sshpass 时脚本会直接停，而不是不声不响地退回密钥 —— 退回去",
     "必然失败，而且报出来是一句和认证毫无关系的「远端建目录失败」。",
-    "换一台能免密的机器就把它改成 key 或 auto。"
+    "换一台能免密的机器就把它改成 key 或 auto。",
+    "",
+    "profile.msprof 是远端 msprof 的**绝对路径，写死，不搜 PATH**。远端那个 ssh 是",
+    "非交互 shell，读不到 ~/.bashrc 里 source 的 set_env.sh —— 搜 PATH 会说「没有",
+    "msprof」而其实装着；机器上有好几套 CANN 时还可能搜到不是这次要用的那一套。",
+    "给目录也行，脚本会自动接一层 /msprof。"
   ],
 
   "soc_version": "MC62CM12AA",
@@ -41,6 +46,7 @@
 
   "profile": {
     "enabled": true,
+    "msprof": "/var/msprof",
     "tbe_work_test_suit": "/home/p84341448/TbeWorkTestSuit"
   },
 
