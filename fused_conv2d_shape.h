@@ -223,12 +223,12 @@ enum Reject {
     RJ_ELEM_BYTES,     // elemBytes 只能是 1 或 2
     RJ_SHAPE_POSITIVE, // 有维度 <= 0
     RJ_CHANNEL_C0,     // ci 或 cout1 不是 C0 的整数倍
-    RJ_CHANNEL_16,     // cout1 / cout2 不是 16 的整数倍（fixpipe 的 NZ nSize）
+    RJ_CHANNEL_16,     // cout1 不是 16 的整数倍（mid 要按 NC1HWC0 读）
     RJ_OUT_EMPTY,      // 卷出来是空的
     RJ_HB_DIVIDE,      // hb 不整除 ho2
-    RJ_HB_GRAN,        // hb 不是 conv2 行粒度的整数倍
+    RJ_HB_GRAN,        // 【已不再产生】M 切到行内之后没有行粒度这回事了
     RJ_MIDROWS,        // 一个 band 的 conv1 行数超过了 ho1
-    RJ_MID_GRAN,       // 某个 band 的 conv1 行数不是 conv1 行粒度的整数倍
+    RJ_MID_GRAN,       // 【已不再产生】同上
     RJ_TILE_K,         // 找不到合法的 K 切分
     RJ_M_TILES,        // M 方向切出来的块数超过 MAX_M_TILES
     RJ_L0C,            // 一个 M 子块装不进 L0C
@@ -251,7 +251,7 @@ FC2D_GEOM_FN const char* RejectText(int r)
         case RJ_ELEM_BYTES: return "elemBytes 只能是 1(int8) 或 2(fp16)";
         case RJ_SHAPE_POSITIVE: return "形状里有非正数";
         case RJ_CHANNEL_C0: return "ci 和 cout1 必须是 C0 的整数倍（C0 = 32/elemBytes）";
-        case RJ_CHANNEL_16: return "cout1 / cout2 必须是 16 的整数倍（fixpipe 的 NZ nSize）";
+        case RJ_CHANNEL_16: return "cout1 必须是 16 的整数倍（mid 要被 conv2 当 NC1HWC0 读）";
         case RJ_OUT_EMPTY: return "卷积输出为空（kernel 比补零后的输入还大）";
         case RJ_HB_DIVIDE: return "band 高度不整除 ho2";
         case RJ_HB_GRAN: return "band 高度不是 conv2 行粒度的整数倍（hb*wo2 要 16 对齐）";
@@ -279,7 +279,6 @@ struct Geometry {
     int c0, c1, midC1;
     int ho1, wo1, ho2, wo2;
     int k1, k2;          // 两个卷积的矩阵乘 K = C1*kh*kw*C0
-    int gran1, gran2;    // M 行粒度：rows*wo 必须 16 对齐
 
     int hb, nchunk;      // 每个 band 出多少行 conv2 输出 / 一张图几个 band
     int chunkTotal;      // n * nchunk
@@ -289,7 +288,7 @@ struct Geometry {
     int m1Max;           // midRows * wo1，mid 的 NZ M 上限
 
     int tileK1, tileK2;              // 每条 img2col 灌多少 K
-    int rowsMax1, rowsMax2;          // 一个 M 子块最多几行
+    int mMax1, mMax2;                // 一个 M 子块最多几个位置（不是行）
     int l0bChunks1, l0bChunkK1, tilesPerChunk1;  // 权重按 K 折几段
     int l0bChunks2, l0bChunkK2, tilesPerChunk2;
 
@@ -310,54 +309,57 @@ struct Geometry {
     int fz1K, fz1N, fz2K, fz2N;
 };
 
-// K 切分和 M 行数是互相牵制的：tileK 越大，一个 L0A 槽装得下的 M 越小。
-// 这里对每个候选 tileK（C0 的整数倍且整除 K）算出对应的 rowsMax，取「M 块数最少、
+// K 切分和 M 大小是互相牵制的：tileK 越大，一个 L0A 槽装得下的 M 越小。
+// 这里对每个候选 tileK（C0 的整数倍且整除 K）算出对应的 mMax，取「M 块数最少、
 // 并列时 tileK 最大」的那个 —— M 块数直接等于 fixpipe 的轮数。
+//
+// **M 的单位是「位置」，不是「行」。** 上一版按整行切，于是一行放不进 L0C 的形状
+// （比如 wo1 = 1788、cout1 = 64：align16(1788)*64 = 114,688 > 65,536）根本无解，
+// 而且行数还得是 16/gcd(wo,16) 的整数倍。切到行内之后这两条限制都不存在了 ——
+// 依据是 tests/ut/op_kernel 里那两条探针：img2col 的 mStartPt/mExtension 和
+// fixpipe 的 mSize/strip 跨距都**不要求** 16 对齐（CPU 仿真结论，真机待确认）。
 struct KChoice {
     int tileK;
-    int rowsMax;
+    int mMax;    // 一个 M 子块最多几个**位置**（不是行）
     int nTiles;
     bool ok;
 };
 
-FC2D_GEOM_FN KChoice PickTileK(int k, int c0, int elemBytes, int wo, int cout, int totalRows, int gran)
+FC2D_GEOM_FN KChoice PickTileK(int k, int c0, int elemBytes, int cout, int totalM)
 {
     KChoice best;
     best.tileK = 0;
-    best.rowsMax = 0;
+    best.mMax = 0;
     best.nTiles = 0;
     best.ok = false;
-    if (k <= 0 || c0 <= 0 || wo <= 0 || cout <= 0 || totalRows <= 0 || gran <= 0) {
+    if (k <= 0 || c0 <= 0 || cout <= 0 || totalM <= 0) {
         return best;
     }
-    // L0C 的上限和 tileK 无关：align16(rows*wo) * cout <= 65,536 个 int32。
-    const int mCapC = L0C_ELEMS / cout;
+    // L0C 的上限和 tileK 无关：align16(m) * align16(cout) <= 65,536 个 int32。
+    const int mCapC = L0C_ELEMS / Align(cout, MMAD_M0);
     for (int tk = c0; tk <= k; tk += c0) {
         if ((k % tk) != 0) {
             continue;
         }
-        // L0A 一槽：align16(rows*wo) * tileK * elemBytes <= 32,768
+        // L0A 一槽：align16(m) * tileK * elemBytes <= 32,768
         const int mCapA = L0A_SLOT_BYTES / (tk * elemBytes);
-        const int mCap = MinI(mCapA, mCapC);
-        int rows = mCap / wo;
-        rows = rows / gran * gran;
-        if (rows < gran) {
+        // 往下取到 16 的整数倍：容量算的是 align16(m)，m 本身不对齐时会往上补，
+        // 取整之后「m <= mMax」就等价于「align16(m) <= 容量」，不用再判一次。
+        int mMax = MinI(mCapA, mCapC) / MMAD_M0 * MMAD_M0;
+        if (mMax <= 0) {
             continue;
         }
-        if (rows > totalRows) {
-            rows = totalRows / gran * gran;
-            if (rows < gran) {
-                continue;
-            }
+        if (mMax > totalM) {
+            mMax = totalM;
         }
-        const int nT = CeilDiv(totalRows / gran, rows / gran);
+        const int nT = CeilDiv(totalM, mMax);
         if (nT > MAX_M_TILES) {
             continue;
         }
         // 并列时取更大的 tileK：一条 mmad 干更多活，指令数更少。
         if (!best.ok || nT < best.nTiles || (nT == best.nTiles && tk > best.tileK)) {
             best.tileK = tk;
-            best.rowsMax = rows;
+            best.mMax = mMax;
             best.nTiles = nT;
             best.ok = true;
         }
@@ -416,7 +418,7 @@ struct FlatGeom {
     int c0, ho1, wo1, ho2, wo2, k1, k2;
     int hb, nchunk, chunkTotal, chunksPerCore;
     int midRows;                 // 一个 band 的窗口跨度（含补零）
-    int gran1, rowsMax1;         // conv1 的 M 分块参数（逐 band 现算用）
+    int mMax1;                   // conv1 的 M 子块上限（位置数），逐 band 现算用
     int tileK1, tileK2;
     int l0bChunks1, l0bChunkK1, tilesPerChunk1;
     int l0bChunks2, l0bChunkK2, tilesPerChunk2;
@@ -427,7 +429,7 @@ struct FlatGeom {
     // ---- GM 侧 ----
     int xPlane, yPlane, yPlaneM;
     // ---- conv2 的 M 分块表：每个 band 都一样，直接下发展开好的三个标量 ----
-    int t2n, t2base, t2extra, gran2;
+    int t2n, t2base, t2extra;
 };
 
 // FlatGeom 的字段清单：X(FlatGeom 里的名字, tiling 里的名字)。
@@ -462,8 +464,7 @@ struct FlatGeom {
     X(chunkTotal, chunkTotal) \
     X(chunksPerCore, chunksPerCore) \
     X(midRows, midRows)       \
-    X(gran1, gran1)           \
-    X(rowsMax1, rowsMax1)     \
+    X(mMax1, mMax1)           \
     X(tileK1, tileK1)         \
     X(tileK2, tileK2)         \
     X(l0bChunks1, l0bChunks1) \
@@ -490,8 +491,7 @@ struct FlatGeom {
     X(yPlaneM, yPlaneM)       \
     X(t2n, t2n)               \
     X(t2base, t2base)         \
-    X(t2extra, t2extra)       \
-    X(gran2, gran2)
+    X(t2extra, t2extra)
 
 FC2D_GEOM_FN void Flatten(const Geometry& g, int chunksPerCore, FlatGeom& f)
 {
@@ -525,8 +525,7 @@ FC2D_GEOM_FN void Flatten(const Geometry& g, int chunksPerCore, FlatGeom& f)
     f.chunksPerCore = chunksPerCore;
 
     f.midRows = g.midRows;
-    f.gran1 = g.gran1;
-    f.rowsMax1 = g.rowsMax1;
+    f.mMax1 = g.mMax1;
     f.tileK1 = g.tileK1;
     f.tileK2 = g.tileK2;
     f.l0bChunks1 = g.l0bChunks1;
@@ -554,11 +553,11 @@ FC2D_GEOM_FN void Flatten(const Geometry& g, int chunksPerCore, FlatGeom& f)
     f.yPlane = g.yPlane;
     f.yPlaneM = g.ho2 * g.wo2;
 
-    const TileSpec t2 = MakeTileSpec(g.hb, g.rowsMax2, g.gran2);
+    // conv2 的 M 空间是「一个 band 的全部输出位置」，不是行数。
+    const TileSpec t2 = MakeTileSpec(g.hb * g.wo2, g.mMax2, 1);
     f.t2n = t2.n;
     f.t2base = t2.base;
     f.t2extra = t2.extra;
-    f.gran2 = g.gran2;
 }
 
 // ---------------------------------------------------------------------------
@@ -606,7 +605,8 @@ FC2D_GEOM_FN void MakeBandLite(const FlatGeom& f, int band, BandLite& b)
     b.xRows = xEnd - b.xRow0;
     b.padB1 = xRaw + xSpan - xEnd;
 
-    b.t1 = MakeTileSpec(b.midReal, f.rowsMax1, f.gran1);
+    // conv1 的 M 空间同理：midReal 行 x wo1 列的**全部位置**，可以切到行内。
+    b.t1 = MakeTileSpec(b.m1, f.mMax1, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -656,8 +656,8 @@ FC2D_GEOM_FN Band MakeBand(const Geometry& g, int chunk)
     b.padB1 = lb.padB1;
     b.outRow0 = lb.outRow0;
     b.m1 = lb.m1;
-    b.t1 = MakeTiles(lb.midReal, g.rowsMax1, g.gran1);
-    b.t2 = MakeTiles(g.hb, g.rowsMax2, g.gran2);
+    b.t1 = MakeTiles(lb.m1, g.mMax1, 1);
+    b.t2 = MakeTiles(g.hb * g.wo2, g.mMax2, 1);
     return b;
 }
 
@@ -681,7 +681,14 @@ FC2D_GEOM_FN int DeriveWithHb(const Params& p, int hb, int l1Budget, Geometry& g
     if ((p.ci % g.c0) != 0 || (p.cout1 % g.c0) != 0) {
         return RJ_CHANNEL_C0;
     }
-    if ((p.cout1 % MMAD_M0) != 0 || (p.cout2 % MMAD_M0) != 0) {
+    // cout1 要 16 对齐（其实更严：下面 ci/cout1 还要是 C0 的整数倍）—— mid 要被
+    // conv2 当 NC1HWC0 读，通道必须整分成 C0 一组。
+    //
+    // **cout2 不需要。** 它只出现在 conv2 的出口，fixpipe 按 COLUMN_MAJOR 直接写
+    // 到 GM，nSize 给多少写多少；L0B / L0C 那边用的是 align16(cout2)。上一版把它
+    // 和 cout1 一起卡了 16，于是 cout2 = 2 这种（FRACTAL_Z 里补齐成 [.., 1, 16, C0]）
+    // 直接被拒 —— 而 filter 的 shape 根本分不出 cout2 是 1 还是 16，得从 y 去取。
+    if ((p.cout1 % MMAD_M0) != 0) {
         return RJ_CHANNEL_16;
     }
     g.c1 = p.ci / g.c0;
@@ -705,16 +712,8 @@ FC2D_GEOM_FN int DeriveWithHb(const Params& p, int hb, int l1Budget, Geometry& g
     g.fz2K = g.midC1 * p.kh * p.kw;
     g.fz2N = CeilDiv(p.cout2, MMAD_M0);
 
-    // M 的行粒度。mmad 的 mStartPt / mExtension 都要 16 对齐，而它们是
-    // rows*wo，所以 rows 必须是 16/gcd(wo,16) 的整数倍。
-    g.gran1 = MMAD_M0 / GcdI(g.wo1, MMAD_M0);
-    g.gran2 = MMAD_M0 / GcdI(g.wo2, MMAD_M0);
-
     if ((g.ho2 % hb) != 0) {
         return RJ_HB_DIVIDE;
-    }
-    if ((hb % g.gran2) != 0) {
-        return RJ_HB_GRAN;
     }
     g.hb = hb;
     g.nchunk = g.ho2 / hb;
@@ -735,15 +734,15 @@ FC2D_GEOM_FN int DeriveWithHb(const Params& p, int hb, int l1Budget, Geometry& g
     }
 
     // K 切分 + M 分块。conv1 对 midRows 行，conv2 对 hb 行。
-    const KChoice kc1 = PickTileK(g.k1, g.c0, p.elemBytes, g.wo1, p.cout1, midRowsCap, g.gran1);
-    const KChoice kc2 = PickTileK(g.k2, g.c0, p.elemBytes, g.wo2, p.cout2, hb, g.gran2);
+    const KChoice kc1 = PickTileK(g.k1, g.c0, p.elemBytes, p.cout1, midRowsCap * g.wo1);
+    const KChoice kc2 = PickTileK(g.k2, g.c0, p.elemBytes, p.cout2, hb * g.wo2);
     if (!kc1.ok || !kc2.ok) {
         return RJ_TILE_K;
     }
     g.tileK1 = kc1.tileK;
-    g.rowsMax1 = kc1.rowsMax;
+    g.mMax1 = kc1.mMax;
     g.tileK2 = kc2.tileK;
-    g.rowsMax2 = kc2.rowsMax;
+    g.mMax2 = kc2.mMax;
 
     if (!PickL0bChunks(p.cout1, g.k1, p.elemBytes, g.tileK1, g.l0bChunks1, g.l0bChunkK1) ||
         !PickL0bChunks(p.cout2, g.k2, p.elemBytes, g.tileK2, g.l0bChunks2, g.l0bChunkK2)) {
@@ -762,20 +761,17 @@ FC2D_GEOM_FN int DeriveWithHb(const Params& p, int hb, int l1Budget, Geometry& g
         if (midReal <= 0) {
             return RJ_MIDROWS;
         }
-        if ((midReal % g.gran1) != 0) {
-            return RJ_MID_GRAN;
-        }
-        if (MakeTileSpec(midReal, g.rowsMax1, g.gran1).n == 0) {
+        if (MakeTileSpec(midReal * g.wo1, g.mMax1, 1).n == 0) {
             return RJ_M_TILES;
         }
     }
-    if (MakeTileSpec(hb, g.rowsMax2, g.gran2).n == 0) {
+    if (MakeTileSpec(hb * g.wo2, g.mMax2, 1).n == 0) {
         return RJ_M_TILES;
     }
 
     // 片上缓冲。L0A 按最大的那个子块分，两个卷积取大。
-    const int l0a1 = Align(g.rowsMax1 * g.wo1, MMAD_M0) * g.tileK1 * p.elemBytes;
-    const int l0a2 = Align(g.rowsMax2 * g.wo2, MMAD_M0) * g.tileK2 * p.elemBytes;
+    const int l0a1 = Align(g.mMax1, MMAD_M0) * g.tileK1 * p.elemBytes;
+    const int l0a2 = Align(g.mMax2, MMAD_M0) * g.tileK2 * p.elemBytes;
     if (l0a1 > L0A_SLOT_BYTES || l0a2 > L0A_SLOT_BYTES) {
         return RJ_TILE_K;
     }
@@ -789,8 +785,8 @@ FC2D_GEOM_FN int DeriveWithHb(const Params& p, int hb, int l1Budget, Geometry& g
     }
     g.l0bElems = l0bMax / p.elemBytes;
 
-    const int l0c1 = Align(g.rowsMax1 * g.wo1, MMAD_M0) * p.cout1;
-    const int l0c2 = Align(g.rowsMax2 * g.wo2, MMAD_M0) * p.cout2;
+    const int l0c1 = Align(g.mMax1, MMAD_M0) * Align(p.cout1, MMAD_M0);
+    const int l0c2 = Align(g.mMax2, MMAD_M0) * Align(p.cout2, MMAD_M0);
     g.l0cElems = MaxI(l0c1, l0c2);
     if (g.l0cElems > L0C_ELEMS) {
         return RJ_L0C;

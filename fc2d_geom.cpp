@@ -64,9 +64,9 @@ int main(int argc, char** argv)
         return 1;
     }
     std::printf("    conv1 -> %dx%d, conv2 -> %dx%d | band=%d 行 x %d 块(共 %d) | "
-                "L1 %d/%d 字节 (%.0f%%) | tileK %d/%d, M 子块 <=%d/%d 行, L0B 折 %d/%d 段\n",
+                "L1 %d/%d 字节 (%.0f%%) | tileK %d/%d, M 子块 <=%d/%d 个位置, L0B 折 %d/%d 段\n",
                 g.ho1, g.wo1, g.ho2, g.wo2, g.hb, g.nchunk, g.chunkTotal, g.l1Used, l1,
-                100.0 * g.l1Used / l1, g.tileK1, g.tileK2, g.rowsMax1, g.rowsMax2, g.l0bChunks1,
+                100.0 * g.l1Used / l1, g.tileK1, g.tileK2, g.mMax1, g.mMax2, g.l0bChunks1,
                 g.l0bChunks2);
     if (g.dq2Bytes > 0) {
         std::printf("    反量化表: %d 字节常驻 L1（%d 个通道 x uint64）\n", g.dq2Bytes, p.cout2);

@@ -196,9 +196,10 @@ def singleop_json(spec):
     fz2k = (spec["cout1"] // c0) * spec["kh"] * spec["kw"]
     inputs = [
         {"format": "ND", "shape": [spec["n"], spec["ci"], spec["hi"], spec["wi"]], "type": t},
-        {"format": "ND", "shape": [fz1k, spec["cout1"] // 16, 16, c0], "type": t},
+        {"format": "ND", "shape": [fz1k, (spec["cout1"] + 15) // 16, 16, c0], "type": t},
         {"format": "ND", "shape": [spec["cout1"]], "type": bt},
-        {"format": "ND", "shape": [fz2k, spec["cout2"] // 16, 16, c0], "type": t},
+        # FRACTAL_Z 的 N 向上补齐到 16 —— cout2 可以是 2，整除会算出 0。
+        {"format": "ND", "shape": [fz2k, (spec["cout2"] + 15) // 16, 16, c0], "type": t},
         {"format": "ND", "shape": [spec["cout2"]], "type": bt},
     ]
     # dequant_scale2 是 IR 下标 5 的可选输入。**传了它就是 int8 进 / fp16 出那条**

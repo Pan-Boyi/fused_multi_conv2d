@@ -187,8 +187,15 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "[X] ci(%d) 和 cout1(%d) 必须是 C0=%d 的整数倍\n", c.ci, c.cout1, c0);
         return 2;
     }
-    if (c.cout1 % 16 != 0 || c.cout2 % 16 != 0) {
-        std::fprintf(stderr, "[X] cout1(%d) / cout2(%d) 必须是 16 的整数倍\n", c.cout1, c.cout2);
+    // cout1 要 16 对齐（上面 cout1 % C0 已经更严了，这里是文档性质的）——
+    // mid 要被 conv2 当 NC1HWC0 读。**cout2 不需要**：它只出现在 conv2 的出口，
+    // fixpipe 给多少写多少；FRACTAL_Z 那边 N 方向补齐到 16 就行。
+    if (c.cout1 % 16 != 0) {
+        std::fprintf(stderr, "[X] cout1(%d) 必须是 16 的整数倍\n", c.cout1);
+        return 2;
+    }
+    if (c.cout2 < 1) {
+        std::fprintf(stderr, "[X] cout2(%d) 必须 >= 1\n", c.cout2);
         return 2;
     }
     if (c.Ho1() <= 0 || c.Wo1() <= 0 || c.Ho2() <= 0 || c.Wo2() <= 0) {
@@ -236,9 +243,11 @@ int main(int argc, char** argv)
     Writer w{f};
 
     const int64_t fz1k = (int64_t)(c.ci / c0) * c.kh * c.kw;
-    const int64_t fz1n = c.cout1 / 16;
+    // FRACTAL_Z 的 N 方向**向上补齐到 16**。cout1 必然是 C0 的整数倍所以除得尽，
+    // 但 cout2 不一定（可以是 2），写成整除会算出 0 —— filter2 的 shape 直接错。
+    const int64_t fz1n = (c.cout1 + 15) / 16;
     const int64_t fz2k = (int64_t)(c.cout1 / c0) * c.kh * c.kw;
-    const int64_t fz2n = c.cout2 / 16;
+    const int64_t fz2n = (c.cout2 + 15) / 16;
     const std::vector<int64_t> xDims = {c.n, c.ci, c.hi, c.wi};
     const std::vector<int64_t> yDims = {c.n, c.cout2, c.Ho2(), c.Wo2()};
     const std::vector<int64_t> f1Dims = {fz1k, fz1n, 16, (int64_t)c0};

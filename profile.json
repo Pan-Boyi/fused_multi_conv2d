@@ -204,6 +204,64 @@
       "cout1": 128,
       "cout2": 32,
       "bias": true
+    },
+    {
+      "name": "wide1790",
+      "dtype": "s8f16",
+      "n": 1,
+      "ci": 64,
+      "hi": 5,
+      "wi": 1790,
+      "cout1": 64,
+      "cout2": 2,
+      "kernel": [
+        3,
+        3
+      ],
+      "strides": [
+        1,
+        7
+      ],
+      "pads": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "bias": true,
+      "relu": [
+        true,
+        true
+      ]
+    },
+    {
+      "name": "wide1790_int8",
+      "dtype": "int8",
+      "n": 1,
+      "ci": 64,
+      "hi": 5,
+      "wi": 1790,
+      "cout1": 64,
+      "cout2": 2,
+      "kernel": [
+        3,
+        3
+      ],
+      "strides": [
+        1,
+        7
+      ],
+      "pads": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "bias": true,
+      "relu": [
+        true,
+        true
+      ]
     }
   ]
 }
