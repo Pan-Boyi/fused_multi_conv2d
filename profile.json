@@ -26,7 +26,7 @@
     "profile.msprof 是远端 msprof 的**绝对路径，写死，不搜 PATH**。远端那个 ssh 是",
     "非交互 shell，读不到 ~/.bashrc 里 source 的 set_env.sh —— 搜 PATH 会说「没有",
     "msprof」而其实装着；机器上有好几套 CANN 时还可能搜到不是这次要用的那一套。",
-    "给目录也行，脚本会自动接一层 /msprof。"
+    "指向 msprof 那个可执行文件本身。"
   ],
 
   "soc_version": "MC62CM12AA",

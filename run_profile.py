@@ -121,7 +121,7 @@ REMOTE_DEFAULTS = {
 
 PROFILE_DEFAULTS = {
     "enabled": True,
-    # 远端 msprof 的**绝对路径，写死，不搜 PATH**。
+    # 远端 msprof 可执行文件的**绝对路径，写死，不搜 PATH**。
     # 搜 PATH 有两种错法，而且都不响：远端那个 ssh 是非交互 shell，读不到
     # ~/.bashrc 里 source 的 set_env.sh，于是明明装了也说「PATH 里没有」；
     # 或者机器上有好几套 CANN，搜到的不是这次要用的那一套，数据照出、来源不明。
@@ -340,10 +340,10 @@ def remote_script(rt, case_name, om_name, use_msprof, msprof):
     if use_msprof:
         q = shlex.quote(msprof)
         lines += [
-            # 路径是配置给死的，不搜 PATH。只做一件事：确认它真的能执行。
-            # 顺手认一下「给的是目录」这种写法（有的安装把 msprof 放在一个目录里）。
+            # 路径是配置给死的，不搜 PATH，也不猜。只确认它真的能执行 ——
+            # 这一条不是搜索，是为了让「路径写错了」当场说清楚，而不是变成
+            # 一句 command not found 混在 msprof 自己的输出里。
             "MSPROF=%s" % q,
-            "if [ -d \"$MSPROF\" ]; then MSPROF=\"$MSPROF/msprof\"; fi",
             "[ -x \"$MSPROF\" ] || { echo \"[REMOTE ERROR] $MSPROF 不存在或不可执行\" >&2; "
             "echo '  这个路径来自 profile.json 的 profile.msprof，改那里' >&2; exit 127; }",
             "echo \"[REMOTE] msprof = $MSPROF\" >&2",

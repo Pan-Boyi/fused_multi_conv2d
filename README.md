@@ -40,7 +40,7 @@ python3 run_profile.py profile.json
 | `case` | 本地 | 生成 `case.bin` |
 | `om` | 本地 | 写 `singleop.json`,跑 `atc --singleop` |
 | `push` | 本地 -> 远端 | 每条 case 一个干净目录,拷 `case.bin`、`.om`、`run_fused_conv2d.py` |
-| `prof` | 远端 | `$MSPROF python3 run_fused_conv2d.py ...`,并找出**本次**新生成的 `PROF_*`。`$MSPROF` 是 `profile.msprof` 给死的绝对路径(缺省 `/var/msprof`),**不搜 PATH** —— 远端那个 ssh 是非交互 shell,读不到 `~/.bashrc` 里 source 的 `set_env.sh`,搜 PATH 会说「没有 msprof」而其实装着。给目录也行,会自动接一层 `/msprof`。 |
+| `prof` | 远端 | `$MSPROF python3 run_fused_conv2d.py ...`,并找出**本次**新生成的 `PROF_*`。`$MSPROF` 是 `profile.msprof` 给死的绝对路径(缺省 `/var/msprof`),**不搜 PATH** —— 远端那个 ssh 是非交互 shell,读不到 `~/.bashrc` 里 source 的 `set_env.sh`,搜 PATH 会说「没有 msprof」而其实装着。指向 msprof 那个可执行文件本身。 |
 | `pull` | 远端 -> 本地 | 把那个 `PROF_*` 拉回 `prof_out/<json 名>/<case 名>/` |
 | `export` | 本地 | `TbeWorkTestSuit` 的 `msprof.py export summary` |
 | `parse` | 本地 | 解析 `op_summary_*.csv`,每条打明细,最后打一张横向对比表 |
