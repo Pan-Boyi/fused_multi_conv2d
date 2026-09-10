@@ -63,11 +63,17 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "不支持: %s\n", RejectText(rc));
         return 1;
     }
-    std::printf("    conv1 -> %dx%d, conv2 -> %dx%d | band=%d 行 x %d 块(共 %d) | "
-                "L1 %d/%d 字节 (%.0f%%) | tileK %d/%d, M 子块 <=%d/%d 个位置, L0B 折 %d/%d 段\n",
-                g.ho1, g.wo1, g.ho2, g.wo2, g.hb, g.nchunk, g.chunkTotal, g.l1Used, l1,
-                100.0 * g.l1Used / l1, g.tileK1, g.tileK2, g.mMax1, g.mMax2, g.l0bChunks1,
-                g.l0bChunks2);
+    std::printf("    conv1 -> %dx%d, conv2 -> %dx%d | 分核 %d 行带 x %d 列段 = %d 块"
+                "（每带 %d 行、每段 %d 列）| L1 %d/%d 字节 (%.0f%%) | "
+                "tileK %d/%d, M 子块 <=%d/%d 个位置, "
+                "L0B 折 %d/%d 段\n",
+                g.ho1, g.wo1, g.ho2, g.wo2, g.nchunk, g.nwseg, g.chunkTotal, g.hb, g.wseg,
+                g.l1Used, l1, 100.0 * g.l1Used / l1, g.tileK1, g.tileK2, g.mMax1, g.mMax2,
+                g.l0bChunks1, g.l0bChunks2);
+    if (g.nwseg > 1) {
+        std::printf("    按 W 分核：每段算 mid 的 %d 列 / x 的 %d 列（整幅是 %d / %d）\n",
+                    g.wSubMax, g.wInMax, g.wo1, p.wi);
+    }
     if (g.dq2Bytes > 0) {
         std::printf("    反量化表: %d 字节常驻 L1（%d 个通道 x uint64）\n", g.dq2Bytes, p.cout2);
     }

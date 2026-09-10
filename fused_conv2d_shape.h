@@ -237,6 +237,7 @@ enum Reject {
     RJ_L1,             // L1 装不下
     RJ_U16,            // 某个指令字段是 16 位的，这个形状超了
     RJ_NO_HB,          // 所有 hb 都不成立
+    RJ_WSEG,           // 列分段数不合法（<= 0 或 > wo2）
 };
 
 // **只在 host 和 CPU 仿真上存在。**
@@ -265,6 +266,7 @@ FC2D_GEOM_FN const char* RejectText(int r)
         case RJ_L1: return "L1 装不下 fm + mid + w1 + w2";
         case RJ_U16: return "指令字段只有 16 位：mid 的 M（midRows*wo1）或 staging 的位置数（xRows*wi）超过 65535";
         case RJ_NO_HB: return "没有任何 band 高度能同时满足全部约束";
+        case RJ_WSEG: return "列分段数不合法（必须在 1..wo2 之间）";
         default: return "未知";
     }
 }
@@ -281,11 +283,17 @@ struct Geometry {
     int k1, k2;          // 两个卷积的矩阵乘 K = C1*kh*kw*C0
 
     int hb, nchunk;      // 每个 band 出多少行 conv2 输出 / 一张图几个 band
-    int chunkTotal;      // n * nchunk
+    // 列方向的分核。一个 chunk = 一个 band x 一个列段，所以
+    //   chunkTotal = n * nchunk * nwseg
+    // Ho2 只有一行的形状（比如 5x1790 那个）在行方向一点并行度都没有，
+    // 不切列就只有一个核在干活。
+    int wseg, nwseg;     // 一个列段出多少列 conv2 输出 / 一张图几个列段
+    int wSubMax, wInMax; // 一个列段最多要算多少列 mid / 要灌多少列 x（L1 按它排）
+    int chunkTotal;      // n * nchunk * nwseg
 
     int midRows;         // 一个 band 的 conv1 输出行数上限（= 窗口跨度）
     int xRows;           // 一个 band 要灌进 L1 的 x 行数上限
-    int m1Max;           // midRows * wo1，mid 的 NZ M 上限
+    int m1Max;           // midRows * wSubMax，mid 的 NZ M 上限
 
     int tileK1, tileK2;              // 每条 img2col 灌多少 K
     int mMax1, mMax2;                // 一个 M 子块最多几个位置（不是行）
@@ -417,8 +425,9 @@ struct FlatGeom {
     // ---- 由形状推出来的 ----
     int c0, ho1, wo1, ho2, wo2, k1, k2;
     int hb, nchunk, chunkTotal, chunksPerCore;
+    int wseg, nwseg;             // 列方向的分核，见 Geometry
     int midRows;                 // 一个 band 的窗口跨度（含补零）
-    int mMax1;                   // conv1 的 M 子块上限（位置数），逐 band 现算用
+    int mMax1, mMax2;            // 两个卷积的 M 子块上限（位置数），逐 chunk 现算用
     int tileK1, tileK2;
     int l0bChunks1, l0bChunkK1, tilesPerChunk1;
     int l0bChunks2, l0bChunkK2, tilesPerChunk2;
@@ -428,8 +437,6 @@ struct FlatGeom {
     int dq2Addr;   // conv2 的 per-channel 反量化表（不带时这一段长度为 0）
     // ---- GM 侧 ----
     int xPlane, yPlane, yPlaneM;
-    // ---- conv2 的 M 分块表：每个 band 都一样，直接下发展开好的三个标量 ----
-    int t2n, t2base, t2extra;
 };
 
 // FlatGeom 的字段清单：X(FlatGeom 里的名字, tiling 里的名字)。
@@ -461,10 +468,13 @@ struct FlatGeom {
     X(k2, k2)                 \
     X(hb, hb)                 \
     X(nchunk, nchunk)         \
+    X(wseg, wseg)             \
+    X(nwseg, nwseg)           \
     X(chunkTotal, chunkTotal) \
     X(chunksPerCore, chunksPerCore) \
     X(midRows, midRows)       \
     X(mMax1, mMax1)           \
+    X(mMax2, mMax2)           \
     X(tileK1, tileK1)         \
     X(tileK2, tileK2)         \
     X(l0bChunks1, l0bChunks1) \
@@ -488,10 +498,7 @@ struct FlatGeom {
     X(dq2Addr, dq2Addr)       \
     X(xPlane, xPlane)         \
     X(yPlane, yPlane)         \
-    X(yPlaneM, yPlaneM)       \
-    X(t2n, t2n)               \
-    X(t2base, t2base)         \
-    X(t2extra, t2extra)
+    X(yPlaneM, yPlaneM)
 
 FC2D_GEOM_FN void Flatten(const Geometry& g, int chunksPerCore, FlatGeom& f)
 {
@@ -521,11 +528,14 @@ FC2D_GEOM_FN void Flatten(const Geometry& g, int chunksPerCore, FlatGeom& f)
 
     f.hb = g.hb;
     f.nchunk = g.nchunk;
+    f.wseg = g.wseg;
+    f.nwseg = g.nwseg;
     f.chunkTotal = g.chunkTotal;
     f.chunksPerCore = chunksPerCore;
 
     f.midRows = g.midRows;
     f.mMax1 = g.mMax1;
+    f.mMax2 = g.mMax2;
     f.tileK1 = g.tileK1;
     f.tileK2 = g.tileK2;
     f.l0bChunks1 = g.l0bChunks1;
@@ -552,12 +562,6 @@ FC2D_GEOM_FN void Flatten(const Geometry& g, int chunksPerCore, FlatGeom& f)
     f.xPlane = g.xPlane;
     f.yPlane = g.yPlane;
     f.yPlaneM = g.ho2 * g.wo2;
-
-    // conv2 的 M 空间是「一个 band 的全部输出位置」，不是行数。
-    const TileSpec t2 = MakeTileSpec(g.hb * g.wo2, g.mMax2, 1);
-    f.t2n = t2.n;
-    f.t2base = t2.base;
-    f.t2extra = t2.extra;
 }
 
 // ---------------------------------------------------------------------------
@@ -579,12 +583,23 @@ struct BandLite {
     int midReal;  // 这个 band 真正算出来的 conv1 行数
     int padT2, padB2;
     int xRow0, xRows, padT1, padB1;
-    int outRow0;  // 这个 band 的第一行 conv2 输出（图内行号）
-    int m1;       // midReal * wo1
-    TileSpec t1;  // conv1 的 M 分块（对 midReal 行）
+    int outRow0;  // 这个 chunk 的第一行 conv2 输出（图内行号）
+    // ---- 列方向的窗口。和上面的行方向是同一套钳位算术，只是换成 W ----
+    int outCol0, outCols;   // 这个 chunk 出哪些列 conv2 输出
+    int midCol0, wSub;      // 要算的 mid 列区间（conv1 在这一段里的输出宽度）
+    int padL2, padR2;       // conv2 在这一段两侧的补零（内部段是 0，边缘段才有）
+    int xCol0, wIn;         // 要灌进 L1 的 x 列区间
+    int padL1, padR1;
+    int m1;       // midReal * wSub
+    // conv2 的输出在 GM(NCHW) 里按行连续。整幅宽度时一个 run 覆盖整个 band（和
+    // 不切列时完全一样）；切了列之后一个 run 只能是一行 —— fixpipe 的一段连续
+    // 写要是跨了行，就会写到下一行的开头去。
+    int rowsPerRun, mRun, nRun;
+    TileSpec t1;  // conv1 的 M 分块（对 midReal x wSub 的全部位置）
+    TileSpec t2;  // conv2 的 M 分块（对一个 run 的全部位置）
 };
 
-FC2D_GEOM_FN void MakeBandLite(const FlatGeom& f, int band, BandLite& b)
+FC2D_GEOM_FN void MakeBandLite(const FlatGeom& f, int band, int wg, BandLite& b)
 {
     b.outRow0 = band * f.hb;
 
@@ -594,7 +609,6 @@ FC2D_GEOM_FN void MakeBandLite(const FlatGeom& f, int band, BandLite& b)
     const int wantRows = f.midRows - b.padT2;          // 窗口里还需要几行真实的 conv1 输出
     b.midReal = MinI(wantRows, f.ho1 - b.aMid);
     b.padB2 = f.midRows - b.padT2 - b.midReal;
-    b.m1 = b.midReal * f.wo1;
 
     // conv1 侧：产出 mid 行 [aMid, aMid+midReal) 需要的 x 行区间，两头都可能被钳。
     const int xRaw = f.stride1 * b.aMid - f.padH1;
@@ -605,8 +619,40 @@ FC2D_GEOM_FN void MakeBandLite(const FlatGeom& f, int band, BandLite& b)
     b.xRows = xEnd - b.xRow0;
     b.padB1 = xRaw + xSpan - xEnd;
 
-    // conv1 的 M 空间同理：midReal 行 x wo1 列的**全部位置**，可以切到行内。
+    // ---- 列方向 ----------------------------------------------------------
+    // 出 conv2 的列 [outCol0, outCol0+outCols) 需要 mid 的列
+    //   [outCol0*s2 - padW2, (outCol0+outCols-1)*s2 - padW2 + kw)
+    // 和 [0, wo1) 求交，交不到的部分就是这一段自己的左右补零。恒等式：
+    //   (wSub + padL2 + padR2 - kw)/s2 + 1 == outCols
+    // conv1 那一层同理，出 wSub 列需要 x 的哪一段。
+    b.outCol0 = wg * f.wseg;
+    b.outCols = MinI(f.wseg, f.wo2 - b.outCol0);
+
+    const int mcRaw0 = b.outCol0 * f.stride2 - f.padW2;
+    const int mcRaw1 = (b.outCol0 + b.outCols - 1) * f.stride2 - f.padW2 + f.kw;
+    b.midCol0 = MaxI(0, mcRaw0);
+    const int mcEnd = MinI(f.wo1, mcRaw1);
+    b.padL2 = b.midCol0 - mcRaw0;
+    b.padR2 = mcRaw1 - mcEnd;
+    b.wSub = mcEnd - b.midCol0;
+
+    const int icRaw0 = b.midCol0 * f.stride1 - f.padW1;
+    const int icRaw1 = (mcEnd - 1) * f.stride1 - f.padW1 + f.kw;
+    b.xCol0 = MaxI(0, icRaw0);
+    const int icEnd = MinI(f.wi, icRaw1);
+    b.padL1 = b.xCol0 - icRaw0;
+    b.padR1 = icRaw1 - icEnd;
+    b.wIn = icEnd - b.xCol0;
+
+    // conv1 的 M 空间：midReal 行 x wSub 列的**全部位置**，可以切到行内 —— mid 在
+    // L1 里就是这么连续排的（行距 wSub），所以扁平区间直接对应一块矩形。
+    b.m1 = b.midReal * b.wSub;
     b.t1 = MakeTileSpec(b.m1, f.mMax1, 1);
+
+    b.rowsPerRun = (b.outCols == f.wo2) ? f.hb : 1;
+    b.mRun = b.rowsPerRun * b.outCols;
+    b.nRun = f.hb / b.rowsPerRun;
+    b.t2 = MakeTileSpec(b.mRun, f.mMax2, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -626,26 +672,37 @@ FC2D_GEOM_FN void MakeBandLite(const FlatGeom& f, int band, BandLite& b)
 struct Band {
     int img;      // batch 里的第几张图
     int band;     // 图内第几个 band
+    int wg;       // 图内第几个列段
     int aMid;     // 这个 band 的第一行 conv1 输出（全局行号）
     int midReal;  // 这个 band 真正算出来的 conv1 行数
     int padT2, padB2;
     int xRow0, xRows, padT1, padB1;
-    int outRow0;  // 这个 band 的第一行 conv2 输出（图内行号）
-    int m1;       // midReal * wo1
-    TileTable t1; // conv1 的 M 分块（对 midReal 行）
-    TileTable t2; // conv2 的 M 分块（对 hb 行）
+    int outRow0;  // 这个 chunk 的第一行 conv2 输出（图内行号）
+    int outCol0, outCols, midCol0, wSub, padL2, padR2, xCol0, wIn, padL1, padR1;
+    int rowsPerRun, mRun, nRun;
+    int m1;       // midReal * wSub
+    TileTable t1; // conv1 的 M 分块
+    TileTable t2; // conv2 的 M 分块（对一个 run）
 };
 
 FC2D_GEOM_FN Band MakeBand(const Geometry& g, int chunk)
 {
     FlatGeom f;
     Flatten(g, 1, f);
+    // chunk 的拆法：列段跑得最快，其次是 band，最后是图。kernel 侧那个自增
+    // （wg -> band -> img）必须和这里一致。
+    const int perImg = g.nchunk * g.nwseg;
+    const int img = chunk / perImg;
+    const int rem = chunk - img * perImg;
+    const int band = rem / g.nwseg;
+    const int wg = rem - band * g.nwseg;
     BandLite lb;
-    MakeBandLite(f, chunk % g.nchunk, lb);
+    MakeBandLite(f, band, wg, lb);
 
     Band b;
-    b.img = chunk / g.nchunk;
-    b.band = chunk % g.nchunk;
+    b.img = img;
+    b.band = band;
+    b.wg = wg;
     b.aMid = lb.aMid;
     b.midReal = lb.midReal;
     b.padT2 = lb.padT2;
@@ -655,17 +712,30 @@ FC2D_GEOM_FN Band MakeBand(const Geometry& g, int chunk)
     b.padT1 = lb.padT1;
     b.padB1 = lb.padB1;
     b.outRow0 = lb.outRow0;
+    b.outCol0 = lb.outCol0;
+    b.outCols = lb.outCols;
+    b.midCol0 = lb.midCol0;
+    b.wSub = lb.wSub;
+    b.padL2 = lb.padL2;
+    b.padR2 = lb.padR2;
+    b.xCol0 = lb.xCol0;
+    b.wIn = lb.wIn;
+    b.padL1 = lb.padL1;
+    b.padR1 = lb.padR1;
+    b.rowsPerRun = lb.rowsPerRun;
+    b.mRun = lb.mRun;
+    b.nRun = lb.nRun;
     b.m1 = lb.m1;
     b.t1 = MakeTiles(lb.m1, g.mMax1, 1);
-    b.t2 = MakeTiles(g.hb * g.wo2, g.mMax2, 1);
+    b.t2 = MakeTiles(lb.mRun, g.mMax2, 1);
     return b;
 }
 
 // ---------------------------------------------------------------------------
-// 核心：Params + hb -> Geometry。返回 0 表示成立，否则是 Reject 码。
+// 核心：Params + hb + 列段数 -> Geometry。返回 0 表示成立，否则是 Reject 码。
 // l1Budget 是这次允许用多少 L1（真机 1 MB，CPU 仿真 512 KB）。
 // ---------------------------------------------------------------------------
-FC2D_GEOM_FN int DeriveWithHb(const Params& p, int hb, int l1Budget, Geometry& g)
+FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Geometry& g)
 {
     if (p.elemBytes != 1 && p.elemBytes != 2) {
         return RJ_ELEM_BYTES;
@@ -715,9 +785,16 @@ FC2D_GEOM_FN int DeriveWithHb(const Params& p, int hb, int l1Budget, Geometry& g
     if ((g.ho2 % hb) != 0) {
         return RJ_HB_DIVIDE;
     }
+    if (nwseg <= 0 || nwseg > g.wo2) {
+        return RJ_WSEG;
+    }
     g.hb = hb;
     g.nchunk = g.ho2 / hb;
-    g.chunkTotal = p.n * g.nchunk;
+    // 段宽先定，段数再由它反推 —— wo2 不被 nwseg 整除时最后一段短一点，
+    // 段数也可能比请求的少（比如 wo2=10 要 6 段，wseg=2 只能分出 5 段）。
+    g.wseg = CeilDiv(g.wo2, nwseg);
+    g.nwseg = CeilDiv(g.wo2, g.wseg);
+    g.chunkTotal = p.n * g.nchunk * g.nwseg;
 
     // 一个 band 的 conv2 输出行覆盖 midRows 行 conv1 输出（含上下补零）。
     g.midRows = p.stride2 * (hb - 1) + p.kh;
@@ -725,17 +802,25 @@ FC2D_GEOM_FN int DeriveWithHb(const Params& p, int hb, int l1Budget, Geometry& g
     // conv1 行数都不会超过 ho1（超出的部分是 conv2 的补零，不是数据），staging 的
     // x 行数同理不会超过 hi。按跨度排会白占 L1，还会把本来放得下的形状拒掉。
     const int midRowsCap = MinI(g.midRows, g.ho1);
-    g.m1Max = midRowsCap * g.wo1;
+    // 列方向同理，按**最宽的那个段**排 L1。内部段两侧都没有补零，所以它最宽；
+    // 边缘段的一部分窗口落在补零里，真实列数只会更少。
+    // 顺带一个副作用：不切列（nwseg = 1）时 wSubMax 也可能小于 wo1 —— stride2
+    // 大于 kw 时 conv2 根本读不到 conv1 最后那几列，以前是白算的。
+    g.wSubMax = MinI(g.wo1, (g.wseg - 1) * p.stride2 + p.kw);
+    g.wInMax = MinI(p.wi, (g.wSubMax - 1) * p.stride1 + p.kw);
+    g.m1Max = midRowsCap * g.wSubMax;
     g.xRows = MinI(p.stride1 * (midRowsCap - 1) + p.kh, p.hi);
     // 两个 16 位字段：img2col 的 mStartPt（最大到 m1Max）和 Dn2Nz 的 nValue /
     // dstNzC0Stride（都等于 xRows*wi）。超了会静默截断成完全不相干的地址。
-    if (g.m1Max > 65535 || (long long)g.xRows * p.wi > 65535) {
+    if (g.m1Max > 65535 || (long long)g.xRows * g.wInMax > 65535) {
         return RJ_U16;
     }
 
-    // K 切分 + M 分块。conv1 对 midRows 行，conv2 对 hb 行。
-    const KChoice kc1 = PickTileK(g.k1, g.c0, p.elemBytes, p.cout1, midRowsCap * g.wo1);
-    const KChoice kc2 = PickTileK(g.k2, g.c0, p.elemBytes, p.cout2, hb * g.wo2);
+    // K 切分 + M 分块。conv1 对一个 chunk 的 midReal x wSub，conv2 对一个 run。
+    // 不切列时一个 run 就是整个 band（hb 行 x wo2 列），和以前一模一样。
+    const int mRunMax = (g.nwseg == 1) ? (hb * g.wo2) : g.wseg;
+    const KChoice kc1 = PickTileK(g.k1, g.c0, p.elemBytes, p.cout1, g.m1Max);
+    const KChoice kc2 = PickTileK(g.k2, g.c0, p.elemBytes, p.cout2, mRunMax);
     if (!kc1.ok || !kc2.ok) {
         return RJ_TILE_K;
     }
@@ -761,11 +846,11 @@ FC2D_GEOM_FN int DeriveWithHb(const Params& p, int hb, int l1Budget, Geometry& g
         if (midReal <= 0) {
             return RJ_MIDROWS;
         }
-        if (MakeTileSpec(midReal * g.wo1, g.mMax1, 1).n == 0) {
+        if (MakeTileSpec(midReal * g.wSubMax, g.mMax1, 1).n == 0) {
             return RJ_M_TILES;
         }
     }
-    if (MakeTileSpec(hb * g.wo2, g.mMax2, 1).n == 0) {
+    if (MakeTileSpec(mRunMax, g.mMax2, 1).n == 0) {
         return RJ_M_TILES;
     }
 
@@ -797,7 +882,7 @@ FC2D_GEOM_FN int DeriveWithHb(const Params& p, int hb, int l1Budget, Geometry& g
     }
 
     // L1 地址表。每段 512 对齐 —— fixpipe 的 L1->FB 取数要求。
-    g.fmElems = g.xRows * p.wi * p.ci;
+    g.fmElems = g.xRows * g.wInMax * p.ci;
     g.midElems = g.m1Max * p.cout1;
     g.w1Elems = Align(p.cout1, MMAD_M0) * g.k1;
     g.w2Elems = Align(p.cout2, MMAD_M0) * g.k2;
@@ -823,6 +908,12 @@ FC2D_GEOM_FN int DeriveWithHb(const Params& p, int hb, int l1Budget, Geometry& g
     g.xPlane = p.ci * p.hi * p.wi;
     g.yPlane = p.cout2 * g.ho2 * g.wo2;
     return RJ_OK;
+}
+
+// 老签名的壳：不切列。UT 和离线扫盘还按 hb 单独取几何。
+FC2D_GEOM_FN int DeriveWithHb(const Params& p, int hb, int l1Budget, Geometry& g)
+{
+    return DeriveWith(p, hb, 1, l1Budget, g);
 }
 
 // ---------------------------------------------------------------------------
@@ -858,34 +949,91 @@ FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
         return RJ_OUT_EMPTY;
     }
 
-    int bestHb = 0;
-    long long bestCost = 0;
+    const int wo1 = (p.wi + 2 * p.padW1 - p.kw) / p.stride1 + 1;
+    if (wo1 <= 0) {
+        return RJ_OUT_EMPTY;
+    }
+    const int wo2 = (wo1 + 2 * p.padW2 - p.kw) / p.stride2 + 1;
+    if (wo2 <= 0) {
+        return RJ_OUT_EMPTY;
+    }
+
+    // ---- 第一趟：不切列。这一趟和加 W 分核之前**逐字相同** ------------------
     // 报哪一条拒绝原因是有讲究的：整除性（RJ_HB_DIVIDE / RJ_HB_GRAN）对绝大多数候选
     // hb 都成立，报它等于什么也没说。留住第一条**别的**原因 —— 那才是这个形状真正
     // 卡在哪里。一条都没有就说「没有任何 band 高度成立」。
+    int bestHb = 0;
+    long long bestCost = 0;
     int firstReal = RJ_NO_HB;
     for (int hb = 1; hb <= ho2; ++hb) {
         if ((ho2 % hb) != 0) {
             continue;
         }
-        const int rc = DeriveWithHb(p, hb, l1Budget, probe);
+        const int rc = DeriveWith(p, hb, 1, l1Budget, probe);
         if (rc != RJ_OK) {
             if (firstReal == RJ_NO_HB && rc != RJ_HB_DIVIDE && rc != RJ_HB_GRAN) {
                 firstReal = rc;
             }
             continue;
         }
-        const long long rounds = CeilDiv(probe.nchunk * p.n, aicNum);
+        const long long rounds = CeilDiv(probe.chunkTotal, aicNum);
         const long long cost = rounds * (long long)probe.midRows;
         if (bestHb == 0 || cost < bestCost || (cost == bestCost && hb > bestHb)) {
             bestHb = hb;
             bestCost = cost;
         }
     }
-    if (bestHb == 0) {
-        return firstReal;
+    // bestHb == 0 不在这里返回 —— 切列还能把 L1 救回来（每段的 fm / mid 都窄一截），
+    // 所以一条 hb 都不成立时也要往下走第二趟。
+    // **行方向已经喂得满核就到此为止。** 切列不是免费的：每段两侧各多算 kw-1 列的
+    // halo，每段还要各重灌一次两套权重，而且 conv2 的一个 run 缩成一行，mmad 的 M
+    // 变小、fixpipe 的次数变多。所以它是「行方向不够分」时的补救，不是优化。
+    // 这一条同时保证了老形状的分核方式一个字都不变。
+    if (bestHb != 0 && (long long)p.n * (ho2 / bestHb) >= (long long)aicNum) {
+        return DeriveWith(p, bestHb, 1, l1Budget, g);
     }
-    return DeriveWithHb(p, bestHb, l1Budget, g);
+
+    // ---- 第二趟：行方向填不满核，才把 W 也拿出来切 --------------------------
+    int bestHb2 = 0;
+    int bestNw = 1;
+    long long bestCost2 = 0;
+    const int nwMax = MinI(aicNum, wo2);
+    for (int hb = 1; hb <= ho2; ++hb) {
+        if ((ho2 % hb) != 0) {
+            continue;
+        }
+        for (int nw = 1; nw <= nwMax; ++nw) {
+            const int rc = DeriveWith(p, hb, nw, l1Budget, probe);
+            if (rc != RJ_OK) {
+                if (firstReal == RJ_NO_HB && rc != RJ_HB_DIVIDE && rc != RJ_HB_GRAN &&
+                    rc != RJ_WSEG) {
+                    firstReal = rc;
+                }
+                continue;
+            }
+            // 一个 chunk 的代价 = conv1 要算的位置数（band 重叠和列 halo 都在里面）
+            //                   + 每个 chunk 都要重灌一次的两套权重。
+            // 后面那一项是防止「越切越好」的：只看第一项的话切得越碎每块越小，代价
+            // 单调下降，最后会切成一堆只搬权重的碎片。
+            const long long rounds = CeilDiv(probe.chunkTotal, aicNum);
+            const long long perChunk =
+                (long long)probe.midRows * probe.wSubMax + probe.k1 + probe.k2;
+            const long long cost = rounds * perChunk;
+            if (bestHb2 == 0 || cost < bestCost2 ||
+                (cost == bestCost2 && (nw < bestNw || (nw == bestNw && hb > bestHb2)))) {
+                bestHb2 = hb;
+                bestNw = nw;
+                bestCost2 = cost;
+            }
+        }
+    }
+    if (bestHb2 == 0) {
+        if (bestHb == 0) {
+            return firstReal;
+        }
+        return DeriveWith(p, bestHb, 1, l1Budget, g);
+    }
+    return DeriveWith(p, bestHb2, bestNw, l1Budget, g);
 }
 
 } // namespace FusedConv2dShape
