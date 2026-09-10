@@ -48,7 +48,12 @@ int main(int argc, char** argv)
     p.padW1 = ArgInt(argc, argv, "--pw1", 1);
     p.padH2 = ArgInt(argc, argv, "--ph2", 1);
     p.padW2 = ArgInt(argc, argv, "--pw2", 1);
-    p.elemBytes = std::strcmp(ArgStr(argc, argv, "--dtype", "fp16"), "int8") == 0 ? 1 : 2;
+    // s8f16 = int8 进 / fp16 出：入口和 int8 一样（elemBytes = 1），但 L1 末尾
+    // 多一段 per-channel 反量化表，所以几何要按带表的算。
+    const char* dt = ArgStr(argc, argv, "--dtype", "fp16");
+    const bool s8f16 = std::strcmp(dt, "s8f16") == 0;
+    p.elemBytes = (std::strcmp(dt, "int8") == 0 || s8f16) ? 1 : 2;
+    p.hasDeqScale2 = s8f16 ? 1 : 0;
     const int l1 = ArgInt(argc, argv, "--l1", 1024 * 1024);
     const int aic = ArgInt(argc, argv, "--cores", 8);
 
@@ -63,5 +68,8 @@ int main(int argc, char** argv)
                 g.ho1, g.wo1, g.ho2, g.wo2, g.hb, g.nchunk, g.chunkTotal, g.l1Used, l1,
                 100.0 * g.l1Used / l1, g.tileK1, g.tileK2, g.rowsMax1, g.rowsMax2, g.l0bChunks1,
                 g.l0bChunks2);
+    if (g.dq2Bytes > 0) {
+        std::printf("    反量化表: %d 字节常驻 L1（%d 个通道 x uint64）\n", g.dq2Bytes, p.cout2);
+    }
     return 0;
 }

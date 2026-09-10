@@ -28,10 +28,8 @@
     "msprof」而其实装着；机器上有好几套 CANN 时还可能搜到不是这次要用的那一套。",
     "指向 msprof 那个可执行文件本身。"
   ],
-
   "soc_version": "MC62CM12AA",
   "local_cann_env": "/home/p84341448/Ascend-52/cann/set_env.sh",
-
   "remote": {
     "host": "7.246.92.17",
     "user": "p84341448",
@@ -43,32 +41,169 @@
     "repeat": 10,
     "warmup": 0
   },
-
   "profile": {
     "enabled": true,
     "msprof": "/var/msprof",
     "tbe_work_test_suit": "/home/p84341448/TbeWorkTestSuit"
   },
-
   "cases": [
-    {"name": "base",      "dtype": "both", "ci": 32, "hi": 288, "wi": 112, "cout1": 64, "cout2": 96},
-    {"name": "base_bias", "dtype": "both", "ci": 32, "hi": 288, "wi": 112, "cout1": 64, "cout2": 96,
-                          "bias": true},
-    {"name": "base_norelu", "dtype": "both", "ci": 32, "hi": 288, "wi": 112, "cout1": 64, "cout2": 96,
-                          "relu": [false, false]},
-
-    {"name": "hw112",     "dtype": "both", "ci": 32, "hi": 112, "wi": 112, "cout1": 32, "cout2": 32},
-    {"name": "s1_1",      "dtype": "both", "ci": 32, "hi": 64,  "wi": 64,  "cout1": 32, "cout2": 32,
-                          "strides": [1, 1]},
-    {"name": "k1x1",      "dtype": "both", "ci": 32, "hi": 64,  "wi": 64,  "cout1": 32, "cout2": 16,
-                          "kernel": [1, 1], "strides": [1, 1], "pads": [0, 0], "bias": true},
-    {"name": "k5x5",      "dtype": "both", "ci": 32, "hi": 64,  "wi": 64,  "cout1": 32, "cout2": 32,
-                          "kernel": [5, 5], "pads": [2, 2], "bias": true},
-    {"name": "k1x3",      "dtype": "both", "ci": 32, "hi": 32,  "wi": 36,  "cout1": 32, "cout2": 32,
-                          "kernel": [1, 3], "strides": [1, 1], "pads": [0, 0, 0, 0], "bias": true},
-    {"name": "wide_cmid", "dtype": "both", "ci": 32, "hi": 32,  "wi": 32,  "cout1": 128, "cout2": 32,
-                          "bias": true},
-    {"name": "batch2",    "dtype": "both", "n": 2, "ci": 32, "hi": 32, "wi": 32, "cout1": 32, "cout2": 32,
-                          "bias": true}
+    {
+      "name": "base",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 288,
+      "wi": 112,
+      "cout1": 64,
+      "cout2": 96
+    },
+    {
+      "name": "base_bias",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 288,
+      "wi": 112,
+      "cout1": 64,
+      "cout2": 96,
+      "bias": true
+    },
+    {
+      "name": "base_norelu",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 288,
+      "wi": 112,
+      "cout1": 64,
+      "cout2": 96,
+      "relu": [
+        false,
+        false
+      ]
+    },
+    {
+      "name": "hw112",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 112,
+      "wi": 112,
+      "cout1": 32,
+      "cout2": 32
+    },
+    {
+      "name": "s1_1",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 64,
+      "wi": 64,
+      "cout1": 32,
+      "cout2": 32,
+      "strides": [
+        1,
+        1
+      ]
+    },
+    {
+      "name": "k1x1",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 64,
+      "wi": 64,
+      "cout1": 32,
+      "cout2": 16,
+      "kernel": [
+        1,
+        1
+      ],
+      "strides": [
+        1,
+        1
+      ],
+      "pads": [
+        0,
+        0
+      ],
+      "bias": true
+    },
+    {
+      "name": "k5x5",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 64,
+      "wi": 64,
+      "cout1": 32,
+      "cout2": 32,
+      "kernel": [
+        5,
+        5
+      ],
+      "pads": [
+        2,
+        2
+      ],
+      "bias": true
+    },
+    {
+      "name": "k1x3",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 32,
+      "wi": 36,
+      "cout1": 32,
+      "cout2": 32,
+      "kernel": [
+        1,
+        3
+      ],
+      "strides": [
+        1,
+        1
+      ],
+      "pads": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "bias": true
+    },
+    {
+      "name": "wide_cmid",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 32,
+      "wi": 32,
+      "cout1": 128,
+      "cout2": 32,
+      "bias": true
+    },
+    {
+      "name": "batch2",
+      "dtype": "both",
+      "n": 2,
+      "ci": 32,
+      "hi": 32,
+      "wi": 32,
+      "cout1": 32,
+      "cout2": 32,
+      "bias": true
+    },
+    {
+      "name": "base_s8f16",
+      "dtype": "s8f16",
+      "ci": 32,
+      "hi": 288,
+      "wi": 112,
+      "cout1": 64,
+      "cout2": 96
+    },
+    {
+      "name": "wide_cmid_s8f16",
+      "dtype": "s8f16",
+      "ci": 32,
+      "hi": 32,
+      "wi": 32,
+      "cout1": 128,
+      "cout2": 32,
+      "bias": true
+    }
   ]
 }

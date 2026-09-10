@@ -143,6 +143,10 @@ struct Params {
     int padH1, padW1;
     int padH2, padW2;
     int elemBytes; // 2 = fp16, 1 = int8
+    // conv2 出口带不带 per-channel 反量化表（int8 进 / fp16 出那条通路）。
+    // 它只影响 L1 —— 表要常驻 L1 给 fixpipe 取，所以必须在这里，不能只当成
+    // 一个运行期开关。0 / 1。
+    int hasDeqScale2;
 };
 
 // M 方向的分块。**整个算子只有这一条分块公式**：把 total 行按 gran 切成 units 个
@@ -297,6 +301,7 @@ struct Geometry {
     int fmElems, midElems, w1Elems, w2Elems;
     int fmAddr, midAddr, w1Addr, w2Addr, b1Addr, b2Addr;
     int b1Bytes, b2Bytes;
+    int dq2Addr, dq2Bytes;   // conv2 的 per-channel 反量化表（不带时长度 0）
     int l1Used;
 
     // GM 侧一张图的元素数，供 batch 偏移和 UT 对账用
@@ -418,6 +423,7 @@ struct FlatGeom {
     int l0bElems, l0cElems;
     // ---- L1 地址表（字节地址）----
     int fmAddr, fmElems, midAddr, midElems, w1Addr, w1Elems, w2Addr, w2Elems, b1Addr, b2Addr;
+    int dq2Addr;   // conv2 的 per-channel 反量化表（不带时这一段长度为 0）
     // ---- GM 侧 ----
     int xPlane, yPlane, yPlaneM;
     // ---- conv2 的 M 分块表：每个 band 都一样，直接下发展开好的三个标量 ----
@@ -478,6 +484,7 @@ struct FlatGeom {
     X(w2Elems, w2Elems)       \
     X(b1Addr, b1Addr)         \
     X(b2Addr, b2Addr)         \
+    X(dq2Addr, dq2Addr)       \
     X(xPlane, xPlane)         \
     X(yPlane, yPlane)         \
     X(yPlaneM, yPlaneM)       \
@@ -541,6 +548,7 @@ FC2D_GEOM_FN void Flatten(const Geometry& g, int chunksPerCore, FlatGeom& f)
     f.w2Elems = g.w2Elems;
     f.b1Addr = g.b1Addr;
     f.b2Addr = g.b2Addr;
+    f.dq2Addr = g.dq2Addr;
 
     f.xPlane = g.xPlane;
     f.yPlane = g.yPlane;
@@ -806,7 +814,12 @@ FC2D_GEOM_FN int DeriveWithHb(const Params& p, int hb, int l1Budget, Geometry& g
     g.b1Bytes = BiasSegBytes(p.cout1, p.elemBytes);
     g.b2Addr = g.b1Addr + g.b1Bytes;
     g.b2Bytes = BiasSegBytes(p.cout2, p.elemBytes);
-    g.l1Used = g.b2Addr + g.b2Bytes;
+    // per-channel 反量化表：一个通道一个 uint64。fixpipe 取的是 L1 地址，所以它
+    // 得常驻。不带这条通路时长度 0，一个字节都不占 —— 否则每个形状都要为一个
+    // 用不上的段让出 4 KB，本来放得下的会被拒掉。
+    g.dq2Addr = g.b2Addr + g.b2Bytes;
+    g.dq2Bytes = (p.hasDeqScale2 != 0) ? Align(p.cout2 * (int)sizeof(long long), L1_SEG_ALIGN) : 0;
+    g.l1Used = g.dq2Addr + g.dq2Bytes;
     if (l1Budget > 0 && g.l1Used > l1Budget) {
         return RJ_L1;
     }

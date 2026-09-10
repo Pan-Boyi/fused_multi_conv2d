@@ -28,53 +28,789 @@
   ],
   "device": 0,
   "cases": [
-    {"name": "base",        "dtype": "both", "ci": 32, "hi": 288, "wi": 112, "cout1": 64, "cout2": 96},
-    {"name": "base_bias",   "dtype": "both", "ci": 32, "hi": 288, "wi": 112, "cout1": 64, "cout2": 96, "bias": true},
-
-    {"name": "k1x1",        "dtype": "both", "ci": 32, "hi": 64, "wi": 64, "cout1": 32, "cout2": 16,
-                            "kernel": [1, 1], "strides": [1, 1], "pads": [0, 0], "bias": true},
-    {"name": "k1x1_s2",     "dtype": "both", "ci": 64, "hi": 64, "wi": 64, "cout1": 64, "cout2": 32,
-                            "kernel": [1, 1], "strides": [1, 2], "pads": [0, 0]},
-    {"name": "s1_1",        "dtype": "both", "ci": 32, "hi": 64, "wi": 64, "cout1": 32, "cout2": 32,
-                            "strides": [1, 1]},
-    {"name": "s2_2",        "dtype": "both", "ci": 32, "hi": 64, "wi": 64, "cout1": 32, "cout2": 32,
-                            "strides": [2, 2], "bias": true},
-    {"name": "s2_1",        "dtype": "both", "ci": 32, "hi": 64, "wi": 64, "cout1": 32, "cout2": 48,
-                            "strides": [2, 1], "bias": true},
-    {"name": "k2x2_nopad",  "dtype": "both", "ci": 32, "hi": 65, "wi": 65, "cout1": 32, "cout2": 32,
-                            "kernel": [2, 2], "strides": [1, 2], "pads": [0, 0]},
-    {"name": "k5x5",        "dtype": "both", "ci": 32, "hi": 64, "wi": 64, "cout1": 32, "cout2": 32,
-                            "kernel": [5, 5], "pads": [2, 2], "bias": true},
-    {"name": "k7x7",        "dtype": "both", "ci": 32, "hi": 32, "wi": 32, "cout1": 32, "cout2": 16,
-                            "kernel": [7, 7], "pads": [3, 3]},
-    {"name": "k1x3",        "dtype": "both", "ci": 32, "hi": 32, "wi": 36, "cout1": 32, "cout2": 32,
-                            "kernel": [1, 3], "strides": [1, 1], "pads": [0, 0, 0, 0], "bias": true},
-    {"name": "k3x1",        "dtype": "both", "ci": 32, "hi": 36, "wi": 32, "cout1": 32, "cout2": 32,
-                            "kernel": [3, 1], "strides": [1, 1], "pads": [0, 0, 0, 0], "bias": true},
-    {"name": "k3x5",        "dtype": "both", "ci": 32, "hi": 32, "wi": 32, "cout1": 32, "cout2": 32,
-                            "kernel": [3, 5], "pads": [1, 2, 1, 2], "bias": true},
-    {"name": "pad_asym",    "dtype": "both", "ci": 32, "hi": 32, "wi": 32, "cout1": 32, "cout2": 32,
-                            "pads": [1, 1, 0, 1], "bias": true},
-
-    {"name": "wide_cin",    "dtype": "both", "ci": 128, "hi": 32, "wi": 32, "cout1": 32, "cout2": 16, "bias": true},
-    {"name": "wide_cmid",   "dtype": "both", "ci": 32, "hi": 32, "wi": 32, "cout1": 128, "cout2": 32, "bias": true},
-    {"name": "wide_cout",   "dtype": "both", "ci": 32, "hi": 32, "wi": 32, "cout1": 32, "cout2": 128},
-    {"name": "cin96",       "dtype": "both", "ci": 96, "hi": 32, "wi": 32, "cout1": 32, "cout2": 32, "bias": true},
-    {"name": "cmid96",      "dtype": "both", "ci": 32, "hi": 32, "wi": 32, "cout1": 96, "cout2": 32, "bias": true},
-    {"name": "cout48",      "dtype": "both", "ci": 64, "hi": 32, "wi": 32, "cout1": 64, "cout2": 48, "bias": true},
-
-    {"name": "hw_48x16",    "dtype": "both", "ci": 32, "hi": 48, "wi": 16, "cout1": 32, "cout2": 32, "bias": true},
-    {"name": "hw_16x48",    "dtype": "both", "ci": 32, "hi": 16, "wi": 48, "cout1": 32, "cout2": 32,
-                            "relu": [true, false]},
-    {"name": "hw_64x16",    "dtype": "both", "ci": 32, "hi": 64, "wi": 16, "cout1": 32, "cout2": 16, "bias": true},
-    {"name": "hw_40x24",    "dtype": "both", "ci": 32, "hi": 40, "wi": 24, "cout1": 32, "cout2": 16},
-    {"name": "hw_112x112",  "dtype": "both", "ci": 32, "hi": 112, "wi": 112, "cout1": 32, "cout2": 32},
-
-    {"name": "batch2",      "dtype": "both", "n": 2, "ci": 32, "hi": 32, "wi": 32, "cout1": 32, "cout2": 32, "bias": true},
-    {"name": "batch2_s11",  "dtype": "both", "n": 2, "ci": 32, "hi": 32, "wi": 32, "cout1": 32, "cout2": 16,
-                            "strides": [1, 1]},
-
-    {"name": "norelu",      "dtype": "both", "ci": 32, "hi": 32, "wi": 32, "cout1": 32, "cout2": 32,
-                            "relu": [false, false], "bias": true}
+    {
+      "name": "base",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 288,
+      "wi": 112,
+      "cout1": 64,
+      "cout2": 96
+    },
+    {
+      "name": "base_bias",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 288,
+      "wi": 112,
+      "cout1": 64,
+      "cout2": 96,
+      "bias": true
+    },
+    {
+      "name": "k1x1",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 64,
+      "wi": 64,
+      "cout1": 32,
+      "cout2": 16,
+      "kernel": [
+        1,
+        1
+      ],
+      "strides": [
+        1,
+        1
+      ],
+      "pads": [
+        0,
+        0
+      ],
+      "bias": true
+    },
+    {
+      "name": "k1x1_s2",
+      "dtype": "both",
+      "ci": 64,
+      "hi": 64,
+      "wi": 64,
+      "cout1": 64,
+      "cout2": 32,
+      "kernel": [
+        1,
+        1
+      ],
+      "strides": [
+        1,
+        2
+      ],
+      "pads": [
+        0,
+        0
+      ]
+    },
+    {
+      "name": "s1_1",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 64,
+      "wi": 64,
+      "cout1": 32,
+      "cout2": 32,
+      "strides": [
+        1,
+        1
+      ]
+    },
+    {
+      "name": "s2_2",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 64,
+      "wi": 64,
+      "cout1": 32,
+      "cout2": 32,
+      "strides": [
+        2,
+        2
+      ],
+      "bias": true
+    },
+    {
+      "name": "s2_1",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 64,
+      "wi": 64,
+      "cout1": 32,
+      "cout2": 48,
+      "strides": [
+        2,
+        1
+      ],
+      "bias": true
+    },
+    {
+      "name": "k2x2_nopad",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 65,
+      "wi": 65,
+      "cout1": 32,
+      "cout2": 32,
+      "kernel": [
+        2,
+        2
+      ],
+      "strides": [
+        1,
+        2
+      ],
+      "pads": [
+        0,
+        0
+      ]
+    },
+    {
+      "name": "k5x5",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 64,
+      "wi": 64,
+      "cout1": 32,
+      "cout2": 32,
+      "kernel": [
+        5,
+        5
+      ],
+      "pads": [
+        2,
+        2
+      ],
+      "bias": true
+    },
+    {
+      "name": "k7x7",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 32,
+      "wi": 32,
+      "cout1": 32,
+      "cout2": 16,
+      "kernel": [
+        7,
+        7
+      ],
+      "pads": [
+        3,
+        3
+      ]
+    },
+    {
+      "name": "k1x3",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 32,
+      "wi": 36,
+      "cout1": 32,
+      "cout2": 32,
+      "kernel": [
+        1,
+        3
+      ],
+      "strides": [
+        1,
+        1
+      ],
+      "pads": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "bias": true
+    },
+    {
+      "name": "k3x1",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 36,
+      "wi": 32,
+      "cout1": 32,
+      "cout2": 32,
+      "kernel": [
+        3,
+        1
+      ],
+      "strides": [
+        1,
+        1
+      ],
+      "pads": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "bias": true
+    },
+    {
+      "name": "k3x5",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 32,
+      "wi": 32,
+      "cout1": 32,
+      "cout2": 32,
+      "kernel": [
+        3,
+        5
+      ],
+      "pads": [
+        1,
+        2,
+        1,
+        2
+      ],
+      "bias": true
+    },
+    {
+      "name": "pad_asym",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 32,
+      "wi": 32,
+      "cout1": 32,
+      "cout2": 32,
+      "pads": [
+        1,
+        1,
+        0,
+        1
+      ],
+      "bias": true
+    },
+    {
+      "name": "wide_cin",
+      "dtype": "both",
+      "ci": 128,
+      "hi": 32,
+      "wi": 32,
+      "cout1": 32,
+      "cout2": 16,
+      "bias": true
+    },
+    {
+      "name": "wide_cmid",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 32,
+      "wi": 32,
+      "cout1": 128,
+      "cout2": 32,
+      "bias": true
+    },
+    {
+      "name": "wide_cout",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 32,
+      "wi": 32,
+      "cout1": 32,
+      "cout2": 128
+    },
+    {
+      "name": "cin96",
+      "dtype": "both",
+      "ci": 96,
+      "hi": 32,
+      "wi": 32,
+      "cout1": 32,
+      "cout2": 32,
+      "bias": true
+    },
+    {
+      "name": "cmid96",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 32,
+      "wi": 32,
+      "cout1": 96,
+      "cout2": 32,
+      "bias": true
+    },
+    {
+      "name": "cout48",
+      "dtype": "both",
+      "ci": 64,
+      "hi": 32,
+      "wi": 32,
+      "cout1": 64,
+      "cout2": 48,
+      "bias": true
+    },
+    {
+      "name": "hw_48x16",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 48,
+      "wi": 16,
+      "cout1": 32,
+      "cout2": 32,
+      "bias": true
+    },
+    {
+      "name": "hw_16x48",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 16,
+      "wi": 48,
+      "cout1": 32,
+      "cout2": 32,
+      "relu": [
+        true,
+        false
+      ]
+    },
+    {
+      "name": "hw_64x16",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 64,
+      "wi": 16,
+      "cout1": 32,
+      "cout2": 16,
+      "bias": true
+    },
+    {
+      "name": "hw_40x24",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 40,
+      "wi": 24,
+      "cout1": 32,
+      "cout2": 16
+    },
+    {
+      "name": "hw_112x112",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 112,
+      "wi": 112,
+      "cout1": 32,
+      "cout2": 32
+    },
+    {
+      "name": "batch2",
+      "dtype": "both",
+      "n": 2,
+      "ci": 32,
+      "hi": 32,
+      "wi": 32,
+      "cout1": 32,
+      "cout2": 32,
+      "bias": true
+    },
+    {
+      "name": "batch2_s11",
+      "dtype": "both",
+      "n": 2,
+      "ci": 32,
+      "hi": 32,
+      "wi": 32,
+      "cout1": 32,
+      "cout2": 16,
+      "strides": [
+        1,
+        1
+      ]
+    },
+    {
+      "name": "norelu",
+      "dtype": "both",
+      "ci": 32,
+      "hi": 32,
+      "wi": 32,
+      "cout1": 32,
+      "cout2": 32,
+      "relu": [
+        false,
+        false
+      ],
+      "bias": true
+    },
+    {
+      "name": "base_s8f16",
+      "dtype": "s8f16",
+      "ci": 32,
+      "hi": 288,
+      "wi": 112,
+      "cout1": 64,
+      "cout2": 96
+    },
+    {
+      "name": "base_bias_s8f16",
+      "dtype": "s8f16",
+      "ci": 32,
+      "hi": 288,
+      "wi": 112,
+      "cout1": 64,
+      "cout2": 96,
+      "bias": true
+    },
+    {
+      "name": "k1x1_s8f16",
+      "dtype": "s8f16",
+      "ci": 32,
+      "hi": 64,
+      "wi": 64,
+      "cout1": 32,
+      "cout2": 16,
+      "kernel": [
+        1,
+        1
+      ],
+      "strides": [
+        1,
+        1
+      ],
+      "pads": [
+        0,
+        0
+      ],
+      "bias": true
+    },
+    {
+      "name": "k1x1_s2_s8f16",
+      "dtype": "s8f16",
+      "ci": 64,
+      "hi": 64,
+      "wi": 64,
+      "cout1": 64,
+      "cout2": 32,
+      "kernel": [
+        1,
+        1
+      ],
+      "strides": [
+        1,
+        2
+      ],
+      "pads": [
+        0,
+        0
+      ]
+    },
+    {
+      "name": "s1_1_s8f16",
+      "dtype": "s8f16",
+      "ci": 32,
+      "hi": 64,
+      "wi": 64,
+      "cout1": 32,
+      "cout2": 32,
+      "strides": [
+        1,
+        1
+      ]
+    },
+    {
+      "name": "s2_2_s8f16",
+      "dtype": "s8f16",
+      "ci": 32,
+      "hi": 64,
+      "wi": 64,
+      "cout1": 32,
+      "cout2": 32,
+      "strides": [
+        2,
+        2
+      ],
+      "bias": true
+    },
+    {
+      "name": "s2_1_s8f16",
+      "dtype": "s8f16",
+      "ci": 32,
+      "hi": 64,
+      "wi": 64,
+      "cout1": 32,
+      "cout2": 48,
+      "strides": [
+        2,
+        1
+      ],
+      "bias": true
+    },
+    {
+      "name": "k2x2_nopad_s8f16",
+      "dtype": "s8f16",
+      "ci": 32,
+      "hi": 65,
+      "wi": 65,
+      "cout1": 32,
+      "cout2": 32,
+      "kernel": [
+        2,
+        2
+      ],
+      "strides": [
+        1,
+        2
+      ],
+      "pads": [
+        0,
+        0
+      ]
+    },
+    {
+      "name": "k5x5_s8f16",
+      "dtype": "s8f16",
+      "ci": 32,
+      "hi": 64,
+      "wi": 64,
+      "cout1": 32,
+      "cout2": 32,
+      "kernel": [
+        5,
+        5
+      ],
+      "pads": [
+        2,
+        2
+      ],
+      "bias": true
+    },
+    {
+      "name": "k7x7_s8f16",
+      "dtype": "s8f16",
+      "ci": 32,
+      "hi": 32,
+      "wi": 32,
+      "cout1": 32,
+      "cout2": 16,
+      "kernel": [
+        7,
+        7
+      ],
+      "pads": [
+        3,
+        3
+      ]
+    },
+    {
+      "name": "k1x3_s8f16",
+      "dtype": "s8f16",
+      "ci": 32,
+      "hi": 32,
+      "wi": 36,
+      "cout1": 32,
+      "cout2": 32,
+      "kernel": [
+        1,
+        3
+      ],
+      "strides": [
+        1,
+        1
+      ],
+      "pads": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "bias": true
+    },
+    {
+      "name": "k3x1_s8f16",
+      "dtype": "s8f16",
+      "ci": 32,
+      "hi": 36,
+      "wi": 32,
+      "cout1": 32,
+      "cout2": 32,
+      "kernel": [
+        3,
+        1
+      ],
+      "strides": [
+        1,
+        1
+      ],
+      "pads": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "bias": true
+    },
+    {
+      "name": "k3x5_s8f16",
+      "dtype": "s8f16",
+      "ci": 32,
+      "hi": 32,
+      "wi": 32,
+      "cout1": 32,
+      "cout2": 32,
+      "kernel": [
+        3,
+        5
+      ],
+      "pads": [
+        1,
+        2,
+        1,
+        2
+      ],
+      "bias": true
+    },
+    {
+      "name": "pad_asym_s8f16",
+      "dtype": "s8f16",
+      "ci": 32,
+      "hi": 32,
+      "wi": 32,
+      "cout1": 32,
+      "cout2": 32,
+      "pads": [
+        1,
+        1,
+        0,
+        1
+      ],
+      "bias": true
+    },
+    {
+      "name": "wide_cin_s8f16",
+      "dtype": "s8f16",
+      "ci": 128,
+      "hi": 32,
+      "wi": 32,
+      "cout1": 32,
+      "cout2": 16,
+      "bias": true
+    },
+    {
+      "name": "wide_cmid_s8f16",
+      "dtype": "s8f16",
+      "ci": 32,
+      "hi": 32,
+      "wi": 32,
+      "cout1": 128,
+      "cout2": 32,
+      "bias": true
+    },
+    {
+      "name": "wide_cout_s8f16",
+      "dtype": "s8f16",
+      "ci": 32,
+      "hi": 32,
+      "wi": 32,
+      "cout1": 32,
+      "cout2": 128
+    },
+    {
+      "name": "cin96_s8f16",
+      "dtype": "s8f16",
+      "ci": 96,
+      "hi": 32,
+      "wi": 32,
+      "cout1": 32,
+      "cout2": 32,
+      "bias": true
+    },
+    {
+      "name": "cmid96_s8f16",
+      "dtype": "s8f16",
+      "ci": 32,
+      "hi": 32,
+      "wi": 32,
+      "cout1": 96,
+      "cout2": 32,
+      "bias": true
+    },
+    {
+      "name": "cout48_s8f16",
+      "dtype": "s8f16",
+      "ci": 64,
+      "hi": 32,
+      "wi": 32,
+      "cout1": 64,
+      "cout2": 48,
+      "bias": true
+    },
+    {
+      "name": "hw_48x16_s8f16",
+      "dtype": "s8f16",
+      "ci": 32,
+      "hi": 48,
+      "wi": 16,
+      "cout1": 32,
+      "cout2": 32,
+      "bias": true
+    },
+    {
+      "name": "hw_16x48_s8f16",
+      "dtype": "s8f16",
+      "ci": 32,
+      "hi": 16,
+      "wi": 48,
+      "cout1": 32,
+      "cout2": 32,
+      "relu": [
+        true,
+        false
+      ]
+    },
+    {
+      "name": "hw_64x16_s8f16",
+      "dtype": "s8f16",
+      "ci": 32,
+      "hi": 64,
+      "wi": 16,
+      "cout1": 32,
+      "cout2": 16,
+      "bias": true
+    },
+    {
+      "name": "hw_40x24_s8f16",
+      "dtype": "s8f16",
+      "ci": 32,
+      "hi": 40,
+      "wi": 24,
+      "cout1": 32,
+      "cout2": 16
+    },
+    {
+      "name": "hw_112x112_s8f16",
+      "dtype": "s8f16",
+      "ci": 32,
+      "hi": 112,
+      "wi": 112,
+      "cout1": 32,
+      "cout2": 32
+    },
+    {
+      "name": "batch2_s8f16",
+      "dtype": "s8f16",
+      "n": 2,
+      "ci": 32,
+      "hi": 32,
+      "wi": 32,
+      "cout1": 32,
+      "cout2": 32,
+      "bias": true
+    },
+    {
+      "name": "batch2_s11_s8f16",
+      "dtype": "s8f16",
+      "n": 2,
+      "ci": 32,
+      "hi": 32,
+      "wi": 32,
+      "cout1": 32,
+      "cout2": 16,
+      "strides": [
+        1,
+        1
+      ]
+    },
+    {
+      "name": "norelu_s8f16",
+      "dtype": "s8f16",
+      "ci": 32,
+      "hi": 32,
+      "wi": 32,
+      "cout1": 32,
+      "cout2": 32,
+      "relu": [
+        false,
+        false
+      ],
+      "bias": true
+    }
   ]
 }

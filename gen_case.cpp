@@ -1,7 +1,7 @@
 /*
  * 生成上板验证用的 case 文件。在**任何能编译的机器**上跑，不需要 CANN、不需要设备。
  *
- *   ./gen_case out.bin --dtype fp16 --n 1 --ci 32 --hi 288 --wi 112 \
+ *   ./gen_case out.bin --dtype fp16|int8|s8f16 --n 1 --ci 32 --hi 288 --wi 112 \
  *              --cout1 64 --cout2 96 --kh 3 --kw 3 --s1 1 --s2 2 \
  *              --ph1 1 --pw1 1 --ph2 1 --pw2 1 --bias 0 --relu1 1 --relu2 1 \
  *              --shift1 42 --shift2 42
@@ -26,10 +26,12 @@
  * singleop.json 时都从它读，所以 .bin 和 .om 不可能对不上形状 —— 上一版靠脚本
  * 里另写一份 shape，改了 golden 忘了改 json，板上报的是「算子没找到」。
  *
- * 张量顺序就是算子的 ABI 顺序：x, filter1, bias1, filter2, bias2 -> y
+ * 张量顺序就是算子的 ABI 顺序：x, filter1, bias1, filter2, bias2, dequant_scale2 -> y
  * 外加 golden：
  *   fp16   y_expect（定点模型，假设成立时应逐位相等）+ y_exact（纯 fp32 参考）
  *   int8   y_expect（精确整数运算 + REQ8，应逐位相等）
+ *   s8f16  y_expect（int8 乘累加 + per-channel 反量化成 fp16，应逐位相等），
+ *          dequant_scale2 是要**下发给算子**的那张表，不是 golden
  */
 #include <cstdio>
 #include <cstdlib>
@@ -44,6 +46,7 @@ using namespace fc2d_golden;
 constexpr uint32_t ACL_DT_FLOAT16 = 1;
 constexpr uint32_t ACL_DT_INT8 = 2;
 constexpr uint32_t ACL_DT_INT32 = 3;
+constexpr uint32_t ACL_DT_UINT64 = 10;
 
 constexpr uint32_t CASE_VERSION = 4;
 constexpr int SPEC_N = 32; // spec 数组的长度，留了余量
@@ -74,6 +77,9 @@ enum SpecIdx {
     SPEC_WO2,
     SPEC_SAFE_F1, // 部分和不溢出所允许的最大 F（只有 fp16 有意义）
     SPEC_SAFE_F2,
+    // 1 = 出口是 fp16 而入口是 int8（那条 per-channel 反量化的通路）。
+    // **只能往后加**：run_fused_conv2d.py 和 fc2d.py 按同样的下标读。
+    SPEC_OUT_FP16,
     SPEC_COUNT
 };
 static_assert(SPEC_COUNT <= SPEC_N, "spec 数组放不下");
@@ -140,13 +146,18 @@ int main(int argc, char** argv)
     const char* out = argv[1];
 
     Case c;
+    // 三条通路。s8f16 的入口和 int8 完全一样，只有 conv2 的出口不同。
     const std::string dtype = ArgStr(argc, argv, "--dtype", "fp16");
+    bool outFp16 = false;
     if (dtype == "int8") {
         c.elemBytes = 1;
+    } else if (dtype == "s8f16") {
+        c.elemBytes = 1;
+        outFp16 = true;
     } else if (dtype == "fp16") {
         c.elemBytes = 2;
     } else {
-        std::fprintf(stderr, "[X] --dtype 只能是 fp16 或 int8，给的是 %s\n", dtype.c_str());
+        std::fprintf(stderr, "[X] --dtype 只能是 fp16 / int8 / s8f16，给的是 %s\n", dtype.c_str());
         return 2;
     }
     c.n = ArgInt(argc, argv, "--n", c.n);
@@ -186,7 +197,8 @@ int main(int argc, char** argv)
         return 2;
     }
 
-    std::printf("形状: %s\n", c.Text().c_str());
+    // Case::Text() 只认 elemBytes，说不出「出口是 fp16」这件事，所以补一句。
+    std::printf("形状: %s%s\n", c.Text().c_str(), outFp16 ? "  [出口 fp16，per-channel 反量化]" : "");
     std::printf("  conv1 -> %dx%d，conv2 -> %dx%d，y 共 %ld 个元素\n", c.Ho1(), c.Wo1(), c.Ho2(), c.Wo2(),
                 c.YElems());
 
@@ -214,6 +226,7 @@ int main(int argc, char** argv)
     spec[SPEC_SHIFT2] = c.shift2;
     spec[SPEC_HO2] = c.Ho2();
     spec[SPEC_WO2] = c.Wo2();
+    spec[SPEC_OUT_FP16] = outFp16 ? 1 : 0;
 
     FILE* f = std::fopen(out, "wb");
     if (f == nullptr) {
@@ -231,7 +244,46 @@ int main(int argc, char** argv)
     const std::vector<int64_t> f1Dims = {fz1k, fz1n, 16, (int64_t)c0};
     const std::vector<int64_t> f2Dims = {fz2k, fz2n, 16, (int64_t)c0};
 
-    if (c.elemBytes == 2) {
+    if (outFp16) {
+        // ---- int8 进 / fp16 出 ------------------------------------------------
+        // conv1 和 int8 通路一模一样（REQ8 出 int8 的 mid），只有 conv2 的出口是
+        // 按通道反量化成 fp16。所以 golden 走的是同一个 Build，只多传一个开关。
+        int8path::Result g = int8path::Build(c, /*fp16Out*/ true);
+        uint32_t qs1 = 0;
+        std::memcpy(&qs1, &g.scale1, 4);
+        const float one = 1.0f;
+        uint32_t oneBits = 0;
+        std::memcpy(&oneBits, &one, 4);
+        std::printf("  conv1 量化: scale1 = %.9g（低 13 位尾数已按硬件丢掉）\n", g.scale1);
+        std::printf("  conv2 反量化: per-channel，%d 个系数，第 0 个 = %.9g\n", c.cout2,
+                    [&]() { float v; uint32_t b = (uint32_t)g.deq[0]; std::memcpy(&v, &b, 4); return v; }());
+        std::printf("  golden: 非零 %ld / %ld\n", g.yNonZero, c.YElems());
+
+        w.Raw("FC2DCASE", 8);
+        w.U32(CASE_VERSION);
+        w.U32(8); // x, f1, b1, f2, b2, dequant_scale2, y_expect, w1_nchw
+        w.U64((uint64_t)g.yNonZero);
+        w.U64(0); // 这条通路没有「饱和」这一说，出口是 fp16
+        w.U64((uint64_t)c.YElems());
+        for (int i = 0; i < SPEC_N; ++i) {
+            w.I32(spec[i]);
+        }
+        // quant_scale1 照发（conv1 的出口用它）；quant_scale2 这条通路不用，
+        // 但**不能写 0** —— 它会原样进 singleop.json 当属性值，而 ACL 按属性的值
+        // 匹配 .om。写算子声明里的缺省 1.0。
+        w.U32(qs1);
+        w.U32(oneBits);
+
+        w.Tensor("x", ACL_DT_INT8, xDims, g.xNchw.data(), g.xNchw.size());
+        w.Tensor("filter1", ACL_DT_INT8, f1Dims, g.w1Dev.data(), g.w1Dev.size());
+        w.Tensor("bias1", ACL_DT_INT32, {(int64_t)c.cout1}, g.b1.data(), g.b1.size() * 4);
+        w.Tensor("filter2", ACL_DT_INT8, f2Dims, g.w2Dev.data(), g.w2Dev.size());
+        w.Tensor("bias2", ACL_DT_INT32, {(int64_t)c.cout2}, g.b2.data(), g.b2.size() * 4);
+        w.Tensor("dequant_scale2", ACL_DT_UINT64, {(int64_t)c.cout2}, g.deq.data(), g.deq.size() * 8);
+        w.Tensor("y_expect", ACL_DT_FLOAT16, yDims, g.yF16.data(), g.yF16.size() * 2);
+        w.Tensor("w1_nchw", ACL_DT_INT8, {(int64_t)c.cout1, (int64_t)c.ci, (int64_t)c.kh, (int64_t)c.kw},
+                 g.w1Nchw.data(), g.w1Nchw.size());
+    } else if (c.elemBytes == 2) {
         f16path::Result g = f16path::Build(c);
         spec[SPEC_SAFE_F1] = g.safeF1;
         spec[SPEC_SAFE_F2] = g.safeF2;

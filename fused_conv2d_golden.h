@@ -515,9 +515,16 @@ struct Result {
     float scale1 = 0, scale2 = 0;
     long yNonZero = 0;
     long sat = 0;
+    // 「int8 进 / fp16 出」那条通路才填这两个：conv2 出口的 per-channel 反量化表，
+    // 和对应的 fp16 golden。y（int8）那时不填。
+    std::vector<uint64_t> deq;
+    std::vector<uint16_t> yF16;
 };
 
-inline Result Build(const Case& c)
+// fp16Out = true 就是「int8 进 / fp16 出」那条：**前半段完全一样**（conv1 REQ8
+// 出 int8 的 mid、conv2 的 int32 累加器），只有 conv2 的出口换成按通道反量化。
+// 用同一个函数而不是另写一份，是为了让两条通路对前半段不可能有分歧。
+inline Result Build(const Case& c, bool fp16Out = false)
 {
     Result r;
     const int ho1 = c.Ho1(), wo1 = c.Wo1(), ho2 = c.Ho2(), wo2 = c.Wo2();
@@ -570,6 +577,56 @@ inline Result Build(const Case& c)
         }
         ConvInt8(mid.data(), r.w2Nchw.data(), pb2, c.cout1, ho1, wo1, c.cout2, ho2, wo2, c.kh, c.kw,
                  c.stride2, c.padH2, c.padW2, acc2[b]);
+    }
+    if (fp16Out) {
+        // ---- 出口：per-channel 反量化成 fp16（VDEQF16）--------------------
+        const size_t plane = (size_t)ho2 * wo2;
+        r.deq.assign((size_t)c.cout2, 0);
+        r.yF16.assign((size_t)c.YElems(), 0);
+        std::vector<float> dq((size_t)c.cout2);
+        for (int co = 0; co < c.cout2; ++co) {
+            int32_t m = 0;
+            for (int b = 0; b < c.n; ++b) {
+                for (size_t p = 0; p < plane; ++p) {
+                    int32_t a = acc2[b][(size_t)co * plane + p];
+                    if (a < 0) {
+                        a = -a;
+                    }
+                    if (a > m) {
+                        m = a;
+                    }
+                }
+            }
+            // 让每个通道的峰值落到 8 附近（fp16 表示得舒服），同时逐通道不同 ——
+            // 全用一个系数的话，「恒取第 0 个」这类 per-channel 特有的错误看不出来。
+            //
+            // EffectiveScale：系数的低 13 位尾数会被硬件丢掉，和 REQ8 的 deqScalar
+            // 一样。不照做的话结果稳定差 1 个 ULP，而且永远是算子那边小。
+            const float base = (m == 0) ? 1.0f : (8.0f / (float)m);
+            dq[(size_t)co] = EffectiveScale(base * (1.0f + 0.05f * (float)(co % 7)));
+            uint32_t bits = 0;
+            std::memcpy(&bits, &dq[(size_t)co], 4);
+            r.deq[(size_t)co] = (uint64_t)bits;
+        }
+        for (int b = 0; b < c.n; ++b) {
+            const size_t bo = (size_t)b * c.cout2 * plane;
+            for (int co = 0; co < c.cout2; ++co) {
+                for (size_t p = 0; p < plane; ++p) {
+                    float v = (float)acc2[b][(size_t)co * plane + p] * dq[(size_t)co];
+                    // 硬件是「先换算后 relu」，而且 relu 把负数压成 **-0.0**
+                    // （0x8000）不是 +0.0 —— 数值上相等，位型上不是。
+                    if (c.relu2 && v < 0.0f) {
+                        v = -0.0f;
+                    }
+                    const uint16_t h = F32ToF16Bits(v);
+                    r.yF16[bo + (size_t)co * plane + p] = h;
+                    if (h != 0 && h != 0x8000u) {
+                        ++r.yNonZero;
+                    }
+                }
+            }
+        }
+        return r;
     }
     {
         std::vector<int32_t> all;

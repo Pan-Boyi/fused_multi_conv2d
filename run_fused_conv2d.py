@@ -68,7 +68,7 @@ CASE_VERSION = 4
 SPEC_KEYS = [
     "n", "ci", "hi", "wi", "cout1", "cout2", "kh", "kw", "s1", "s2",
     "ph1", "pw1", "ph2", "pw2", "elem_bytes", "bias", "relu1", "relu2",
-    "shift1", "shift2", "ho2", "wo2", "safe_f1", "safe_f2",
+    "shift1", "shift2", "ho2", "wo2", "safe_f1", "safe_f2", "out_fp16",
 ]
 SPEC_N = 32
 HDR_FMT = "<8sIIQQQ" + "%di" % SPEC_N + "II"
@@ -76,7 +76,11 @@ HDR_LEN = struct.calcsize(HDR_FMT)
 REC_FMT = "<16sII4qQ"           # name, dtype, ndim, dims[4], nbytes
 REC_LEN = struct.calcsize(REC_FMT)
 
+# 算子的 ABI 输入顺序。dequant_scale2 是 IR 下标 5 的**可选**输入，只有
+# 「int8 进 / fp16 出」那条通路传它 —— 通路就是由它的有无来选的。
+# 实际用哪个列表见 info["order"]，那是按 case 算出来的。
 ORDER = ["x", "filter1", "bias1", "filter2", "bias2"]
+ORDER_S8F16 = ORDER + ["dequant_scale2"]
 # 两个 golden：y_expect 是定点模型（假设成立时应逐位相等），y_exact 是纯 fp32
 # 参考（判「有没有在算这个卷积」，不受定点假设影响）。见 golden.h 顶部那段。
 GOLDENS = ["y_expect", "y_exact"]
@@ -159,10 +163,13 @@ def load_case(path):
             die("张量 %s: dims=%s dtype=%s 应为 %d 字节，实际 %d"
                 % (name, dims, DTYPE_NAME[dtype], want, len(data)))
 
-    isInt8 = (spec["elem_bytes"] == 1)
+    isInt8 = (spec["elem_bytes"] == 1)          # **入口**是 int8
+    isS8F16 = isInt8 and spec.get("out_fp16", 0) == 1
+    outInt8 = isInt8 and not isS8F16            # **出口**是 int8
+    order = ORDER_S8F16 if isS8F16 else ORDER
     # y_exact（纯 fp32 参考）只有 fp16 定点通路有 —— 那边的定点模型带假设，需要
-    # 第二个不依赖模型的参照。int8 通路的 golden 是精确整数运算，没有这个概念。
-    required = list(ORDER) + ["y_expect"] + ([] if isInt8 else ["y_exact"])
+    # 第二个不依赖模型的参照。两条 int8 入口的 golden 都是精确整数运算，没有这个概念。
+    required = list(order) + ["y_expect"] + ([] if isInt8 else ["y_exact"])
     for name in required:
         if name not in tensors:
             die("case 文件里缺张量 %s" % name)
@@ -171,7 +178,10 @@ def load_case(path):
     if not isInt8 and not (0 <= shift1 <= FIX_SHIFT_LEN and 0 <= shift2 <= FIX_SHIFT_LEN):
         die("header 里的定点定标 %d / %d 超出 [0,%d]" % (shift1, shift2, FIX_SHIFT_LEN))
     info = dict(spec)
-    info["isInt8"] = isInt8
+    info["isInt8"] = isInt8      # 入口
+    info["outInt8"] = outInt8    # 出口。s8f16 这条两者不同，别混用
+    info["isS8F16"] = isS8F16
+    info["order"] = order
     info["hasBias"] = bool(spec["bias"])
     info["relu"] = bool(spec["relu1"])   # 兼容旧调用点；两层各自的开关见 relu1/relu2
     info["qs1"] = struct.unpack("<f", struct.pack("<I", qs1_bits))[0]
@@ -180,7 +190,8 @@ def load_case(path):
         "n%d %d->%d->%d %dx%d k%dx%d s%d/%d p%d,%d/%d,%d -> %dx%d %s"
         % (spec["n"], spec["ci"], spec["cout1"], spec["cout2"], spec["hi"], spec["wi"],
            spec["kh"], spec["kw"], spec["s1"], spec["s2"], spec["ph1"], spec["pw1"],
-           spec["ph2"], spec["pw2"], spec["ho2"], spec["wo2"], "int8" if isInt8 else "fp16"))
+           spec["ph2"], spec["pw2"], spec["ho2"], spec["wo2"],
+           "int8->fp16" if isS8F16 else ("int8" if isInt8 else "fp16")))
     # probe 这一位在版本 4 里没有了：探针权重是运行时输入，要探就直接改 gen_case
     # 生成的权重，不需要在 header 里留一个字段。
     return tensors, nonzero, 0, sat, y_elems, shift1, shift2, info
@@ -804,16 +815,16 @@ def main():
     tensors, gold_nonzero, probe, sat, y_elems, shift1, shift2, info = load_case(case_path)
     print("形状（来自 case 文件的 spec）: %s" % info["shape_text"])
     want_raw = tensors["y_expect"][2]
-    yElemBytes = 1 if info["isInt8"] else 2
-    ySentinel = Y_SENTINEL_I8 if info["isInt8"] else Y_SENTINEL_U16
+    yElemBytes = 1 if info["outInt8"] else 2
+    ySentinel = Y_SENTINEL_I8 if info["outInt8"] else Y_SENTINEL_U16
     if len(want_raw) != y_elems * yElemBytes:
         die("golden 输出 %d 字节，按 %d 个 fp16 元素应为 %d"
             % (len(want_raw), y_elems, y_elems * yElemBytes))
-    want = decode_y(want_raw, info["isInt8"])
+    want = decode_y(want_raw, info["outInt8"])
     print("case 文件 OK：")
     # 只列**存在**的张量：int8 通路没有 y_exact（它的 golden 是精确整数模型，
     # 不需要 fp16 那边的"纯 fp32 参考"）。写死成 ORDER + GOLDENS 会 KeyError。
-    for name in ORDER + GOLDENS:
+    for name in info["order"] + GOLDENS:
         if name not in tensors:
             continue
         dtype, dims, data = tensors[name]
@@ -907,7 +918,7 @@ def main():
         # ABI 顺序钉死，和 op_host/fused_conv2d_def.cpp 的 Input() 调用顺序一一对应：
         #   x, scale_x, filter1, bias1, scale1, filter2, bias2, scale2 -> y
         # 少传一个 ACL 不一定报错，它可能把后面的实参往前挪，于是 filter1 被当成 scale_x。
-        for name in ORDER:
+        for name in info["order"]:
             dtype, dims, data = tensors[name]
             make_operand(dtype, dims, data)
 
@@ -915,7 +926,7 @@ def main():
         # 这是"返回码 0 但什么都没算"唯一能被抓住的地方。
         make_operand(y_dtype, y_dims, bytes([Y_SENTINEL_BYTE]) * (y_elems * yElemBytes))
 
-        NIN = len(ORDER)
+        NIN = len(info["order"])
         in_desc = (ctypes.c_void_p * NIN)(*descs[:NIN])
         in_buf = (ctypes.c_void_p * NIN)(*bufs[:NIN])
         out_desc = (ctypes.c_void_p * 1)(descs[NIN])
@@ -1002,7 +1013,7 @@ def main():
         out = ctypes.create_string_buffer(y_bytes)
         check(acl.aclrtMemcpy(ctypes.cast(out, ctypes.c_void_p), y_bytes, dev_ptrs[NIN], y_bytes,   # NIN 号才是输出，别写死
                               ACL_MEMCPY_DEVICE_TO_HOST), "aclrtMemcpy D2H = %d")
-        got = decode_y(out.raw[:y_bytes], info["isInt8"])
+        got = decode_y(out.raw[:y_bytes], info["outInt8"])
 
     # ------------------------------------------------------------ 比对
     r = evaluate(got, want, rel_tol, ySentinel)
@@ -1045,14 +1056,14 @@ def main():
     # **小于 1e-3**。也就是说差 1 个 ULP 的结果照样能通过 1e-3 的判据。
     # 所以现在这两条判据不再等价，宽严关系是：逐位相等 严于 1e-3。
     # 真正的判据是 mismatches == 0；达标比例 100% 但 mismatches != 0 就是 [PASS*]。
-    if info["isInt8"]:
+    if info["outInt8"]:
         print("       注: 输出是 int8，判据只有逐位相等 —— 没有 ULP 可言。")
     else:
         print("       注: 输出是 fp16，1 个 ULP 的相对误差 <= 2^-10 ≈ 9.77e-4 < %g，" % rel_tol)
         print("           所以 %g 的判据比逐位相等**宽**：差 1 ULP 也能达标。" % rel_tol)
         print("           以 mismatches == 0 为准；只达标不逐位相等会报 [PASS*]。")
 
-    if info["isInt8"]:
+    if info["outInt8"]:
         # int8 的输出就是整数，没有"累加器 LSB"或"输出 ULP"可言 —— 判据只有
         # 逐位相等。差 1 的个数单独报，那是重量化舍入方向不同的表现。
         offBy1 = sum(1 for i in range(r["n"]) if abs(got[0][i] - want[0][i]) == 1)
@@ -1068,10 +1079,16 @@ def main():
             print("       => 设备侧大面积饱和而 golden 没有 —— 极可能是 quant_scale 没传对。")
             print("          它是 OPTIONAL，缺省 1.0，而 int8 的累加器量级在 1e6~1e7，")
             print("          1.0 会让每个点都撞到 ±127。检查 om_out 里的 singleop_used.json。")
+    elif info["isS8F16"]:
+        # 这条的出口是 per-channel 反量化，定标不是 2 的幂 —— report_lsb 那套
+        # 「累加器 LSB = 2^-(58-S)」在这里没有意义，报了只会误导。
+        print("\n[s8f16] 出口是 per-channel 反量化（VDEQF16），定标来自 dequant_scale2 那张表，")
+        print("        不是 fixed_shift 的 2 的幂 —— 所以这里不报累加器 LSB。")
+        print("        判据就是逐位相等：golden 的乘累加是精确整数运算，出口按同一张表换算。")
     else:
         report_lsb(got, want, r, mismatches, y_dims, shift2)
     report_ratio(got, want, r["n"])
-    if info["isInt8"]:
+    if info["outInt8"]:
         # int8 没有 y_exact，但抽样一样有用 —— 打整数就行。
         print("\n[抽样] 32 个点，跨通道跨空间铺开   (idx  c/h/w   got | y_expect)")
         plane = y_dims[2] * y_dims[3]
@@ -1097,7 +1114,7 @@ def main():
     dump_path = os.environ.get("FC2D_DUMP", "")
     if (not dry_run) and dump_path and dump_path != "-":
         dump_raw(dump_path, out.raw[:y_bytes], "设备输出 (%s NCHW [1,%d,%d,%d])"
-                 % ("int8" if info["isInt8"] else "fp16", y_dims[1], y_dims[2], y_dims[3]))
+                 % ("int8" if info["outInt8"] else "fp16", y_dims[1], y_dims[2], y_dims[3]))
 
     if not dry_run:
         acl.aclopDestroyAttr(attr)

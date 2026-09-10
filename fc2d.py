@@ -29,6 +29,7 @@ fused_conv2d 上板验证的总驱动 —— **改一个 json 就能换形状**�
 """
 import argparse
 import json
+import re
 import os
 import shutil
 import struct
@@ -41,7 +42,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SPEC_KEYS = [
     "n", "ci", "hi", "wi", "cout1", "cout2", "kh", "kw", "s1", "s2",
     "ph1", "pw1", "ph2", "pw2", "elem_bytes", "bias", "relu1", "relu2",
-    "shift1", "shift2", "ho2", "wo2", "safe_f1", "safe_f2",
+    "shift1", "shift2", "ho2", "wo2", "safe_f1", "safe_f2", "out_fp16",
 ]
 SPEC_N = 32
 HDR_FMT = "<8sIIQQQ" + "%di" % SPEC_N + "II"
@@ -49,9 +50,32 @@ HDR_LEN = struct.calcsize(HDR_FMT)
 CASE_VERSION = 4
 
 
+# run_fused_conv2d.py 里有**同一份** SPEC_KEYS 的抄本。它必须能单独跑在板子机上
+# （do_push 只拷 case.bin / .om / run_fused_conv2d.py 三个文件过去），所以没法
+# import 这边的定义。两份一旦长歪，读到的就是相邻字段的值 —— 不报错，只是全错。
+# 加了 out_fp16 那次就是这么被绊了一下：这边加了、那边没加，表现是「golden 输出
+# 1548288 字节，按 774144 个 fp16 元素应为 774144」，跟字段清单看不出关系。
+def _check_spec_keys_in_sync():
+    path = os.path.join(HERE, "run_fused_conv2d.py")
+    if not os.path.isfile(path):
+        return
+    with open(path) as fh:
+        m = re.search(r"SPEC_KEYS = \[(.*?)\]", fh.read(), re.S)
+    if m is None:
+        return
+    other = [x.strip().strip('"') for x in m.group(1).replace("\n", " ").split(",") if x.strip()]
+    if other != SPEC_KEYS:
+        die("SPEC_KEYS 和 run_fused_conv2d.py 里那份对不上：\n"
+            "    这边 %s\n    那边 %s\n"
+            "  两边读的是同一个 .bin，对不上会静默读错字段。" % (SPEC_KEYS, other))
+
+
 def die(msg):
     print("\n[X] %s" % msg)
     sys.exit(1)
+
+
+_check_spec_keys_in_sync()
 
 
 def step(msg):
@@ -89,8 +113,11 @@ def normalise(case, index):
             % (index, unknown, ", ".join(sorted(DEFAULTS) + ["name"])))
     out.update(case)
     out["name"] = case.get("name", "case%02d" % index)
-    if out["dtype"] not in ("fp16", "int8", "both"):
-        die("case %s 的 dtype 只能是 fp16 / int8 / both" % out["name"])
+    # s8f16 = int8 进 / fp16 出：conv1 还是 int8，conv2 的出口 per-channel 反量化。
+    # both 只展开 fp16 + int8 这两条（那是「同一形状两条通路都跑一遍」的意思），
+    # s8f16 要显式写 —— 它多一个输入，不是前两条的变体。
+    if out["dtype"] not in ("fp16", "int8", "s8f16", "both"):
+        die("case %s 的 dtype 只能是 fp16 / int8 / s8f16 / both" % out["name"])
     k = out["kernel"]
     if not isinstance(k, list) or len(k) != 2:
         die("case %s 的 kernel 要写成 [kh, kw]" % out["name"])
@@ -160,8 +187,10 @@ def singleop_json(spec):
     一个子集，于是执行时多设一个属性就炸 —— 这里统一成全集，那类问题不存在了。
     """
     fp16 = spec["elem_bytes"] == 2
+    outFp16 = fp16 or spec.get("out_fp16", 0) == 1
     t = "float16" if fp16 else "int8"
     bt = "float16" if fp16 else "int32"
+    yt = "float16" if outFp16 else "int8"
     c0 = 16 if fp16 else 32
     fz1k = (spec["ci"] // c0) * spec["kh"] * spec["kw"]
     fz2k = (spec["cout1"] // c0) * spec["kh"] * spec["kw"]
@@ -172,13 +201,17 @@ def singleop_json(spec):
         {"format": "ND", "shape": [fz2k, spec["cout2"] // 16, 16, c0], "type": t},
         {"format": "ND", "shape": [spec["cout2"]], "type": bt},
     ]
+    # dequant_scale2 是 IR 下标 5 的可选输入。**传了它就是 int8 进 / fp16 出那条**
+    # —— 通路由输入的有无来选，不是属性。所以别的两条这里一个字都不加。
+    if spec.get("out_fp16", 0) == 1:
+        inputs.append({"format": "ND", "shape": [spec["cout2"]], "type": "uint64"})
     return [{
         "op": "FusedConv2d",
         "input_desc": inputs,
         "output_desc": [
             {"format": "ND",
              "shape": [spec["n"], spec["cout2"], spec["ho2"], spec["wo2"]],
-             "type": t}
+             "type": yt}
         ],
         "attr": [
             {"name": "fixed_shift1", "type": "int", "value": spec["shift1"]},
@@ -244,6 +277,8 @@ def do_check(c, l1):
     ~/ascend/log/ 里，找起来很费劲。
     """
     exe = ensure_tool("fc2d_geom")
+    # dtype 原样传下去：fc2d_geom 认 fp16 / int8 / s8f16，s8f16 会按「L1 末尾多一段
+    # per-channel 反量化表」去算几何 —— 那一段是真占地方的，预检不能漏掉它。
     ph1, pw1, ph2, pw2 = c["pads"]
     argv = [exe, "--dtype", c["dtype"],
             "--n", str(c["n"]), "--ci", str(c["ci"]), "--hi", str(c["hi"]), "--wi", str(c["wi"]),
