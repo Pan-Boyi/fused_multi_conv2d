@@ -123,9 +123,10 @@ FC2D_GEOM_CE int BiasSegBytes(int cout, int elemBytes)
 }
 
 // ---------------------------------------------------------------------------
-// 调用方给的东西。elemBytes 是特征图 / 权重的元素宽度：2 = fp16 定点，1 = int8
-// 量化。C0 由它决定（一个 C0 恒等于 32 字节），于是 C1、FRACTAL_Z 的维度、L1 占用
-// 全跟着变 —— 两条通路的差别在这个头里只有这一个入口。
+// 调用方给的东西。elemBytes 保留为 x 的元素宽度和旧三条同 dtype 通路的兼容入口；
+// weightElemBytes / midElemBytes / biasElemBytes 为 0 时继承旧语义。A16W8 显式给出
+// fp16 x、int8 filter、int8 mid、int32 bias。每类张量的 C0 都按自己的元素宽度计算，
+// 一个 C0 始终是 32 字节。
 // ---------------------------------------------------------------------------
 struct Params {
     int n;         // batch
@@ -142,12 +143,34 @@ struct Params {
     // 比如 1x3 的 separable conv 要 padH = 0、padW = 1，一个标量表达不了。
     int padH1, padW1;
     int padH2, padW2;
-    int elemBytes; // 2 = fp16, 1 = int8
+    int elemBytes; // x element bytes: 2 = fp16, 1 = int8
     // conv2 出口带不带 per-channel 反量化表（int8 进 / fp16 出那条通路）。
     // 它只影响 L1 —— 表要常驻 L1 给 fixpipe 取，所以必须在这里，不能只当成
     // 一个运行期开关。0 / 1。
-    int hasDeqScale2;
+    int hasDeqScale2 = 0;
+    // The original three paths use one dtype for x/filter/mid, so old aggregate
+    // initializers intentionally leave these fields at zero.  Zero means
+    // "inherit the legacy value derived from elemBytes".  A16W8 sets them
+    // explicitly: fp16 x, int8 filters, int8 mid, int32 bias.
+    int weightElemBytes = 0;
+    int midElemBytes = 0;
+    int biasElemBytes = 0;
+    int hasQuantScale1 = 0; // per-channel VREQ8 table for conv1 -> int8 mid
+    int hasQuantScale2 = 0; // per-channel VREQ8 table for conv2 -> int8 y
 };
+
+FC2D_GEOM_CE int WeightElemBytes(const Params& p)
+{
+    return p.weightElemBytes == 0 ? p.elemBytes : p.weightElemBytes;
+}
+FC2D_GEOM_CE int MidElemBytes(const Params& p)
+{
+    return p.midElemBytes == 0 ? p.elemBytes : p.midElemBytes;
+}
+FC2D_GEOM_CE int ParamBiasElemBytes(const Params& p)
+{
+    return p.biasElemBytes == 0 ? BiasElemBytes(p.elemBytes) : p.biasElemBytes;
+}
 
 // M 方向的分块。**整个算子只有这一条分块公式**：把 total 行按 gran 切成 units 个
 // 单位，均分成 n 块，余数摊给靠前的块。
@@ -208,6 +231,27 @@ FC2D_GEOM_FN TileTable MakeTiles(int total, int maxRows, int gran)
         t.row0[i] = (i < s.n) ? TileRow0(s, i) : 0;
     }
     return t;
+}
+
+// Split the fmap MTE2 transaction along its channel/K dimension without
+// changing conv1's M tiles.  Input channels are innermost in K, so the first
+// tileK1 channels are precisely what the first img2col/MMAD consumes.  The
+// remaining channels can arrive while that original full-M MMAD is running.
+struct FmLoadSpec {
+    int n;
+    int firstC;
+};
+
+FC2D_GEOM_CE FmLoadSpec MakeFmLoadSpec(int ci, int c0, int tileK1, int l0bChunks1, int nwseg,
+                                      int conv1MTiles)
+{
+    FmLoadSpec s = {1, ci};
+    if (nwseg > 1 && l0bChunks1 == 1 && conv1MTiles == 1 && tileK1 >= c0 && tileK1 < ci &&
+        (tileK1 % c0) == 0) {
+        s.n = 2;
+        s.firstC = tileK1;
+    }
+    return s;
 }
 
 // ---------------------------------------------------------------------------
@@ -278,7 +322,7 @@ FC2D_GEOM_FN const char* RejectText(int r)
 struct Geometry {
     Params p;
 
-    int c0, c1, midC1;
+    int c0, weightC0, midC0, c1, midC1;
     int ho1, wo1, ho2, wo2;
     int k1, k2;          // 两个卷积的矩阵乘 K = C1*kh*kw*C0
 
@@ -309,6 +353,8 @@ struct Geometry {
     int fmAddr, midAddr, w1Addr, w2Addr, b1Addr, b2Addr;
     int b1Bytes, b2Bytes;
     int dq2Addr, dq2Bytes;   // conv2 的 per-channel 反量化表（不带时长度 0）
+    int q1Addr, q1Bytes;     // conv1 的 per-channel VREQ8 表（int8 mid 路径）
+    int q2Addr, q2Bytes;     // conv2 的 per-channel VREQ8 表（int8 y 路径）
     int l1Used;
 
     // GM 侧一张图的元素数，供 batch 偏移和 UT 对账用
@@ -422,8 +468,9 @@ struct FlatGeom {
     // ---- 形状（img2col / Dn2Nz 直接要）----
     int n, ci, hi, wi, cout1, cout2, kh, kw, stride1, stride2;
     int padH1, padW1, padH2, padW2, elemBytes;
+    int weightElemBytes, midElemBytes, biasElemBytes;
     // ---- 由形状推出来的 ----
-    int c0, ho1, wo1, ho2, wo2, k1, k2;
+    int c0, weightC0, midC0, ho1, wo1, ho2, wo2, k1, k2;
     int hb, nchunk, chunkTotal, chunksPerCore;
     int wseg, nwseg;             // 列方向的分核，见 Geometry
     int midRows;                 // 一个 band 的窗口跨度（含补零）
@@ -435,6 +482,8 @@ struct FlatGeom {
     // ---- L1 地址表（字节地址）----
     int fmAddr, fmElems, midAddr, midElems, w1Addr, w1Elems, w2Addr, w2Elems, b1Addr, b2Addr;
     int dq2Addr;   // conv2 的 per-channel 反量化表（不带时这一段长度为 0）
+    int q1Addr;    // conv1 的 per-channel VREQ8 表（不带时长度为 0）
+    int q2Addr;    // conv2 的 per-channel VREQ8 表（不带时长度为 0）
     // ---- GM 侧 ----
     int xPlane, yPlane, yPlaneM;
 };
@@ -459,7 +508,12 @@ struct FlatGeom {
     X(padH2, padH2)           \
     X(padW2, padW2)           \
     X(elemBytes, elemBytes)   \
+    X(weightElemBytes, weightElemBytes) \
+    X(midElemBytes, midElemBytes) \
+    X(biasElemBytes, biasElemBytes) \
     X(c0, c0)                 \
+    X(weightC0, weightC0)     \
+    X(midC0, midC0)           \
     X(ho1, ho1)               \
     X(wo1, wo1)               \
     X(ho2, ho2)               \
@@ -496,6 +550,8 @@ struct FlatGeom {
     X(b1Addr, b1Addr)         \
     X(b2Addr, b2Addr)         \
     X(dq2Addr, dq2Addr)       \
+    X(q1Addr, q1Addr)         \
+    X(q2Addr, q2Addr)         \
     X(xPlane, xPlane)         \
     X(yPlane, yPlane)         \
     X(yPlaneM, yPlaneM)
@@ -517,8 +573,13 @@ FC2D_GEOM_FN void Flatten(const Geometry& g, int chunksPerCore, FlatGeom& f)
     f.padH2 = g.p.padH2;
     f.padW2 = g.p.padW2;
     f.elemBytes = g.p.elemBytes;
+    f.weightElemBytes = WeightElemBytes(g.p);
+    f.midElemBytes = MidElemBytes(g.p);
+    f.biasElemBytes = ParamBiasElemBytes(g.p);
 
     f.c0 = g.c0;
+    f.weightC0 = g.weightC0;
+    f.midC0 = g.midC0;
     f.ho1 = g.ho1;
     f.wo1 = g.wo1;
     f.ho2 = g.ho2;
@@ -558,6 +619,8 @@ FC2D_GEOM_FN void Flatten(const Geometry& g, int chunksPerCore, FlatGeom& f)
     f.b1Addr = g.b1Addr;
     f.b2Addr = g.b2Addr;
     f.dq2Addr = g.dq2Addr;
+    f.q1Addr = g.q1Addr;
+    f.q2Addr = g.q2Addr;
 
     f.xPlane = g.xPlane;
     f.yPlane = g.yPlane;
@@ -737,7 +800,12 @@ FC2D_GEOM_FN Band MakeBand(const Geometry& g, int chunk)
 // ---------------------------------------------------------------------------
 FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Geometry& g)
 {
-    if (p.elemBytes != 1 && p.elemBytes != 2) {
+    const int xBytes = p.elemBytes;
+    const int weightBytes = WeightElemBytes(p);
+    const int midBytes = MidElemBytes(p);
+    const int biasBytes = ParamBiasElemBytes(p);
+    if ((xBytes != 1 && xBytes != 2) || (weightBytes != 1 && weightBytes != 2) ||
+        (midBytes != 1 && midBytes != 2) || (biasBytes != 2 && biasBytes != 4)) {
         return RJ_ELEM_BYTES;
     }
     if (p.n <= 0 || p.ci <= 0 || p.hi <= 0 || p.wi <= 0 || p.cout1 <= 0 || p.cout2 <= 0 || p.kh <= 0 ||
@@ -747,8 +815,14 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
     }
 
     g.p = p;
-    g.c0 = 32 / p.elemBytes;
-    if ((p.ci % g.c0) != 0 || (p.cout1 % g.c0) != 0) {
+    g.c0 = 32 / xBytes;
+    g.weightC0 = 32 / weightBytes;
+    g.midC0 = 32 / midBytes;
+    // conv1's fmap and filter may use different K0 values on A16W8.  The
+    // logical channels must be representable by both layouts; the fused mid
+    // must in turn match conv2's int8 fmap layout and its filter K0.
+    if ((p.ci % g.c0) != 0 || (p.ci % g.weightC0) != 0 ||
+        (p.cout1 % g.midC0) != 0 || (p.cout1 % g.weightC0) != 0) {
         return RJ_CHANNEL_C0;
     }
     // cout1 要 16 对齐（其实更严：下面 ci/cout1 还要是 C0 的整数倍）—— mid 要被
@@ -761,8 +835,8 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
     if ((p.cout1 % MMAD_M0) != 0) {
         return RJ_CHANNEL_16;
     }
-    g.c1 = p.ci / g.c0;
-    g.midC1 = p.cout1 / g.c0;
+    g.c1 = p.ci / g.weightC0;
+    g.midC1 = p.cout1 / g.weightC0;
 
     g.ho1 = (p.hi + 2 * p.padH1 - p.kh) / p.stride1 + 1;
     g.wo1 = (p.wi + 2 * p.padW1 - p.kw) / p.stride1 + 1;
@@ -775,8 +849,8 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
         return RJ_OUT_EMPTY;
     }
 
-    g.k1 = g.c1 * p.kh * p.kw * g.c0;
-    g.k2 = g.midC1 * p.kh * p.kw * g.c0;
+    g.k1 = p.ci * p.kh * p.kw;
+    g.k2 = p.cout1 * p.kh * p.kw;
     g.fz1K = g.c1 * p.kh * p.kw;
     g.fz1N = CeilDiv(p.cout1, MMAD_M0);
     g.fz2K = g.midC1 * p.kh * p.kw;
@@ -819,8 +893,10 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
     // K 切分 + M 分块。conv1 对一个 chunk 的 midReal x wSub，conv2 对一个 run。
     // 不切列时一个 run 就是整个 band（hb 行 x wo2 列），和以前一模一样。
     const int mRunMax = (g.nwseg == 1) ? (hb * g.wo2) : g.wseg;
-    const KChoice kc1 = PickTileK(g.k1, g.c0, p.elemBytes, p.cout1, g.m1Max);
-    const KChoice kc2 = PickTileK(g.k2, g.c0, p.elemBytes, p.cout2, mRunMax);
+    const int kBlock1 = MaxI(g.c0, g.weightC0);
+    const int kBlock2 = MaxI(g.midC0, g.weightC0);
+    const KChoice kc1 = PickTileK(g.k1, kBlock1, xBytes, p.cout1, g.m1Max);
+    const KChoice kc2 = PickTileK(g.k2, kBlock2, midBytes, p.cout2, mRunMax);
     if (!kc1.ok || !kc2.ok) {
         return RJ_TILE_K;
     }
@@ -829,8 +905,8 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
     g.tileK2 = kc2.tileK;
     g.mMax2 = kc2.mMax;
 
-    if (!PickL0bChunks(p.cout1, g.k1, p.elemBytes, g.tileK1, g.l0bChunks1, g.l0bChunkK1) ||
-        !PickL0bChunks(p.cout2, g.k2, p.elemBytes, g.tileK2, g.l0bChunks2, g.l0bChunkK2)) {
+    if (!PickL0bChunks(p.cout1, g.k1, weightBytes, g.tileK1, g.l0bChunks1, g.l0bChunkK1) ||
+        !PickL0bChunks(p.cout2, g.k2, weightBytes, g.tileK2, g.l0bChunks2, g.l0bChunkK2)) {
         return RJ_L0B;
     }
     g.tilesPerChunk1 = g.l0bChunkK1 / g.tileK1;
@@ -855,20 +931,20 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
     }
 
     // 片上缓冲。L0A 按最大的那个子块分，两个卷积取大。
-    const int l0a1 = Align(g.mMax1, MMAD_M0) * g.tileK1 * p.elemBytes;
-    const int l0a2 = Align(g.mMax2, MMAD_M0) * g.tileK2 * p.elemBytes;
+    const int l0a1 = Align(g.mMax1, MMAD_M0) * g.tileK1 * xBytes;
+    const int l0a2 = Align(g.mMax2, MMAD_M0) * g.tileK2 * midBytes;
     if (l0a1 > L0A_SLOT_BYTES || l0a2 > L0A_SLOT_BYTES) {
         return RJ_TILE_K;
     }
-    g.l0aSlotElems = L0A_SLOT_BYTES / p.elemBytes;
+    g.l0aSlotElems = L0A_SLOT_BYTES / MaxI(xBytes, midBytes);
 
-    const int l0b1 = Align(p.cout1, MMAD_M0) * g.l0bChunkK1 * p.elemBytes;
-    const int l0b2 = Align(p.cout2, MMAD_M0) * g.l0bChunkK2 * p.elemBytes;
+    const int l0b1 = Align(p.cout1, MMAD_M0) * g.l0bChunkK1 * weightBytes;
+    const int l0b2 = Align(p.cout2, MMAD_M0) * g.l0bChunkK2 * weightBytes;
     const int l0bMax = MaxI(l0b1, l0b2);
     if (l0bMax > L0B_BYTES) {
         return RJ_L0B;
     }
-    g.l0bElems = l0bMax / p.elemBytes;
+    g.l0bElems = l0bMax / weightBytes;
 
     const int l0c1 = Align(g.mMax1, MMAD_M0) * Align(p.cout1, MMAD_M0);
     const int l0c2 = Align(g.mMax2, MMAD_M0) * Align(p.cout2, MMAD_M0);
@@ -888,19 +964,23 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
     g.w2Elems = Align(p.cout2, MMAD_M0) * g.k2;
 
     g.fmAddr = 0;
-    g.midAddr = Align(g.fmAddr + g.fmElems * p.elemBytes, L1_SEG_ALIGN);
-    g.w1Addr = Align(g.midAddr + g.midElems * p.elemBytes, L1_SEG_ALIGN);
-    g.w2Addr = Align(g.w1Addr + g.w1Elems * p.elemBytes, L1_SEG_ALIGN);
-    g.b1Addr = Align(g.w2Addr + g.w2Elems * p.elemBytes, L1_SEG_ALIGN);
-    g.b1Bytes = BiasSegBytes(p.cout1, p.elemBytes);
+    g.midAddr = Align(g.fmAddr + g.fmElems * xBytes, L1_SEG_ALIGN);
+    g.w1Addr = Align(g.midAddr + g.midElems * midBytes, L1_SEG_ALIGN);
+    g.w2Addr = Align(g.w1Addr + g.w1Elems * weightBytes, L1_SEG_ALIGN);
+    g.b1Addr = Align(g.w2Addr + g.w2Elems * weightBytes, L1_SEG_ALIGN);
+    g.b1Bytes = Align(p.cout1 * biasBytes, L1_SEG_ALIGN);
     g.b2Addr = g.b1Addr + g.b1Bytes;
-    g.b2Bytes = BiasSegBytes(p.cout2, p.elemBytes);
+    g.b2Bytes = Align(p.cout2 * biasBytes, L1_SEG_ALIGN);
     // per-channel 反量化表：一个通道一个 uint64。fixpipe 取的是 L1 地址，所以它
     // 得常驻。不带这条通路时长度 0，一个字节都不占 —— 否则每个形状都要为一个
     // 用不上的段让出 4 KB，本来放得下的会被拒掉。
     g.dq2Addr = g.b2Addr + g.b2Bytes;
     g.dq2Bytes = (p.hasDeqScale2 != 0) ? Align(p.cout2 * (int)sizeof(long long), L1_SEG_ALIGN) : 0;
-    g.l1Used = g.dq2Addr + g.dq2Bytes;
+    g.q1Addr = g.dq2Addr + g.dq2Bytes;
+    g.q1Bytes = (p.hasQuantScale1 != 0) ? Align(p.cout1 * (int)sizeof(long long), L1_SEG_ALIGN) : 0;
+    g.q2Addr = g.q1Addr + g.q1Bytes;
+    g.q2Bytes = (p.hasQuantScale2 != 0) ? Align(p.cout2 * (int)sizeof(long long), L1_SEG_ALIGN) : 0;
+    g.l1Used = g.q2Addr + g.q2Bytes;
     if (l1Budget > 0 && g.l1Used > l1Budget) {
         return RJ_L1;
     }

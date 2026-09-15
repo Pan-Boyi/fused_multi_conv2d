@@ -1,7 +1,8 @@
 /*
  * 形状预检 —— 在生成 case、编 .om 之前就回答「这个形状算子能不能跑」。
  *
- *   ./fc2d_geom --dtype fp16 --ci 32 --hi 288 --wi 112 --cout1 64 --cout2 96 [--l1 1048576]
+ *   ./fc2d_geom --dtype fp16|int8|s8f16|a16w8 --ci 32 --hi 288 --wi 112
+ *                --cout1 64 --cout2 96 [--l1 1048576]
  *
  * 用的是算子共用几何头的一份副本（fused_conv2d_shape.h）。**顾问性质**：真正说了
  * 算的是算子的 tiling。不过两边调的是同一个 DeriveWithHb / PickHb，只要副本没过期
@@ -51,9 +52,18 @@ int main(int argc, char** argv)
     // s8f16 = int8 进 / fp16 出：入口和 int8 一样（elemBytes = 1），但 L1 末尾
     // 多一段 per-channel 反量化表，所以几何要按带表的算。
     const char* dt = ArgStr(argc, argv, "--dtype", "fp16");
+    const bool int8 = std::strcmp(dt, "int8") == 0;
     const bool s8f16 = std::strcmp(dt, "s8f16") == 0;
-    p.elemBytes = (std::strcmp(dt, "int8") == 0 || s8f16) ? 1 : 2;
-    p.hasDeqScale2 = s8f16 ? 1 : 0;
+    const bool a16w8 = std::strcmp(dt, "a16w8") == 0;
+    p.elemBytes = (int8 || s8f16) ? 1 : 2;
+    p.hasDeqScale2 = (s8f16 || a16w8) ? 1 : 0;
+    p.hasQuantScale1 = (int8 || s8f16 || a16w8) ? 1 : 0;
+    p.hasQuantScale2 = int8 ? 1 : 0;
+    if (a16w8) {
+        p.weightElemBytes = 1;
+        p.midElemBytes = 1;
+        p.biasElemBytes = 4;
+    }
     const int l1 = ArgInt(argc, argv, "--l1", 1024 * 1024);
     const int aic = ArgInt(argc, argv, "--cores", 8);
 
@@ -76,6 +86,14 @@ int main(int argc, char** argv)
     }
     if (g.dq2Bytes > 0) {
         std::printf("    反量化表: %d 字节常驻 L1（%d 个通道 x uint64）\n", g.dq2Bytes, p.cout2);
+    }
+    if (g.q1Bytes > 0) {
+        std::printf("    conv1 重量化表: %d 字节常驻 L1（%d 个通道 x uint64）\n",
+                    g.q1Bytes, p.cout1);
+    }
+    if (g.q2Bytes > 0) {
+        std::printf("    conv2 重量化表: %d 字节常驻 L1（%d 个通道 x uint64）\n",
+                    g.q2Bytes, p.cout2);
     }
     return 0;
 }
