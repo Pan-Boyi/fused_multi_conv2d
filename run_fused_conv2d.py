@@ -62,13 +62,14 @@ Y_SENTINEL_U16 = 0x7F7F   # fp16 输出的哨兵（两字节）
 Y_SENTINEL_I8 = 0x7F      # int8 输出的哨兵（一字节，正好是 int8 的 127）
 Y_ELEM_BYTES = 2          # fp16 那条；int8 那条用 1，见 decode_y()
 
-# case 文件的头（version 5）。**形状全在 spec 里**，脚本不再写死任何一个维度 ——
+# case 文件的头（version 6）。**形状全在 spec 里**，脚本不再写死任何一个维度 ——
 # gen_case 写它，fc2d.py 从它生成 singleop.json，本脚本从它下发属性，三处同源。
-CASE_VERSION = 5
+CASE_VERSION = 6
 SPEC_KEYS = [
     "n", "ci", "hi", "wi", "cout1", "cout2", "kh", "kw", "s1", "s2",
     "ph1", "pw1", "ph2", "pw2", "elem_bytes", "bias", "relu1", "relu2",
     "shift1", "shift2", "ho2", "wo2", "safe_f1", "safe_f2", "out_fp16",
+    "dtype_mode",
 ]
 SPEC_N = 32
 HDR_FMT = "<8sIIQQQ" + "%di" % SPEC_N + "II"
@@ -81,6 +82,7 @@ REC_LEN = struct.calcsize(REC_FMT)
 ORDER = ["x", "filter1", "bias1", "filter2", "bias2"]
 ORDER_INT8 = ORDER + ["quant_scale1", "quant_scale2"]
 ORDER_S8F16 = ORDER + ["dequant_scale2", "quant_scale1"]
+ORDER_A16W8 = ORDER_S8F16
 # 两个 golden：y_expect 是定点模型（假设成立时应逐位相等），y_exact 是纯 fp32
 # 参考（判「有没有在算这个卷积」，不受定点假设影响）。见 golden.h 顶部那段。
 GOLDENS = ["y_expect", "y_exact"]
@@ -88,6 +90,12 @@ GOLDENS = ["y_expect", "y_exact"]
 # 硬件移位域宽度。属性 S 和实际定标指数 F 的关系恒为 F = FIX_SHIFT_LEN - S，
 # 见 dav_m510/kernel_operator_fixpipe_impl.h:77 SetDeqScalarDepOnMode。
 FIX_SHIFT_LEN = 58
+A16W8_SHIFT_LEN = 29
+
+DTYPE_FP16 = 0
+DTYPE_INT8 = 1
+DTYPE_S8F16 = 2
+DTYPE_A16W8 = 3
 
 
 # ACL 把失败的细节（AI Core 异常、哪条 task、PC）攒在一个进程级的字符串里，
@@ -163,24 +171,30 @@ def load_case(path):
             die("张量 %s: dims=%s dtype=%s 应为 %d 字节，实际 %d"
                 % (name, dims, DTYPE_NAME[dtype], want, len(data)))
 
-    isInt8 = (spec["elem_bytes"] == 1)          # **入口**是 int8
-    isS8F16 = isInt8 and spec.get("out_fp16", 0) == 1
-    outInt8 = isInt8 and not isS8F16            # **出口**是 int8
-    order = ORDER_S8F16 if isS8F16 else (ORDER_INT8 if outInt8 else ORDER)
+    mode = spec.get("dtype_mode", DTYPE_FP16 if spec["elem_bytes"] == 2 else DTYPE_INT8)
+    isInt8 = mode in (DTYPE_INT8, DTYPE_S8F16)   # **入口 x** 是 int8
+    isS8F16 = mode == DTYPE_S8F16
+    isA16W8 = mode == DTYPE_A16W8
+    isFp16 = mode == DTYPE_FP16
+    outInt8 = mode == DTYPE_INT8
+    order = ORDER_A16W8 if isA16W8 else (ORDER_S8F16 if isS8F16 else
+                                         (ORDER_INT8 if outInt8 else ORDER))
     # y_exact（纯 fp32 参考）只有 fp16 定点通路有 —— 那边的定点模型带假设，需要
     # 第二个不依赖模型的参照。两条 int8 入口的 golden 都是精确整数运算，没有这个概念。
-    required = list(order) + ["y_expect"] + ([] if isInt8 else ["y_exact"])
+    required = list(order) + ["y_expect"] + (["y_exact"] if isFp16 else [])
     for name in required:
         if name not in tensors:
             die("case 文件里缺张量 %s" % name)
 
     shift1, shift2 = spec["shift1"], spec["shift2"]
-    if not isInt8 and not (0 <= shift1 <= FIX_SHIFT_LEN and 0 <= shift2 <= FIX_SHIFT_LEN):
+    if isFp16 and not (0 <= shift1 <= FIX_SHIFT_LEN and 0 <= shift2 <= FIX_SHIFT_LEN):
         die("header 里的定点定标 %d / %d 超出 [0,%d]" % (shift1, shift2, FIX_SHIFT_LEN))
     info = dict(spec)
     info["isInt8"] = isInt8      # 入口
     info["outInt8"] = outInt8    # 出口。s8f16 这条两者不同，别混用
     info["isS8F16"] = isS8F16
+    info["isA16W8"] = isA16W8
+    info["isFp16"] = isFp16
     info["order"] = order
     info["hasBias"] = bool(spec["bias"])
     info["relu"] = bool(spec["relu1"])   # 兼容旧调用点；两层各自的开关见 relu1/relu2
@@ -191,7 +205,8 @@ def load_case(path):
         % (spec["n"], spec["ci"], spec["cout1"], spec["cout2"], spec["hi"], spec["wi"],
            spec["kh"], spec["kw"], spec["s1"], spec["s2"], spec["ph1"], spec["pw1"],
            spec["ph2"], spec["pw2"], spec["ho2"], spec["wo2"],
-           "int8->fp16" if isS8F16 else ("int8" if isInt8 else "fp16")))
+           "a16w8" if isA16W8 else ("int8->fp16" if isS8F16 else
+           ("int8" if outInt8 else "fp16"))))
     # probe 这一位在版本 4 里没有了：探针权重是运行时输入，要探就直接改 gen_case
     # 生成的权重，不需要在 header 里留一个字段。
     return tensors, nonzero, 0, sat, y_elems, shift1, shift2, info
@@ -829,12 +844,20 @@ def main():
             continue
         dtype, dims, data = tensors[name]
         print("  %-9s %-6s %-16s %9d 字节" % (name, DTYPE_NAME[dtype], dims, len(data)))
-    if info["isInt8"]:
+    if info["outInt8"]:
         print("量化系数（header 调试元数据；实际以 per-channel uint64 张量下发）: "
               "quant_scale1=%.9g quant_scale2=%.9g  relu=%s  bias=%s"
               % (info["qs1"], info["qs2"], "on" if info["relu"] else "off",
                  "on" if info["hasBias"] else "off"))
         print("            out_int8 = saturate( round( acc_int32 * quant_scale ) )，再 relu")
+    elif info["isS8F16"]:
+        print("量化系数: conv1 quant_scale1=%.9g；conv2 使用 per-channel dequant_scale2；relu=%s bias=%s"
+              % (info["qs1"], "on" if info["relu"] else "off",
+                 "on" if info["hasBias"] else "off"))
+    elif info["isA16W8"]:
+        print("A16W8 定标: a16w8_shift1=%d（累加器定标 2^(%d-%d)=1），"
+              "conv1 quant_scale1=%.9g，conv2 使用 per-channel dequant_scale2"
+              % (A16W8_SHIFT_LEN, A16W8_SHIFT_LEN, A16W8_SHIFT_LEN, info["qs1"]))
     else:
         print("定点定标（来自 header，将作为算子属性下发）: fixed_shift1=%d fixed_shift2=%d"
               % (shift1, shift2))
@@ -1073,12 +1096,16 @@ def main():
         if satGot > r["n"] // 10 and satWant * 20 < satGot:
             print("       => 设备侧大面积饱和而 golden 没有 —— 极可能是 per-channel quant_scale 表没传对。")
             print("          检查 case.bin 里的 q1/q2 表、bit46 和 om 里的输入槽。")
-    elif info["isS8F16"]:
+    elif info["isS8F16"] or info["isA16W8"]:
         # 这条的出口是 per-channel 反量化，定标不是 2 的幂 —— report_lsb 那套
         # 「累加器 LSB = 2^-(58-S)」在这里没有意义，报了只会误导。
-        print("\n[s8f16] 出口是 per-channel 反量化（VDEQF16），定标来自 dequant_scale2 那张表，")
+        label = "a16w8" if info["isA16W8"] else "s8f16"
+        print("\n[%s] 出口是 per-channel 反量化（VDEQF16），定标来自 dequant_scale2 那张表，" % label)
         print("        不是 fixed_shift 的 2 的幂 —— 所以这里不报累加器 LSB。")
-        print("        判据就是逐位相等：golden 的乘累加是精确整数运算，出口按同一张表换算。")
+        if info["isA16W8"]:
+            print("        A16W8 case 使用 fp16 可精确表示的整数输入和 shift=29；判据为逐位相等。")
+        else:
+            print("        判据就是逐位相等：golden 的乘累加是精确整数运算，出口按同一张表换算。")
     else:
         report_lsb(got, want, r, mismatches, y_dims, shift2)
     report_ratio(got, want, r["n"])

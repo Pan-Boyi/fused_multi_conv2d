@@ -25,7 +25,8 @@ FusedConv2d 上板执行 + profiling 的总驱动 —— **全部配置来自一
         "cout1": 64, "cout2": 96, "kernel": [3,3], "strides": [1,2],
         "pads": [1,1], "bias": true, "relu": [true,false], "fixed_shift": [42,42]}
 
-   dtype 写 "both" 会自动展开成 fp16 和 int8 两条。
+   dtype 写 "both" 会自动展开成 fp16 和 int8 两条；`a16w8` 显式表示
+   fp16 fmap + int8 filters、per-channel int8 mid、fp16 输出。
 
 3. **一次可以跑很多条。** 原来一次一个 dtype，PROF 目录靠"当前 dtype"分。现在每条
    case 有自己的名字，本地产物落在 out/<name>/ 和 prof_out/<name>/，互不干扰，

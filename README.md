@@ -2,12 +2,17 @@
 
 **改一个 json（`cases.json`）就能换形状**，别的地方不用动。
 
-`dtype` 有四个取值：`fp16` / `int8` / `s8f16` / `both`。`both` 展开成 fp16 + int8
+`dtype` 有五个取值：`fp16` / `int8` / `s8f16` / `a16w8` / `both`。`both` 展开成 fp16 + int8
 两条（名字加 `_fp16` / `_int8` 后缀）。**`s8f16` 是「int8 进 / fp16 出」那条**：
 conv1 用 `quant_scale1[Cout1]` 的 per-channel VREQ8 出 int8 mid，conv2 用
 `dequant_scale2[Cout2]` 按通道反量化成 fp16。两张表都是 uint64，所以它不在
 `both` 里面，要显式写。int8→int8 则传 `quant_scale1[Cout1]` +
 `quant_scale2[Cout2]`；纯 fp16 不传 scale 表。
+
+`a16w8` 是混合通路：`x` 为 fp16，两张 filter 为 int8，conv1 通过
+`quant_scale1[Cout1]` 得到 int8 mid，conv2 再通过 `dequant_scale2[Cout2]` 输出 fp16。
+case generator 使用 fp16 可精确表示的小整数输入，并固定 `a16w8_shift1=29`，因此板侧
+结果可与精确整数 golden 逐位比对。
 
 两个 C++ 小工具（`gen_case` / `fc2d_geom`）**不进仓**，脚本用到时自己编 ——
 缺了就编，源码或任何一个头比二进制新也重编。要 `g++`，不要 CANN，不要设备。
@@ -135,7 +140,7 @@ cases.json 里的一条
 | 字段 | 缺省 | 说明 |
 | :-- | :-- | :-- |
 | `name` | `caseNN` | 产物落在 `out/<name>/` |
-| `dtype` | `fp16` | `fp16` / `int8` / `both`（`both` 展开成 `<name>_fp16` 和 `<name>_int8`）|
+| `dtype` | `fp16` | `fp16` / `int8` / `s8f16` / `a16w8` / `both`（`both` 展开成 `<name>_fp16` 和 `<name>_int8`）|
 | `n` `ci` `hi` `wi` | 1 / 32 / 288 / 112 | 输入形状 NCHW |
 | `cout1` `cout2` | 64 / 96 | 两层的输出通道 |
 | `kernel` | `[3, 3]` | `[kh, kw]`，两层共用 |
@@ -147,7 +152,7 @@ cases.json 里的一条
 
 写错字段名会直接报错并列出认识的字段 —— 不会静默用缺省值跑一个你没打算跑的形状。
 
-## 三条通路的判据不一样
+## 四条通路的判据不一样
 
 **fp16 定点**：两个 golden。
 - `y_expect` 定点模型，假设成立时应当**逐位相等**
@@ -166,6 +171,13 @@ cases.json 里的一条
 
 **int8 出问题时先看饱和那一行**：设备侧大面积饱和而 golden 没有，通常是
 per-channel `quant_scale` 表的位型或 bit46 不对，不是卷积本身算错。
+
+**s8f16**：前两层乘累加都是精确整数，conv1 通过 `quant_scale1` 输出 int8 mid，
+conv2 通过 `dequant_scale2` 输出 fp16；golden 应逐位相等。
+
+**a16w8**：输入是 fp16、filter 是 int8。生成器把输入限制在 fp16 可精确表示的整数，
+并使用 `a16w8_shift1=29`，使 conv1 累加与整数参考一致；其余量化/反量化与 s8f16
+相同，因此同样执行逐位比对。
 
 ## 单独跑一条
 

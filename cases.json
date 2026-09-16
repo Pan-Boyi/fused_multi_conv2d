@@ -9,7 +9,7 @@
     "",
     "每条能写的字段（不写就用缺省）：",
     "  name          这条的名字，产物落在 out/<name>/",
-    "  dtype         fp16 / int8 / both（both 会展开成 <name>_fp16 和 <name>_int8）",
+    "  dtype         fp16 / int8 / s8f16 / a16w8 / both（both 展开成 fp16 + int8）",
     "  n ci hi wi    输入形状 NCHW",
     "  cout1 cout2   两层的输出通道",
     "  kernel        [kh, kw]，两层共用",

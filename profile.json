@@ -262,6 +262,33 @@
         true,
         true
       ]
+    },
+    {
+      "name": "a16w8_target",
+      "dtype": "a16w8",
+      "n": 1,
+      "ci": 32,
+      "hi": 352,
+      "wi": 640,
+      "cout1": 64,
+      "cout2": 64,
+      "kernel": [
+        3,
+        3
+      ],
+      "strides": [
+        2,
+        2
+      ],
+      "pads": [
+        1,
+        1
+      ],
+      "bias": true,
+      "relu": [
+        true,
+        true
+      ]
     }
   ]
 }

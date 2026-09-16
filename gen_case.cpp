@@ -1,7 +1,7 @@
 /*
  * 生成上板验证用的 case 文件。在**任何能编译的机器**上跑，不需要 CANN、不需要设备。
  *
- *   ./gen_case out.bin --dtype fp16|int8|s8f16 --n 1 --ci 32 --hi 288 --wi 112 \
+ *   ./gen_case out.bin --dtype fp16|int8|s8f16|a16w8 --n 1 --ci 32 --hi 288 --wi 112 \
  *              --cout1 64 --cout2 96 --kh 3 --kw 3 --s1 1 --s2 2 \
  *              --ph1 1 --pw1 1 --ph2 1 --pw2 1 --bias 0 --relu1 1 --relu2 1 \
  *              --shift1 42 --shift2 42
@@ -10,10 +10,10 @@
  * fc2d.py 从 cases.json 里读一条就展开成上面这样一行，所以**改 json 就能换形状**。
  *
  * ---------------------------------------------------------------------------
- * 文件格式（version = 5，和 run_fused_conv2d.py 配套）
+ * 文件格式（version = 6，和 run_fused_conv2d.py 配套）
  * ---------------------------------------------------------------------------
  *   magic "FC2DCASE" (8B)
- *   version u32 = 5
+ *   version u32 = 6
  *   ntensors u32
  *   nonzero  u64   golden 里非零输出的个数
  *   sat      u64   落格时撞到边界的个数（fp16 是 int32 饱和，int8 是 ±127）
@@ -30,6 +30,8 @@
  *   fp16   x, filter1, bias1, filter2, bias2
  *   int8   x, filter1, bias1, filter2, bias2, quant_scale1, quant_scale2
  *   s8f16  x, filter1, bias1, filter2, bias2, dequant_scale2, quant_scale1
+ *   a16w8  x(fp16), filter1(int8), bias1(int32), filter2(int8), bias2(int32),
+ *           dequant_scale2, quant_scale1
  * 外加 golden：
  *   fp16   y_expect（定点模型，假设成立时应逐位相等）+ y_exact（纯 fp32 参考）
  *   int8   y_expect（精确整数运算 + per-channel VREQ8，应逐位相等）
@@ -51,8 +53,15 @@ constexpr uint32_t ACL_DT_INT8 = 2;
 constexpr uint32_t ACL_DT_INT32 = 3;
 constexpr uint32_t ACL_DT_UINT64 = 10;
 
-constexpr uint32_t CASE_VERSION = 5;
+constexpr uint32_t CASE_VERSION = 6;
 constexpr int SPEC_N = 32; // spec 数组的长度，留了余量
+
+enum DTypeMode {
+    DTYPE_FP16 = 0,
+    DTYPE_INT8 = 1,
+    DTYPE_S8F16 = 2,
+    DTYPE_A16W8 = 3,
+};
 
 // spec 数组的下标。**只能往后加，不能插**：run_fused_conv2d.py 按同样的下标读。
 enum SpecIdx {
@@ -83,6 +92,8 @@ enum SpecIdx {
     // 1 = 出口是 fp16 而入口是 int8（那条 per-channel 反量化的通路）。
     // **只能往后加**：run_fused_conv2d.py 和 fc2d.py 按同样的下标读。
     SPEC_OUT_FP16,
+    // 精确区分 fp16 / int8 / s8f16 / a16w8。elemBytes 只描述 x，不足以表达混合通路。
+    SPEC_DTYPE_MODE,
     SPEC_COUNT
 };
 static_assert(SPEC_COUNT <= SPEC_N, "spec 数组放不下");
@@ -145,7 +156,7 @@ int main(int argc, char** argv)
 {
     if (argc < 2) {
         std::fprintf(stderr,
-                     "用法: %s <out.bin> [--dtype fp16|int8] [--n N] [--ci N] [--hi N] [--wi N]\n"
+                     "用法: %s <out.bin> [--dtype fp16|int8|s8f16|a16w8] [--n N] [--ci N] [--hi N] [--wi N]\n"
                      "        [--cout1 N] [--cout2 N] [--kh N] [--kw N] [--s1 N] [--s2 N]\n"
                      "        [--ph1 N] [--pw1 N] [--ph2 N] [--pw2 N]\n"
                      "        [--bias 0|1] [--relu1 0|1] [--relu2 0|1] [--shift1 N] [--shift2 N]\n"
@@ -156,18 +167,28 @@ int main(int argc, char** argv)
     const char* out = argv[1];
 
     Case c;
-    // 三条通路。s8f16 的入口和 int8 完全一样，只有 conv2 的出口不同。
+    // 四条通路。A16W8 的 x 是 fp16，两张 filter 和 fused mid 是 int8，y 是 fp16。
     const std::string dtype = ArgStr(argc, argv, "--dtype", "fp16");
     bool outFp16 = false;
+    bool isA16W8 = false;
+    int dtypeMode = DTYPE_FP16;
     if (dtype == "int8") {
         c.elemBytes = 1;
+        dtypeMode = DTYPE_INT8;
     } else if (dtype == "s8f16") {
         c.elemBytes = 1;
         outFp16 = true;
+        dtypeMode = DTYPE_S8F16;
+    } else if (dtype == "a16w8") {
+        c.elemBytes = 2;
+        outFp16 = true;
+        isA16W8 = true;
+        dtypeMode = DTYPE_A16W8;
     } else if (dtype == "fp16") {
         c.elemBytes = 2;
     } else {
-        std::fprintf(stderr, "[X] --dtype 只能是 fp16 / int8 / s8f16，给的是 %s\n", dtype.c_str());
+        std::fprintf(stderr, "[X] --dtype 只能是 fp16 / int8 / s8f16 / a16w8，给的是 %s\n",
+                     dtype.c_str());
         return 2;
     }
     c.n = ArgInt(argc, argv, "--n", c.n);
@@ -192,9 +213,12 @@ int main(int argc, char** argv)
 
     // 形状的基本自洽性。算子的 tiling 还会再查一遍（而且更严），这里只挡住那些
     // 会让 golden 本身算不出来的。
-    const int c0 = c.C0();
-    if (c.ci % c0 != 0 || c.cout1 % c0 != 0) {
-        std::fprintf(stderr, "[X] ci(%d) 和 cout1(%d) 必须是 C0=%d 的整数倍\n", c.ci, c.cout1, c0);
+    const int xC0 = c.C0();
+    const int weightC0 = isA16W8 ? 32 : xC0;
+    if (c.ci % xC0 != 0 || c.ci % weightC0 != 0 || c.cout1 % weightC0 != 0) {
+        std::fprintf(stderr,
+                     "[X] ci(%d) 必须同时按 x C0=%d、filter C0=%d 对齐，cout1(%d) 必须按 filter C0 对齐\n",
+                     c.ci, xC0, weightC0, c.cout1);
         return 2;
     }
     // cout1 要 16 对齐（上面 cout1 % C0 已经更严了，这里是文档性质的）——
@@ -215,7 +239,9 @@ int main(int argc, char** argv)
     }
 
     // Case::Text() 只认 elemBytes，说不出「出口是 fp16」这件事，所以补一句。
-    std::printf("形状: %s%s\n", c.Text().c_str(), outFp16 ? "  [出口 fp16，per-channel 反量化]" : "");
+    std::printf("形状: %s%s\n", c.Text().c_str(),
+                isA16W8 ? "  [A16W8：fp16 x + int8 filters，int8 mid，fp16 y]" :
+                (outFp16 ? "  [出口 fp16，per-channel 反量化]" : ""));
     std::printf("  conv1 -> %dx%d，conv2 -> %dx%d，y 共 %ld 个元素\n", c.Ho1(), c.Wo1(), c.Ho2(), c.Wo2(),
                 c.YElems());
 
@@ -244,6 +270,7 @@ int main(int argc, char** argv)
     spec[SPEC_HO2] = c.Ho2();
     spec[SPEC_WO2] = c.Wo2();
     spec[SPEC_OUT_FP16] = outFp16 ? 1 : 0;
+    spec[SPEC_DTYPE_MODE] = dtypeMode;
 
     FILE* f = std::fopen(out, "wb");
     if (f == nullptr) {
@@ -252,18 +279,63 @@ int main(int argc, char** argv)
     }
     Writer w{f};
 
-    const int64_t fz1k = (int64_t)(c.ci / c0) * c.kh * c.kw;
+    const int64_t fz1k = (int64_t)(c.ci / weightC0) * c.kh * c.kw;
     // FRACTAL_Z 的 N 方向**向上补齐到 16**。cout1 必然是 C0 的整数倍所以除得尽，
     // 但 cout2 不一定（可以是 2），写成整除会算出 0 —— filter2 的 shape 直接错。
     const int64_t fz1n = (c.cout1 + 15) / 16;
-    const int64_t fz2k = (int64_t)(c.cout1 / c0) * c.kh * c.kw;
+    const int64_t fz2k = (int64_t)(c.cout1 / weightC0) * c.kh * c.kw;
     const int64_t fz2n = (c.cout2 + 15) / 16;
     const std::vector<int64_t> xDims = {c.n, c.ci, c.hi, c.wi};
     const std::vector<int64_t> yDims = {c.n, c.cout2, c.Ho2(), c.Wo2()};
-    const std::vector<int64_t> f1Dims = {fz1k, fz1n, 16, (int64_t)c0};
-    const std::vector<int64_t> f2Dims = {fz2k, fz2n, 16, (int64_t)c0};
+    const std::vector<int64_t> f1Dims = {fz1k, fz1n, 16, (int64_t)weightC0};
+    const std::vector<int64_t> f2Dims = {fz2k, fz2n, 16, (int64_t)weightC0};
 
-    if (outFp16) {
+    if (isA16W8) {
+        // ---- fp16 fmap + int8 filters / mid + fp16 output -----------------
+        // 输入只取 fp16 可精确表示的小整数，a16w8_shift1=29 对应 29-29=0 位
+        // 定标，因此 conv1 的 int32 累加与 int8 精确模型逐位一致。这样上板 golden
+        // 不依赖一个猜测性的通用 f16xs8 模型，同时仍然覆盖非零数据和完整卷积。
+        Case q = c;
+        q.elemBytes = 1;
+        int8path::Result g = int8path::Build(q, /*fp16Out*/ true);
+        std::vector<uint16_t> xF16(g.xNchw.size());
+        for (size_t i = 0; i < g.xNchw.size(); ++i) {
+            xF16[i] = F32ToF16Bits((float)g.xNchw[i]);
+        }
+        uint32_t qs1 = 0;
+        std::memcpy(&qs1, &g.scale1, 4);
+        const std::vector<uint64_t> q1 = Req8Table(c.cout1, qs1);
+        const float one = 1.0f;
+        uint32_t oneBits = 0;
+        std::memcpy(&oneBits, &one, 4);
+        std::printf("  A16W8 conv1: a16w8_shift1=29，整数 fp16 输入，quant_scale1=%.9g\n", g.scale1);
+        std::printf("  conv2 反量化: per-channel，%d 个系数；golden 非零 %ld / %ld\n",
+                    c.cout2, g.yNonZero, c.YElems());
+
+        w.Raw("FC2DCASE", 8);
+        w.U32(CASE_VERSION);
+        w.U32(9); // x, f1, b1, f2, b2, dq2, q1, y_expect, w1_nchw
+        w.U64((uint64_t)g.yNonZero);
+        w.U64(0);
+        w.U64((uint64_t)c.YElems());
+        for (int i = 0; i < SPEC_N; ++i) {
+            w.I32(spec[i]);
+        }
+        w.U32(qs1);
+        w.U32(oneBits);
+
+        w.Tensor("x", ACL_DT_FLOAT16, xDims, xF16.data(), xF16.size() * 2);
+        w.Tensor("filter1", ACL_DT_INT8, f1Dims, g.w1Dev.data(), g.w1Dev.size());
+        w.Tensor("bias1", ACL_DT_INT32, {(int64_t)c.cout1}, g.b1.data(), g.b1.size() * 4);
+        w.Tensor("filter2", ACL_DT_INT8, f2Dims, g.w2Dev.data(), g.w2Dev.size());
+        w.Tensor("bias2", ACL_DT_INT32, {(int64_t)c.cout2}, g.b2.data(), g.b2.size() * 4);
+        w.Tensor("dequant_scale2", ACL_DT_UINT64, {(int64_t)c.cout2}, g.deq.data(), g.deq.size() * 8);
+        w.Tensor("quant_scale1", ACL_DT_UINT64, {(int64_t)c.cout1}, q1.data(), q1.size() * 8);
+        w.Tensor("y_expect", ACL_DT_FLOAT16, yDims, g.yF16.data(), g.yF16.size() * 2);
+        w.Tensor("w1_nchw", ACL_DT_INT8,
+                 {(int64_t)c.cout1, (int64_t)c.ci, (int64_t)c.kh, (int64_t)c.kw},
+                 g.w1Nchw.data(), g.w1Nchw.size());
+    } else if (outFp16) {
         // ---- int8 进 / fp16 出 ------------------------------------------------
         // conv1 和 int8 通路一模一样（VREQ8 出 int8 的 mid），只有 conv2 的出口是
         // 按通道反量化成 fp16。所以 golden 走的是同一个 Build，只多传一个开关。

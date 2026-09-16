@@ -43,11 +43,17 @@ SPEC_KEYS = [
     "n", "ci", "hi", "wi", "cout1", "cout2", "kh", "kw", "s1", "s2",
     "ph1", "pw1", "ph2", "pw2", "elem_bytes", "bias", "relu1", "relu2",
     "shift1", "shift2", "ho2", "wo2", "safe_f1", "safe_f2", "out_fp16",
+    "dtype_mode",
 ]
 SPEC_N = 32
 HDR_FMT = "<8sIIQQQ" + "%di" % SPEC_N + "II"
 HDR_LEN = struct.calcsize(HDR_FMT)
-CASE_VERSION = 5
+CASE_VERSION = 6
+
+DTYPE_FP16 = 0
+DTYPE_INT8 = 1
+DTYPE_S8F16 = 2
+DTYPE_A16W8 = 3
 
 
 # run_fused_conv2d.py 里有**同一份** SPEC_KEYS 的抄本。它必须能单独跑在板子机上
@@ -113,11 +119,11 @@ def normalise(case, index):
             % (index, unknown, ", ".join(sorted(DEFAULTS) + ["name"])))
     out.update(case)
     out["name"] = case.get("name", "case%02d" % index)
-    # s8f16 = int8 进 / fp16 出：conv1 还是 int8，conv2 的出口 per-channel 反量化。
+    # s8f16 = int8 进 / fp16 出；a16w8 = fp16 fmap + int8 filters，mid 为 int8。
     # both 只展开 fp16 + int8 这两条（那是「同一形状两条通路都跑一遍」的意思），
     # s8f16 要显式写 —— 它多一个输入，不是前两条的变体。
-    if out["dtype"] not in ("fp16", "int8", "s8f16", "both"):
-        die("case %s 的 dtype 只能是 fp16 / int8 / s8f16 / both" % out["name"])
+    if out["dtype"] not in ("fp16", "int8", "s8f16", "a16w8", "both"):
+        die("case %s 的 dtype 只能是 fp16 / int8 / s8f16 / a16w8 / both" % out["name"])
     k = out["kernel"]
     if not isinstance(k, list) or len(k) != 2:
         die("case %s 的 kernel 要写成 [kh, kw]" % out["name"])
@@ -186,34 +192,39 @@ def singleop_json(spec):
     都会匹配不上，报出来是「算子没找到」。上一版 fp16 和 int8 各写一份 json、各带
     一个子集，于是执行时多设一个属性就炸 —— 这里统一成全集，那类问题不存在了。
     """
-    fp16 = spec["elem_bytes"] == 2
-    outFp16 = fp16 or spec.get("out_fp16", 0) == 1
-    t = "float16" if fp16 else "int8"
+    mode = spec.get("dtype_mode", DTYPE_FP16 if spec["elem_bytes"] == 2 else DTYPE_INT8)
+    fp16 = mode == DTYPE_FP16
+    a16w8 = mode == DTYPE_A16W8
+    s8f16 = mode == DTYPE_S8F16
+    x_fp16 = fp16 or a16w8
+    filter_fp16 = fp16
+    outFp16 = fp16 or s8f16 or a16w8
+    xt = "float16" if x_fp16 else "int8"
+    wt = "float16" if filter_fp16 else "int8"
     bt = "float16" if fp16 else "int32"
     yt = "float16" if outFp16 else "int8"
-    c0 = 16 if fp16 else 32
-    fz1k = (spec["ci"] // c0) * spec["kh"] * spec["kw"]
-    fz2k = (spec["cout1"] // c0) * spec["kh"] * spec["kw"]
+    weight_c0 = 16 if filter_fp16 else 32
+    mid_c0 = 16 if fp16 else 32
+    fz1k = (spec["ci"] // weight_c0) * spec["kh"] * spec["kw"]
+    fz2k = (spec["cout1"] // mid_c0) * spec["kh"] * spec["kw"]
     inputs = [
-        {"format": "ND", "shape": [spec["n"], spec["ci"], spec["hi"], spec["wi"]], "type": t},
-        {"format": "ND", "shape": [fz1k, (spec["cout1"] + 15) // 16, 16, c0], "type": t},
+        {"format": "ND", "shape": [spec["n"], spec["ci"], spec["hi"], spec["wi"]], "type": xt},
+        {"format": "ND", "shape": [fz1k, (spec["cout1"] + 15) // 16, 16, weight_c0], "type": wt},
         {"format": "ND", "shape": [spec["cout1"]], "type": bt},
         # FRACTAL_Z 的 N 向上补齐到 16 —— cout2 可以是 2，整除会算出 0。
-        {"format": "ND", "shape": [fz2k, (spec["cout2"] + 15) // 16, 16, c0], "type": t},
+        {"format": "ND", "shape": [fz2k, (spec["cout2"] + 15) // 16, 16, weight_c0], "type": wt},
         {"format": "ND", "shape": [spec["cout2"]], "type": bt},
     ]
     # optional 输入必须按 IR 下标 5/6/7 对齐。中间缺席的槽不能直接省略：
     # ATC single-op JSON 的约定是 RESERVED + UNDEFINED 占位。
     missing = {"format": "RESERVED", "shape": [], "type": "UNDEFINED"}
-    is_int8 = spec["elem_bytes"] == 1
-    is_s8f16 = is_int8 and spec.get("out_fp16", 0) == 1
-    if is_s8f16:
+    if s8f16 or a16w8:
         inputs.extend([
             {"format": "ND", "shape": [spec["cout2"]], "type": "uint64"},  # dq2
             {"format": "ND", "shape": [spec["cout1"]], "type": "uint64"},  # q1
             dict(missing),                                                       # q2
         ])
-    elif is_int8:
+    elif mode == DTYPE_INT8:
         inputs.extend([
             dict(missing),                                                       # dq2
             {"format": "ND", "shape": [spec["cout1"]], "type": "uint64"},  # q1
@@ -292,8 +303,8 @@ def do_check(c, l1):
     ~/ascend/log/ 里，找起来很费劲。
     """
     exe = ensure_tool("fc2d_geom")
-    # dtype 原样传下去：fc2d_geom 认 fp16 / int8 / s8f16，s8f16 会按「L1 末尾多一段
-    # per-channel 反量化表」去算几何 —— 那一段是真占地方的，预检不能漏掉它。
+    # dtype 原样传下去：fc2d_geom 也认 a16w8，会分别按 fp16 x、int8 filter/mid
+    # 以及 q1/dq2 两张 per-channel 表计算 L1，预检不能漏掉这些真实占用。
     ph1, pw1, ph2, pw2 = c["pads"]
     argv = [exe, "--dtype", c["dtype"],
             "--n", str(c["n"]), "--ci", str(c["ci"]), "--hi", str(c["hi"]), "--wi", str(c["wi"]),
