@@ -50,6 +50,8 @@ ACL_MEMCPY_HOST_TO_DEVICE = 1
 ACL_MEMCPY_DEVICE_TO_HOST = 2
 ACL_MEM_MALLOC_HUGE_FIRST = 0
 ACL_FORMAT_ND = 2
+ACL_DT_UNDEFINED = -1
+ACL_FORMAT_UNDEFINED = -1
 
 DTYPE_NAME = {0: "float32", 1: "float16", 2: "int8", 3: "int32", 10: "uint64"}
 DTYPE_SIZE = {0: 4, 1: 2, 2: 1, 3: 4, 10: 8}
@@ -77,9 +79,13 @@ HDR_LEN = struct.calcsize(HDR_FMT)
 REC_FMT = "<16sII4qQ"           # name, dtype, ndim, dims[4], nbytes
 REC_LEN = struct.calcsize(REC_FMT)
 
-# 算子的实参 ABI 顺序。q1/q2/dq2 在 OpDef 中是 optional，在相应 dtype 通路中条件必传。
-# 实际用哪个列表见 info["order"]，由 case dtype 决定。
+# 算子的完整 IR ABI 顺序。q1/q2/dq2 在 OpDef 中是 optional，但 aclopExecuteV2
+# **不允许把未使用的槽位从数组中删掉**：必须在原位置传
+#   ACL_DT_UNDEFINED / ACL_FORMAT_UNDEFINED 的 desc + nullptr/0 的 DataBuffer。
+# info["order"] 仍只列当前 dtype 真正有数据的输入，用于 case 完整性检查；执行时
+# 始终遍历 INPUT_SLOTS，缺的槽由 optional placeholder 补齐。
 ORDER = ["x", "filter1", "bias1", "filter2", "bias2"]
+INPUT_SLOTS = ORDER + ["dequant_scale2", "quant_scale1", "quant_scale2"]
 ORDER_INT8 = ORDER + ["quant_scale1", "quant_scale2"]
 ORDER_S8F16 = ORDER + ["dequant_scale2", "quant_scale1"]
 ORDER_A16W8 = ORDER_S8F16
@@ -96,6 +102,15 @@ DTYPE_FP16 = 0
 DTYPE_INT8 = 1
 DTYPE_S8F16 = 2
 DTYPE_A16W8 = 3
+
+
+def runtime_input_slots(info):
+    """返回 aclopExecuteV2 的 8 个 IR 槽；None 表示必须构造空 optional input。"""
+    actual = set(info["order"])
+    unknown = actual - set(INPUT_SLOTS)
+    if unknown:
+        die("case 里有不属于 FusedConv2d IR 的输入: %s" % sorted(unknown))
+    return [name if name in actual else None for name in INPUT_SLOTS]
 
 
 # ACL 把失败的细节（AI Core 异常、哪条 task、PC）攒在一个进程级的字符串里，
@@ -844,6 +859,10 @@ def main():
             continue
         dtype, dims, data = tensors[name]
         print("  %-9s %-6s %-16s %9d 字节" % (name, DTYPE_NAME[dtype], dims, len(data)))
+    slots = runtime_input_slots(info)
+    print("ACL 输入槽（固定 8 个）:")
+    for i, name in enumerate(slots):
+        print("  %d: %s" % (i, name if name is not None else "<UNDEFINED optional placeholder>"))
     if info["outInt8"]:
         print("量化系数（header 调试元数据；实际以 per-channel uint64 张量下发）: "
               "quant_scale1=%.9g quant_scale2=%.9g  relu=%s  bias=%s"
@@ -939,17 +958,35 @@ def main():
             descs.append(desc)
             bufs.append(buf)
 
-        # 实参 ABI 顺序钉死。singleop.json 里用 RESERVED/UNDEFINED 保留缺席的 optional
-        # 槽；执行时则只传当前 dtype 通路的实际张量，顺序与该 .om 的有效输入一致。
-        for name in info["order"]:
-            dtype, dims, data = tensors[name]
-            make_operand(dtype, dims, data)
+        def make_optional_placeholder():
+            # ACL 的执行期 optional-input 规则和 ATC singleop JSON 一致：槽位不能
+            # 压缩。没有数据的输入仍传 UNDEFINED desc + 空 DataBuffer。只传实际
+            # 张量会改变 numInputs/位置，模型明明加载成功也会 MatchOpModel 100024。
+            desc = acl.aclCreateTensorDesc(ACL_DT_UNDEFINED, 0, None, ACL_FORMAT_UNDEFINED)
+            if not desc:
+                die("aclCreateTensorDesc(UNDEFINED optional input) 返回 null")
+            buf = acl.aclCreateDataBuffer(None, 0)
+            if not buf:
+                acl.aclDestroyTensorDesc(desc)
+                die("aclCreateDataBuffer(nullptr, 0) 返回 null")
+            dev_ptrs.append(None)  # cleanup 时明确跳过 aclrtFree
+            descs.append(desc)
+            bufs.append(buf)
+
+        # 实参 ABI 顺序钉死为 8 个 IR 槽。未使用的 optional input 也必须占位；
+        # 不能把数组压短，更不能让后面的 q1/q2 左移到前一个 optional 的位置。
+        for name in slots:
+            if name is None:
+                make_optional_placeholder()
+            else:
+                dtype, dims, data = tensors[name]
+                make_operand(dtype, dims, data)
 
         # 输出缓冲预填哨兵 127：kernel 一个字节都没写的话，读回来还是 127，
         # 这是"返回码 0 但什么都没算"唯一能被抓住的地方。
         make_operand(y_dtype, y_dims, bytes([Y_SENTINEL_BYTE]) * (y_elems * yElemBytes))
 
-        NIN = len(info["order"])
+        NIN = len(INPUT_SLOTS)
         in_desc = (ctypes.c_void_p * NIN)(*descs[:NIN])
         in_buf = (ctypes.c_void_p * NIN)(*bufs[:NIN])
         out_desc = (ctypes.c_void_p * 1)(descs[NIN])
@@ -1142,7 +1179,8 @@ def main():
         for i in range(NIN + 1):
             acl.aclDestroyDataBuffer(bufs[i])
             acl.aclDestroyTensorDesc(descs[i])
-            acl.aclrtFree(dev_ptrs[i])
+            if dev_ptrs[i]:
+                acl.aclrtFree(dev_ptrs[i])
         acl.aclrtDestroyStream(stream)
         acl.aclrtResetDevice(device_id)
         acl.aclFinalize()

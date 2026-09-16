@@ -61,6 +61,9 @@ python3 run_profile.py profile.json
 
 - **`run_fused_conv2d.py` 每次都重新拷过去。** 它和 `case.bin` 的格式是配套的,
   远端留着一份旧的会报「case 文件版本 N,本脚本认 M」,而那时人往往已经在查算子了。
+- **运行时始终传完整的 8 个 IR 输入槽。** 没有使用的 optional input 用
+  `ACL_DT_UNDEFINED / ACL_FORMAT_UNDEFINED` 描述符和空 DataBuffer 占位；不能直接
+  从数组中删除，否则 `aclopExecuteV2` 会因为输入数量/位置不同而报 100024。
 - **每条 case 在远端有自己的干净目录,不复用。** `aclopSetModelDir` 会把目录下所有
   `.om` 都装进去,留着上一个形状的那个,它可能反而先匹配上,跑出来的是上个形状的
   结果,而且不报错。
