@@ -289,6 +289,93 @@
         true,
         true
       ]
+    },
+    {
+      "name": "a16w8_k1x1",
+      "dtype": "a16w8",
+      "n": 1,
+      "ci": 32,
+      "hi": 64,
+      "wi": 64,
+      "cout1": 32,
+      "cout2": 16,
+      "kernel": [
+        1,
+        1
+      ],
+      "strides": [
+        1,
+        1
+      ],
+      "pads": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "bias": true,
+      "relu": [
+        true,
+        true
+      ]
+    },
+    {
+      "name": "a16w8_k1x1_ci64",
+      "dtype": "a16w8",
+      "n": 1,
+      "ci": 64,
+      "hi": 64,
+      "wi": 64,
+      "cout1": 64,
+      "cout2": 32,
+      "kernel": [
+        1,
+        1
+      ],
+      "strides": [
+        1,
+        2
+      ],
+      "pads": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "bias": true,
+      "relu": [
+        true,
+        true
+      ]
+    },
+    {
+      "name": "a16w8_k1x3",
+      "dtype": "a16w8",
+      "n": 1,
+      "ci": 32,
+      "hi": 32,
+      "wi": 36,
+      "cout1": 32,
+      "cout2": 32,
+      "kernel": [
+        1,
+        3
+      ],
+      "strides": [
+        1,
+        1
+      ],
+      "pads": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "bias": true,
+      "relu": [
+        true,
+        true
+      ]
     }
   ]
 }
