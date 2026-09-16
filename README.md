@@ -4,9 +4,10 @@
 
 `dtype` 有四个取值：`fp16` / `int8` / `s8f16` / `both`。`both` 展开成 fp16 + int8
 两条（名字加 `_fp16` / `_int8` 后缀）。**`s8f16` 是「int8 进 / fp16 出」那条**：
-conv1 和 int8 通路一样（REQ8 出 int8 的 mid），conv2 的出口按通道反量化成 fp16。
-它比另外两条多一个输入 `dequant_scale2`（`[Cout2]` 个 uint64，低 32 位是该通道
-fp32 系数的位型），所以不在 `both` 里面，要显式写。
+conv1 用 `quant_scale1[Cout1]` 的 per-channel VREQ8 出 int8 mid，conv2 用
+`dequant_scale2[Cout2]` 按通道反量化成 fp16。两张表都是 uint64，所以它不在
+`both` 里面，要显式写。int8→int8 则传 `quant_scale1[Cout1]` +
+`quant_scale2[Cout2]`；纯 fp16 不传 scale 表。
 
 两个 C++ 小工具（`gen_case` / `fc2d_geom`）**不进仓**，脚本用到时自己编 ——
 缺了就编，源码或任何一个头比二进制新也重编。要 `g++`，不要 CANN，不要设备。
@@ -98,7 +99,7 @@ python3 run_profile.py profile.json
 | :-- | :-- |
 | `case.bin` 里的输入和 golden | `gen_case` |
 | `.om`（ACL 按 **op 类型 + 每个张量的 shape/dtype/format + 全部属性的值** 匹配） | `atc --singleop` |
-| 执行时下发的属性 | `run_fused_conv2d.py` |
+| 执行时下发的输入和属性 | `run_fused_conv2d.py` |
 
 三者只要有一处不一致，板上报的是 `100024` / `MatchOpModel fail`，翻译过来是
 **「算子没找到」** —— 那条信息完全不指向真正的原因。这条链上折过好几次：
@@ -112,10 +113,10 @@ cases.json 里的一条
    -> gen_case 的命令行
    -> case.bin 头部的 spec（32 个 int，形状 + 属性的唯一真相）
    -> singleop.json（fc2d.py 从 spec 读，不从 json 读）
-   -> 执行时下发的属性（run_fused_conv2d.py 从 spec 读）
+   -> 执行时下发的输入和属性（run_fused_conv2d.py 从 case.bin 读）
 ```
 
-中间没有第二份形状。另外属性是**九个一个不少地全设**，两边都一样 —— 不再有
+中间没有第二份形状。另外属性是**八个一个不少地全设**，两边都一样 —— 不再有
 「这条通路设这几个、那条通路设那几个」的子集，那正是最容易出错的地方。
 
 ## cases.json 怎么写
@@ -146,7 +147,7 @@ cases.json 里的一条
 
 写错字段名会直接报错并列出认识的字段 —— 不会静默用缺省值跑一个你没打算跑的形状。
 
-## 两条通路的判据不一样
+## 三条通路的判据不一样
 
 **fp16 定点**：两个 golden。
 - `y_expect` 定点模型，假设成立时应当**逐位相等**
@@ -159,11 +160,12 @@ cases.json 里的一条
 和直觉相反。42（F = 16）是厂商工作点。`gen_case` 会打出「部分和不溢出允许到 F ≤ ?」，
 超了会警告 —— 超了的话逐位比对不可能成立，因为累加器真的溢出了。
 
-**int8 量化**：一个 golden，精确整数运算 + REQ8（round-half-to-even + 饱和 + relu），
-应当逐位相等。scale 由 golden 按 `127 / 峰值` 自动挑并按硬件丢掉低 13 位尾数。
+**int8 量化**：一个 golden，精确整数运算 + per-channel VREQ8
+（round-half-to-even + 饱和 + relu），应当逐位相等。当前 case 为了与历史 golden
+逐位对齐，把同一 scale 复制到所有通道；表格式仍是每通道一个 uint64。
 
-**int8 出问题时先看饱和那一行**：设备侧大面积饱和而 golden 没有，是 `quant_scale`
-没传到，不是算子算错了。
+**int8 出问题时先看饱和那一行**：设备侧大面积饱和而 golden 没有，通常是
+per-channel `quant_scale` 表的位型或 bit46 不对，不是卷积本身算错。
 
 ## 单独跑一条
 

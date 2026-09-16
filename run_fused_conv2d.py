@@ -62,9 +62,9 @@ Y_SENTINEL_U16 = 0x7F7F   # fp16 输出的哨兵（两字节）
 Y_SENTINEL_I8 = 0x7F      # int8 输出的哨兵（一字节，正好是 int8 的 127）
 Y_ELEM_BYTES = 2          # fp16 那条；int8 那条用 1，见 decode_y()
 
-# case 文件的头（version 4）。**形状全在 spec 里**，脚本不再写死任何一个维度 ——
+# case 文件的头（version 5）。**形状全在 spec 里**，脚本不再写死任何一个维度 ——
 # gen_case 写它，fc2d.py 从它生成 singleop.json，本脚本从它下发属性，三处同源。
-CASE_VERSION = 4
+CASE_VERSION = 5
 SPEC_KEYS = [
     "n", "ci", "hi", "wi", "cout1", "cout2", "kh", "kw", "s1", "s2",
     "ph1", "pw1", "ph2", "pw2", "elem_bytes", "bias", "relu1", "relu2",
@@ -76,11 +76,11 @@ HDR_LEN = struct.calcsize(HDR_FMT)
 REC_FMT = "<16sII4qQ"           # name, dtype, ndim, dims[4], nbytes
 REC_LEN = struct.calcsize(REC_FMT)
 
-# 算子的 ABI 输入顺序。dequant_scale2 是 IR 下标 5 的**可选**输入，只有
-# 「int8 进 / fp16 出」那条通路传它 —— 通路就是由它的有无来选的。
-# 实际用哪个列表见 info["order"]，那是按 case 算出来的。
+# 算子的实参 ABI 顺序。q1/q2/dq2 在 OpDef 中是 optional，在相应 dtype 通路中条件必传。
+# 实际用哪个列表见 info["order"]，由 case dtype 决定。
 ORDER = ["x", "filter1", "bias1", "filter2", "bias2"]
-ORDER_S8F16 = ORDER + ["dequant_scale2"]
+ORDER_INT8 = ORDER + ["quant_scale1", "quant_scale2"]
+ORDER_S8F16 = ORDER + ["dequant_scale2", "quant_scale1"]
 # 两个 golden：y_expect 是定点模型（假设成立时应逐位相等），y_exact 是纯 fp32
 # 参考（判「有没有在算这个卷积」，不受定点假设影响）。见 golden.h 顶部那段。
 GOLDENS = ["y_expect", "y_exact"]
@@ -166,7 +166,7 @@ def load_case(path):
     isInt8 = (spec["elem_bytes"] == 1)          # **入口**是 int8
     isS8F16 = isInt8 and spec.get("out_fp16", 0) == 1
     outInt8 = isInt8 and not isS8F16            # **出口**是 int8
-    order = ORDER_S8F16 if isS8F16 else ORDER
+    order = ORDER_S8F16 if isS8F16 else (ORDER_INT8 if outInt8 else ORDER)
     # y_exact（纯 fp32 参考）只有 fp16 定点通路有 —— 那边的定点模型带假设，需要
     # 第二个不依赖模型的参照。两条 int8 入口的 golden 都是精确整数运算，没有这个概念。
     required = list(order) + ["y_expect"] + ([] if isInt8 else ["y_exact"])
@@ -830,7 +830,8 @@ def main():
         dtype, dims, data = tensors[name]
         print("  %-9s %-6s %-16s %9d 字节" % (name, DTYPE_NAME[dtype], dims, len(data)))
     if info["isInt8"]:
-        print("量化系数（来自 header，将作为算子属性下发）: quant_scale1=%.9g quant_scale2=%.9g  relu=%s  bias=%s"
+        print("量化系数（header 调试元数据；实际以 per-channel uint64 张量下发）: "
+              "quant_scale1=%.9g quant_scale2=%.9g  relu=%s  bias=%s"
               % (info["qs1"], info["qs2"], "on" if info["relu"] else "off",
                  "on" if info["hasBias"] else "off"))
         print("            out_int8 = saturate( round( acc_int32 * quant_scale ) )，再 relu")
@@ -915,9 +916,8 @@ def main():
             descs.append(desc)
             bufs.append(buf)
 
-        # ABI 顺序钉死，和 op_host/fused_conv2d_def.cpp 的 Input() 调用顺序一一对应：
-        #   x, scale_x, filter1, bias1, scale1, filter2, bias2, scale2 -> y
-        # 少传一个 ACL 不一定报错，它可能把后面的实参往前挪，于是 filter1 被当成 scale_x。
+        # 实参 ABI 顺序钉死。singleop.json 里用 RESERVED/UNDEFINED 保留缺席的 optional
+        # 槽；执行时则只传当前 dtype 通路的实际张量，顺序与该 .om 的有效输入一致。
         for name in info["order"]:
             dtype, dims, data = tensors[name]
             make_operand(dtype, dims, data)
@@ -944,13 +944,13 @@ def main():
         # 匹配的，多设一个或少设一个都会 MatchOpModel fail，而报出来是 100024 /
         # 「算子没找到」，那条信息完全不指向真正的原因。
         #
-        # 所以这里**九个属性一个不少地全设**，fc2d.py 生成 singleop.json 时也全写。
+        # 所以这里**八个属性一个不少地全设**，fc2d.py 生成 singleop.json 时也全写。
         # 上一版是两条通路各设一个子集，于是「int8 分支之后又无条件设了 fixed_shift」
         # 这种事就会炸，而且炸得像算子没装。全集没有这个问题。
-        for fn in ("aclopSetAttrFloat", "aclopSetAttrBool", "aclopSetAttrListInt"):
+        for fn in ("aclopSetAttrBool", "aclopSetAttrListInt"):
             if getattr(acl, fn, None) is None:
                 die("这个 CANN 的 libascendcl.so 里没有 %s —— 属性传不下去" % fn)
-        for nm, v in (("fixed_shift1", shift1), ("fixed_shift2", shift2)):
+        for nm, v in (("fixed_shift1", shift1), ("fixed_shift2", shift2), ("a16w8_shift1", 29)):
             rc = setattr_fn(attr, nm.encode(), v)
             if rc != ACL_SUCCESS:
                 die("aclopSetAttrInt(%s=%d) = %d" % (nm, v, rc))
@@ -958,10 +958,6 @@ def main():
             rc = acl.aclopSetAttrBool(attr, nm.encode(), 1 if v else 0)
             if rc != ACL_SUCCESS:
                 die("aclopSetAttrBool(%s=%s) = %d" % (nm, v, rc))
-        for nm, v in (("quant_scale1", info["qs1"]), ("quant_scale2", info["qs2"])):
-            rc = acl.aclopSetAttrFloat(attr, nm.encode(), ctypes.c_float(v))
-            if rc != ACL_SUCCESS:
-                die("aclopSetAttrFloat(%s=%g) = %d" % (nm, v, rc))
         for nm, vals in (("kernel_size", [info["kh"], info["kw"]]),
                          ("strides", [info["s1"], info["s2"]]),
                          ("pads", [info["ph1"], info["pw1"], info["ph2"], info["pw2"]])):
@@ -969,9 +965,9 @@ def main():
             rc = acl.aclopSetAttrListInt(attr, nm.encode(), len(vals), arr)
             if rc != ACL_SUCCESS:
                 die("aclopSetAttrListInt(%s=%s) = %d" % (nm, vals, rc))
-        print("算子属性: fixed_shift=%d/%d relu=%s/%s quant_scale=%.9g/%.9g "
+        print("算子属性: fixed_shift=%d/%d relu=%s/%s a16w8_shift1=29 "
               "kernel=%dx%d strides=%d/%d pads=%d,%d/%d,%d"
-              % (shift1, shift2, bool(info["relu1"]), bool(info["relu2"]), info["qs1"], info["qs2"],
+              % (shift1, shift2, bool(info["relu1"]), bool(info["relu2"]),
                  info["kh"], info["kw"], info["s1"], info["s2"],
                  info["ph1"], info["pw1"], info["ph2"], info["pw2"]))
 
@@ -1068,17 +1064,15 @@ def main():
         # 逐位相等。差 1 的个数单独报，那是重量化舍入方向不同的表现。
         offBy1 = sum(1 for i in range(r["n"]) if abs(got[0][i] - want[0][i]) == 1)
         print("\n[int8] 差 1 的有 %d 个（重量化舍入方向不同的话会集中在这里）" % offBy1)
-        # quant_scale 漏传的表征：输出大面积贴在 ±127。这个属性没有安全的缺省
-        # （OpDef 给的 1.0 在 int32 累加器上必然全饱和），所以专门报一下 ——
-        # 否则它长得像"算子算错了"。
+        # quant_scale 表编码错的表征：输出大面积贴在 ±127。host tiling 会拒绝缺表，
+        # 但表存在而 scale 位型/bit46 写错仍会跑完，所以专门报一下。
         satGot = sum(1 for v in got[0] if v == 127 or v == -128)
         satWant = sum(1 for v in want[0] if v == 127 or v == -128)
         print("[int8] 饱和（±127/-128）: 设备 %d / %d = %.4f%%   golden %d = %.4f%%"
               % (satGot, r["n"], satGot * 100.0 / r["n"], satWant, satWant * 100.0 / r["n"]))
         if satGot > r["n"] // 10 and satWant * 20 < satGot:
-            print("       => 设备侧大面积饱和而 golden 没有 —— 极可能是 quant_scale 没传对。")
-            print("          它是 OPTIONAL，缺省 1.0，而 int8 的累加器量级在 1e6~1e7，")
-            print("          1.0 会让每个点都撞到 ±127。检查 om_out 里的 singleop_used.json。")
+            print("       => 设备侧大面积饱和而 golden 没有 —— 极可能是 per-channel quant_scale 表没传对。")
+            print("          检查 case.bin 里的 q1/q2 表、bit46 和 om 里的输入槽。")
     elif info["isS8F16"]:
         # 这条的出口是 per-channel 反量化，定标不是 2 的幂 —— report_lsb 那套
         # 「累加器 LSB = 2^-(58-S)」在这里没有意义，报了只会误导。

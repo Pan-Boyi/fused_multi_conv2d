@@ -10,28 +10,31 @@
  * fc2d.py 从 cases.json 里读一条就展开成上面这样一行，所以**改 json 就能换形状**。
  *
  * ---------------------------------------------------------------------------
- * 文件格式（version = 4，和 run_fused_conv2d.py 配套）
+ * 文件格式（version = 5，和 run_fused_conv2d.py 配套）
  * ---------------------------------------------------------------------------
  *   magic "FC2DCASE" (8B)
- *   version u32 = 4
+ *   version u32 = 5
  *   ntensors u32
  *   nonzero  u64   golden 里非零输出的个数
  *   sat      u64   落格时撞到边界的个数（fp16 是 int32 饱和，int8 是 ±127）
  *   y_elems  u64
  *   spec     32 x i32  —— 完整的形状 + 属性，见下面 SPEC_* 的定义
- *   qscale   2 x u32   —— int8 通路的两个 quant_scale 的 float 位型
+ *   qscale   2 x u32   —— int8 通路两张 per-channel 表的统一系数位型（调试元数据）
  *   然后每个张量：name[16], dtype u32, ndim u32, dims[4] i64, nbytes u64, data
  *
  * **spec 是这个文件里唯一的形状真相。** run_fused_conv2d.py 和 fc2d.py 生成
  * singleop.json 时都从它读，所以 .bin 和 .om 不可能对不上形状 —— 上一版靠脚本
  * 里另写一份 shape，改了 golden 忘了改 json，板上报的是「算子没找到」。
  *
- * 张量顺序就是算子的 ABI 顺序：x, filter1, bias1, filter2, bias2, dequant_scale2 -> y
+ * 张量顺序就是算子的实参 ABI 顺序：
+ *   fp16   x, filter1, bias1, filter2, bias2
+ *   int8   x, filter1, bias1, filter2, bias2, quant_scale1, quant_scale2
+ *   s8f16  x, filter1, bias1, filter2, bias2, dequant_scale2, quant_scale1
  * 外加 golden：
  *   fp16   y_expect（定点模型，假设成立时应逐位相等）+ y_exact（纯 fp32 参考）
- *   int8   y_expect（精确整数运算 + REQ8，应逐位相等）
+ *   int8   y_expect（精确整数运算 + per-channel VREQ8，应逐位相等）
  *   s8f16  y_expect（int8 乘累加 + per-channel 反量化成 fp16，应逐位相等），
- *          dequant_scale2 是要**下发给算子**的那张表，不是 golden
+ *          dequant_scale2 / quant_scale1 是要**下发给算子**的表，不是 golden
  */
 #include <cstdio>
 #include <cstdlib>
@@ -48,7 +51,7 @@ constexpr uint32_t ACL_DT_INT8 = 2;
 constexpr uint32_t ACL_DT_INT32 = 3;
 constexpr uint32_t ACL_DT_UINT64 = 10;
 
-constexpr uint32_t CASE_VERSION = 4;
+constexpr uint32_t CASE_VERSION = 5;
 constexpr int SPEC_N = 32; // spec 数组的长度，留了余量
 
 // spec 数组的下标。**只能往后加，不能插**：run_fused_conv2d.py 按同样的下标读。
@@ -107,6 +110,13 @@ struct Writer {
         Raw(data, nbytes);
     }
 };
+
+static std::vector<uint64_t> Req8Table(int channels, uint32_t scaleBits)
+{
+    // VREQ8 每通道一个 uint64：低 32 位是 fp32 scale 位型，bit46 选有符号 int8 饱和。
+    const uint64_t entry = static_cast<uint64_t>(scaleBits) | (1ULL << 46);
+    return std::vector<uint64_t>(static_cast<size_t>(channels), entry);
+}
 
 static int ArgInt(int argc, char** argv, const char* key, int dflt, bool* found = nullptr)
 {
@@ -255,11 +265,12 @@ int main(int argc, char** argv)
 
     if (outFp16) {
         // ---- int8 进 / fp16 出 ------------------------------------------------
-        // conv1 和 int8 通路一模一样（REQ8 出 int8 的 mid），只有 conv2 的出口是
+        // conv1 和 int8 通路一模一样（VREQ8 出 int8 的 mid），只有 conv2 的出口是
         // 按通道反量化成 fp16。所以 golden 走的是同一个 Build，只多传一个开关。
         int8path::Result g = int8path::Build(c, /*fp16Out*/ true);
         uint32_t qs1 = 0;
         std::memcpy(&qs1, &g.scale1, 4);
+        const std::vector<uint64_t> q1 = Req8Table(c.cout1, qs1);
         const float one = 1.0f;
         uint32_t oneBits = 0;
         std::memcpy(&oneBits, &one, 4);
@@ -270,16 +281,14 @@ int main(int argc, char** argv)
 
         w.Raw("FC2DCASE", 8);
         w.U32(CASE_VERSION);
-        w.U32(8); // x, f1, b1, f2, b2, dequant_scale2, y_expect, w1_nchw
+        w.U32(9); // x, f1, b1, f2, b2, dequant_scale2, quant_scale1, y_expect, w1_nchw
         w.U64((uint64_t)g.yNonZero);
         w.U64(0); // 这条通路没有「饱和」这一说，出口是 fp16
         w.U64((uint64_t)c.YElems());
         for (int i = 0; i < SPEC_N; ++i) {
             w.I32(spec[i]);
         }
-        // quant_scale1 照发（conv1 的出口用它）；quant_scale2 这条通路不用，
-        // 但**不能写 0** —— 它会原样进 singleop.json 当属性值，而 ACL 按属性的值
-        // 匹配 .om。写算子声明里的缺省 1.0。
+        // header 保留两个统一 scale 位型仅供调试打印；算子实际读下面的 uint64 表。
         w.U32(qs1);
         w.U32(oneBits);
 
@@ -289,6 +298,7 @@ int main(int argc, char** argv)
         w.Tensor("filter2", ACL_DT_INT8, f2Dims, g.w2Dev.data(), g.w2Dev.size());
         w.Tensor("bias2", ACL_DT_INT32, {(int64_t)c.cout2}, g.b2.data(), g.b2.size() * 4);
         w.Tensor("dequant_scale2", ACL_DT_UINT64, {(int64_t)c.cout2}, g.deq.data(), g.deq.size() * 8);
+        w.Tensor("quant_scale1", ACL_DT_UINT64, {(int64_t)c.cout1}, q1.data(), q1.size() * 8);
         w.Tensor("y_expect", ACL_DT_FLOAT16, yDims, g.yF16.data(), g.yF16.size() * 2);
         w.Tensor("w1_nchw", ACL_DT_INT8, {(int64_t)c.cout1, (int64_t)c.ci, (int64_t)c.kh, (int64_t)c.kw},
                  g.w1Nchw.data(), g.w1Nchw.size());
@@ -351,9 +361,7 @@ int main(int argc, char** argv)
         for (int i = 0; i < SPEC_N; ++i) {
             w.I32(spec[i]);
         }
-        // fp16 通路不用 quant_scale，但**不能写 0**：这两个数会原样进 singleop.json
-        // 当属性值，而 ACL 是按属性的值匹配 .om 的。写算子声明里的缺省 1.0，
-        // 让 .om 上登记的和一个"没传这个属性"的调用方看到的是同一个值。
+        // fp16 通路不用 quant scale；这两个 1.0 只是为了保持 header 调试元数据格式统一。
         const float one = 1.0f;
         uint32_t oneBits = 0;
         std::memcpy(&oneBits, &one, 4);
@@ -376,6 +384,8 @@ int main(int argc, char** argv)
         uint32_t qs1 = 0, qs2 = 0;
         std::memcpy(&qs1, &g.scale1, 4);
         std::memcpy(&qs2, &g.scale2, 4);
+        const std::vector<uint64_t> q1 = Req8Table(c.cout1, qs1);
+        const std::vector<uint64_t> q2 = Req8Table(c.cout2, qs2);
         std::printf("  量化: scale1 = %.9g，scale2 = %.9g（低 13 位尾数已按硬件丢掉）\n", g.scale1,
                     g.scale2);
         std::printf("  golden: 非零 %ld / %ld，饱和到 ±127 的 %ld 处\n", g.yNonZero, c.YElems(), g.sat);
@@ -385,7 +395,7 @@ int main(int argc, char** argv)
 
         w.Raw("FC2DCASE", 8);
         w.U32(CASE_VERSION);
-        w.U32(7); // x, f1, b1, f2, b2, y_expect, w1_nchw
+        w.U32(9); // x, f1, b1, f2, b2, quant_scale1, quant_scale2, y_expect, w1_nchw
         w.U64((uint64_t)g.yNonZero);
         w.U64((uint64_t)g.sat);
         w.U64((uint64_t)c.YElems());
@@ -400,6 +410,8 @@ int main(int argc, char** argv)
         w.Tensor("bias1", ACL_DT_INT32, {(int64_t)c.cout1}, g.b1.data(), g.b1.size() * 4);
         w.Tensor("filter2", ACL_DT_INT8, f2Dims, g.w2Dev.data(), g.w2Dev.size());
         w.Tensor("bias2", ACL_DT_INT32, {(int64_t)c.cout2}, g.b2.data(), g.b2.size() * 4);
+        w.Tensor("quant_scale1", ACL_DT_UINT64, {(int64_t)c.cout1}, q1.data(), q1.size() * 8);
+        w.Tensor("quant_scale2", ACL_DT_UINT64, {(int64_t)c.cout2}, q2.data(), q2.size() * 8);
         w.Tensor("y_expect", ACL_DT_INT8, yDims, g.y.data(), g.y.size());
         w.Tensor("w1_nchw", ACL_DT_INT8, {(int64_t)c.cout1, (int64_t)c.ci, (int64_t)c.kh, (int64_t)c.kw},
                  g.w1Nchw.data(), g.w1Nchw.size());

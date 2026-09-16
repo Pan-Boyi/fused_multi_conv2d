@@ -11,7 +11,7 @@
  *
  *   fp16 定点   y_expect  定点模型：acc_i32 = round(sum(a*b) * 2^F)，F = 58 - S
  *               y_exact   纯 fp32 参考，只在每层末尾窄化到 fp16
- *   int8 量化   y         精确整数卷积 + REQ8（round-half-even + 饱和 + relu）
+ *   int8 量化   y         精确整数卷积 + per-channel VREQ8（round-half-even + 饱和 + relu）
  *
  * fp16 给两个 golden 是因为定点模型带假设（累加器的定标语义），而 y_exact 不带。
  * 板上先看 y_exact 的相对误差过不过 —— 那判的是「这个算子有没有在算这个卷积」；
@@ -433,7 +433,7 @@ inline Result Build(const Case& c)
 // ===========================================================================
 namespace int8path {
 
-// scale 的低 13 位尾数会被硬件丢掉（REQ8 的 deqScalar 只有 [31:13] 这 19 位），
+// scale 的低 13 位尾数会被硬件丢掉（VREQ8 表项的 scale 只有 [31:13] 这 19 位），
 // golden 必须照做，否则会出现「只差最后一位」的不一致，而那种不一致最难判定谁错。
 inline float EffectiveScale(float s)
 {
@@ -493,7 +493,7 @@ inline void ConvInt8(const int8_t* in, const int8_t* wt, const int32_t* bias, in
 
 // scale 挑法：让重量化之后的动态范围铺满 int8。**不能不挑** —— 累加器量级在
 // 1e6~1e7，scale = 1.0 会让每个点都饱和到 ±127，那样比对全 127 = 全对，什么也
-// 验不出来。板上漏传 quant_scale 的表征就是输出大面积贴在 ±127 上。
+// 验不出来。板上 per-channel quant_scale 表编码错的表征就是输出大面积贴在 ±127 上。
 inline float PickScale(const std::vector<int32_t>& acc)
 {
     int32_t m = 0;
@@ -521,7 +521,7 @@ struct Result {
     std::vector<uint16_t> yF16;
 };
 
-// fp16Out = true 就是「int8 进 / fp16 出」那条：**前半段完全一样**（conv1 REQ8
+// fp16Out = true 就是「int8 进 / fp16 出」那条：**前半段完全一样**（conv1 VREQ8
 // 出 int8 的 mid、conv2 的 int32 累加器），只有 conv2 的出口换成按通道反量化。
 // 用同一个函数而不是另写一份，是为了让两条通路对前半段不可能有分歧。
 inline Result Build(const Case& c, bool fp16Out = false)

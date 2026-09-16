@@ -47,7 +47,7 @@ SPEC_KEYS = [
 SPEC_N = 32
 HDR_FMT = "<8sIIQQQ" + "%di" % SPEC_N + "II"
 HDR_LEN = struct.calcsize(HDR_FMT)
-CASE_VERSION = 4
+CASE_VERSION = 5
 
 
 # run_fused_conv2d.py 里有**同一份** SPEC_KEYS 的抄本。它必须能单独跑在板子机上
@@ -182,7 +182,7 @@ def read_spec(path):
 def singleop_json(spec):
     """从 .bin 的 spec 造 singleop 描述。
 
-    **九个属性一个不少地全写上。** ACL 是按属性的**值**匹配 .om 的，多一个少一个
+    **八个属性一个不少地全写上。** ACL 是按属性的**值**匹配 .om 的，多一个少一个
     都会匹配不上，报出来是「算子没找到」。上一版 fp16 和 int8 各写一份 json、各带
     一个子集，于是执行时多设一个属性就炸 —— 这里统一成全集，那类问题不存在了。
     """
@@ -202,10 +202,25 @@ def singleop_json(spec):
         {"format": "ND", "shape": [fz2k, (spec["cout2"] + 15) // 16, 16, c0], "type": t},
         {"format": "ND", "shape": [spec["cout2"]], "type": bt},
     ]
-    # dequant_scale2 是 IR 下标 5 的可选输入。**传了它就是 int8 进 / fp16 出那条**
-    # —— 通路由输入的有无来选，不是属性。所以别的两条这里一个字都不加。
-    if spec.get("out_fp16", 0) == 1:
-        inputs.append({"format": "ND", "shape": [spec["cout2"]], "type": "uint64"})
+    # optional 输入必须按 IR 下标 5/6/7 对齐。中间缺席的槽不能直接省略：
+    # ATC single-op JSON 的约定是 RESERVED + UNDEFINED 占位。
+    missing = {"format": "RESERVED", "shape": [], "type": "UNDEFINED"}
+    is_int8 = spec["elem_bytes"] == 1
+    is_s8f16 = is_int8 and spec.get("out_fp16", 0) == 1
+    if is_s8f16:
+        inputs.extend([
+            {"format": "ND", "shape": [spec["cout2"]], "type": "uint64"},  # dq2
+            {"format": "ND", "shape": [spec["cout1"]], "type": "uint64"},  # q1
+            dict(missing),                                                       # q2
+        ])
+    elif is_int8:
+        inputs.extend([
+            dict(missing),                                                       # dq2
+            {"format": "ND", "shape": [spec["cout1"]], "type": "uint64"},  # q1
+            {"format": "ND", "shape": [spec["cout2"]], "type": "uint64"},  # q2
+        ])
+    else:
+        inputs.extend([dict(missing), dict(missing), dict(missing)])
     return [{
         "op": "FusedConv2d",
         "input_desc": inputs,
@@ -219,12 +234,11 @@ def singleop_json(spec):
             {"name": "fixed_shift2", "type": "int", "value": spec["shift2"]},
             {"name": "relu1", "type": "bool", "value": bool(spec["relu1"])},
             {"name": "relu2", "type": "bool", "value": bool(spec["relu2"])},
-            {"name": "quant_scale1", "type": "float", "value": spec["qs1"]},
-            {"name": "quant_scale2", "type": "float", "value": spec["qs2"]},
             {"name": "kernel_size", "type": "list_int", "value": [spec["kh"], spec["kw"]]},
             {"name": "strides", "type": "list_int", "value": [spec["s1"], spec["s2"]]},
             {"name": "pads", "type": "list_int",
              "value": [spec["ph1"], spec["pw1"], spec["ph2"], spec["pw2"]]},
+            {"name": "a16w8_shift1", "type": "int", "value": 29},
         ],
     }]
 
