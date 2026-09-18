@@ -71,6 +71,28 @@
 namespace FusedConv2dShape {
 
 // ---------------------------------------------------------------------------
+// 几何的修订号。**每次改动几何的判据或 L1/L0 布局都要 +1，并在下面记一行。**
+//
+// 它存在的理由是一次真实的返工：tileK 受 L0B 限那一笔（7c3ff143）和权重按段滚动
+// 那一笔（a56527ee）都是**纯 tiling 改动**，而运行时没有任何办法知道加载进来的
+// tiling 是哪一版 —— 报出来的只有 RejectText 那句话，和三个月前的版本一模一样。
+// 于是「代码推了、也重编了，但编的是另一棵树」这件事，靠看日志完全分辨不出来，
+// 白花了一整轮来回。现在这个号打在 tiling 的成功**和拒绝**两条日志里。
+//
+//   1  运行期形状（65f32342）以来的基线
+//   2  M 切到行内、cout2 放开 16 对齐（bbc30c42）
+//   3  按 W 分核，chunk = 行带 x 列段（44743d33）
+//   4  L0B 里一段 K 的跨距是 align16(Cout)（fe3f86ca）
+//   5  conv1 的 L0C 双缓冲，多一个 l0cStride 字段（821f2dea）
+//   6  tileK 必须被 L0B 压住（7c3ff143）
+//   7  权重可按 L0B 段在 L1 里滚动，多 w1Stage / w2Stage 两个字段（a56527ee）
+// **只能是宏。** 不要写成 constexpr const char* —— ccec 把字符串字面量放在 __gm__
+// 地址空间里，`const __gm__ char[N]` 转不成 `const char*`，device 那条编译链直接挂。
+// 这也是 RejectText() 被 #if !defined(__NPU_ARCH__) 包起来的同一个理由。
+// 宏只是一个 token，谁需要谁自己用，两条编译链都安全。
+#define FC2D_GEOM_REV "geom7"
+
+// ---------------------------------------------------------------------------
 // 5102 的片上容量。**只有这一组仍然是编译期常量** —— 它们是芯片属性，不是形状。
 // L1 是例外：真机 1 MB，而 CPU 仿真把它截在 512 KB
 // （kernel_utils_mode_cpu.h:283），所以 L1 预算是 PickHb() 的入参，由调用方给。
@@ -347,7 +369,13 @@ struct Geometry {
     int l0aSlotElems;    // 一个 L0A 槽的元素数（按 elemBytes）
     int l0bElems;        // L0B 要多少元素（两个卷积取大）
     int l0cElems;        // 共享 L0C 的元素数（int32）
+    // L0C 两个槽的元素跨距。**0 表示单缓冲**（一个槽），此时指令流和双缓冲之前
+    // 逐字相同。见下面 DeriveWith 里算它的那一段。
+    int l0cStride;
 
+    // 权重在 L1 里的摆法。0 = 整套常驻（老行为），1 = 按 L0B 段滚动（两个槽）。
+    // 见 DeriveWith 里 PickWeightPlacement 那一段。
+    int w1Stage, w2Stage;
     // L1 常驻段，字节地址（每段 512 对齐）
     int fmElems, midElems, w1Elems, w2Elems;
     int fmAddr, midAddr, w1Addr, w2Addr, b1Addr, b2Addr;
@@ -379,20 +407,40 @@ struct KChoice {
     bool ok;
 };
 
-FC2D_GEOM_FN KChoice PickTileK(int k, int c0, int elemBytes, int cout, int totalM)
+FC2D_GEOM_FN KChoice PickTileK(int k, int c0, int elemBytes, int cout, int totalM, int weightBytes)
 {
     KChoice best;
     best.tileK = 0;
     best.mMax = 0;
     best.nTiles = 0;
     best.ok = false;
-    if (k <= 0 || c0 <= 0 || cout <= 0 || totalM <= 0) {
+    if (k <= 0 || c0 <= 0 || cout <= 0 || totalM <= 0 || weightBytes <= 0) {
         return best;
     }
     // L0C 的上限和 tileK 无关：align16(m) * align16(cout) <= 65,536 个 int32。
     const int mCapC = L0C_ELEMS / Align(cout, MMAD_M0);
+    // **L0B 的上限。** 这一条以前不在这里，后果是一整类形状被无谓拒掉：
+    // PickL0bChunks 要求折出来的每一段 chunkK 都是 tileK 的整数倍（img2col 的 K 偏移
+    // k0 = hc*chunkK + t*tileK 和 L0B 里的偏移必须对得上），而每一段又要装进 L0B。
+    // 于是 chunkK >= tileK 且 align16(cout)*chunkK*weightBytes <= L0B_BYTES，
+    //     => tileK <= ckMax = L0B_BYTES / (align16(cout) * weightBytes)
+    // 这条既必要也充分 —— 充分是因为 chunkK = tileK 永远合法（tileK 整除 k，所以
+    // c = k/tileK 是整数）。
+    //
+    // 不加这一条时的失败形态：M 很小的形状（比如 ci=192 的 36x14，m1Max=42、
+    // mRunMax=7）所有 tileK 都给出 nTiles=1，于是「并列取更大的 tileK」一路取到
+    // k 本身；那个 tileK 折不进 L0B，PickL0bChunks 必然失败，整个形状报 RJ_L0B ——
+    // 而同一个形状换个小一点的 tileK 是完全成立的。并列取大的**收益在 M 这么小的
+    // 时候是零**（img2col 的条数由 m*k/L0A一槽 定，和 tileK 无关），代价却是被拒。
+    //
+    // 对现有能过的形状这一行是空操作：能过 => PickL0bChunks 成功 => 存在
+    // chunkK >= tileK 装进 L0B => tileK <= ckMax => 这个 continue 不会触发。
+    const int ckMax = L0B_BYTES / (Align(cout, MMAD_M0) * weightBytes);
     for (int tk = c0; tk <= k; tk += c0) {
         if ((k % tk) != 0) {
+            continue;
+        }
+        if (tk > ckMax) {
             continue;
         }
         // L0A 一槽：align16(m) * tileK * elemBytes <= 32,768
@@ -478,7 +526,8 @@ struct FlatGeom {
     int tileK1, tileK2;
     int l0bChunks1, l0bChunkK1, tilesPerChunk1;
     int l0bChunks2, l0bChunkK2, tilesPerChunk2;
-    int l0bElems, l0cElems;
+    int l0bElems, l0cElems, l0cStride;
+    int w1Stage, w2Stage;   // 权重在 L1 里的摆法，见 Geometry
     // ---- L1 地址表（字节地址）----
     int fmAddr, fmElems, midAddr, midElems, w1Addr, w1Elems, w2Addr, w2Elems, b1Addr, b2Addr;
     int dq2Addr;   // conv2 的 per-channel 反量化表（不带时这一段长度为 0）
@@ -539,6 +588,9 @@ struct FlatGeom {
     X(tilesPerChunk2, tilesPerChunk2) \
     X(l0bElems, l0bElems)     \
     X(l0cElems, l0cElems)     \
+    X(l0cStride, l0cStride)   \
+    X(w1Stage, w1Stage)       \
+    X(w2Stage, w2Stage)       \
     X(fmAddr, fmAddr)         \
     X(fmElems, fmElems)       \
     X(midAddr, midAddr)       \
@@ -607,6 +659,9 @@ FC2D_GEOM_FN void Flatten(const Geometry& g, int chunksPerCore, FlatGeom& f)
     f.tilesPerChunk2 = g.tilesPerChunk2;
     f.l0bElems = g.l0bElems;
     f.l0cElems = g.l0cElems;
+    f.l0cStride = g.l0cStride;
+    f.w1Stage = g.w1Stage;
+    f.w2Stage = g.w2Stage;
 
     f.fmAddr = g.fmAddr;
     f.fmElems = g.fmElems;
@@ -798,6 +853,36 @@ FC2D_GEOM_FN Band MakeBand(const Geometry& g, int chunk)
 // 核心：Params + hb + 列段数 -> Geometry。返回 0 表示成立，否则是 Reject 码。
 // l1Budget 是这次允许用多少 L1（真机 1 MB，CPU 仿真 512 KB）。
 // ---------------------------------------------------------------------------
+// L1 的地址表。从 DeriveWith 里抽出来，因为权重的两种摆法要各排一遍。
+// 每段 512 对齐 —— fixpipe 的 L1->FB 取数要求。
+FC2D_GEOM_FN void LayOutL1(const Params& p, Geometry& g, int xBytes, int midBytes, int weightBytes,
+                           int biasBytes)
+{
+    g.fmAddr = 0;
+    g.midAddr = Align(g.fmAddr + g.fmElems * xBytes, L1_SEG_ALIGN);
+    g.w1Addr = Align(g.midAddr + g.midElems * midBytes, L1_SEG_ALIGN);
+    g.w2Addr = Align(g.w1Addr + g.w1Elems * weightBytes, L1_SEG_ALIGN);
+    g.b1Addr = Align(g.w2Addr + g.w2Elems * weightBytes, L1_SEG_ALIGN);
+    g.b1Bytes = Align(p.cout1 * biasBytes, L1_SEG_ALIGN);
+    g.b2Addr = g.b1Addr + g.b1Bytes;
+    g.b2Bytes = Align(p.cout2 * biasBytes, L1_SEG_ALIGN);
+    // per-channel 反量化表：一个通道一个 uint64。fixpipe 取的是 L1 地址，所以它
+    // 得常驻。不带这条通路时长度 0，一个字节都不占 —— 否则每个形状都要为一个
+    // 用不上的段让出 4 KB，本来放得下的会被拒掉。
+    g.dq2Addr = g.b2Addr + g.b2Bytes;
+    g.dq2Bytes = (p.hasDeqScale2 != 0) ? Align(p.cout2 * (int)sizeof(long long), L1_SEG_ALIGN) : 0;
+    g.q1Addr = g.dq2Addr + g.dq2Bytes;
+    g.q1Bytes = (p.hasQuantScale1 != 0) ? Align(p.cout1 * (int)sizeof(long long), L1_SEG_ALIGN) : 0;
+    g.q2Addr = g.q1Addr + g.q1Bytes;
+    g.q2Bytes = (p.hasQuantScale2 != 0) ? Align(p.cout2 * (int)sizeof(long long), L1_SEG_ALIGN) : 0;
+    g.l1Used = g.q2Addr + g.q2Bytes;
+}
+
+// l1Budget 不只是一道「收不收」的门禁 —— 它会改变权重在 L1 里的**摆法**
+// （整套常驻 / 按段滚动，见下面 w1Stage 那段），于是 w2Addr / b2Addr / l1Used 都
+// 随它变。**同一个形状必须始终用同一个预算去推几何**，否则算出来的是两份不同的
+// L1 地址表。生产路径上这个预算只有一个来源（tiling 从平台读 L1 大小），
+// UT 里由 L1_BUDGET_SIM 统一。<= 0 表示不限。
 FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Geometry& g)
 {
     const int xBytes = p.elemBytes;
@@ -895,8 +980,15 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
     const int mRunMax = (g.nwseg == 1) ? (hb * g.wo2) : g.wseg;
     const int kBlock1 = MaxI(g.c0, g.weightC0);
     const int kBlock2 = MaxI(g.midC0, g.weightC0);
-    const KChoice kc1 = PickTileK(g.k1, kBlock1, xBytes, p.cout1, g.m1Max);
-    const KChoice kc2 = PickTileK(g.k2, kBlock2, midBytes, p.cout2, mRunMax);
+    // 一段 K 最短就是 kBlock（K 的分形宽度），连它都装不进 L0B 的话没有任何 tileK
+    // 能成立。先在这里判掉，是为了把**真正的原因**报出来 —— 否则 PickTileK 的候选
+    // 集为空，报的是 RJ_TILE_K（「找不到 K 切分」），指向错误的方向。
+    if (Align(p.cout1, MMAD_M0) * kBlock1 * weightBytes > L0B_BYTES ||
+        Align(p.cout2, MMAD_M0) * kBlock2 * weightBytes > L0B_BYTES) {
+        return RJ_L0B;
+    }
+    const KChoice kc1 = PickTileK(g.k1, kBlock1, xBytes, p.cout1, g.m1Max, weightBytes);
+    const KChoice kc2 = PickTileK(g.k2, kBlock2, midBytes, p.cout2, mRunMax, weightBytes);
     if (!kc1.ok || !kc2.ok) {
         return RJ_TILE_K;
     }
@@ -948,41 +1040,101 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
 
     const int l0c1 = Align(g.mMax1, MMAD_M0) * Align(p.cout1, MMAD_M0);
     const int l0c2 = Align(g.mMax2, MMAD_M0) * Align(p.cout2, MMAD_M0);
-    g.l0cElems = MaxI(l0c1, l0c2);
-    if (g.l0cElems > L0C_ELEMS) {
+    // 拒绝的判据不变：**一个**子块装不进 L0C 才拒。下面的双缓冲只在还有余量时开，
+    // 所以这条改动一个形状都不会新拒。
+    if (MaxI(l0c1, l0c2) > L0C_ELEMS) {
         return RJ_L0C;
     }
+    // L0C 双缓冲。conv1 的 M 子块在两个槽之间乒乓，一个子块的 fixpipe 于是能和
+    // **下一个**子块的 mmad 同时在飞。今天这两者完全串行（fixFree 只有一个信用），
+    // a16w8_target 上量出来 fixpipe 那条管 9.14us 里一点都没被盖住。
+    //
+    // **只有装得下才开，装不下一个字节都不改。** conv1 的 M 上限同时受 L0A 一槽和
+    // L0C 两头限制（PickTileK 里的 mCapA / mCapC）；A16W8 的 A 侧是 fp16，一槽只
+    // 装得下 512 个位置，于是 L0C 那头根本没用满 —— 512*64 = 32,768，正好是 L0C 的
+    // 一半。这条路对它因此是**免费**的：mMax 不动、分块数不动、一条指令都不多。
+    // 同形状的 int8 通路 mMax1 = 1024、l0c1 刚好占满 L0C，那就退回单缓冲。
+    //
+    // conv2 不乒乓。它的 l0c2 可以比一个槽更宽（a16w8_target 是 40,960 > 32,768），
+    // 乒乓会让它盖掉另一个槽。所以 conv2 仍然坐在槽 0、一次占掉**全部**槽的信用
+    // （impl.h 里 l0cSlots 那段）。它每个 chunk 只有一两条 fixpipe，9.14us 里占
+    // 约 1.3us，不值得为它再多一种情形。
+    g.l0cStride = (2 * l0c1 <= L0C_ELEMS) ? l0c1 : 0;
+    g.l0cElems = MaxI(g.l0cStride + l0c1, l0c2);
 
     if (p.cout1 > BT_SLOT_ELEMS || p.cout2 > BT_SLOT_ELEMS) {
         return RJ_BT;
     }
 
-    // L1 地址表。每段 512 对齐 —— fixpipe 的 L1->FB 取数要求。
+    // ---- 权重在 L1 里怎么摆 --------------------------------------------------
+    // 两种摆法：
+    //   全驻（老行为）  w1Elems = align16(cout1)*k1，前缀一次灌完，之后只读
+    //   按段滚动（新）  w1Elems = 2 * align16(cout1)*l0bChunkK1 —— L1 里只放
+    //                   **两个 L0B 段**，用到哪段搬哪段，下一段在算的时候预取
+    //
+    // 为什么需要它：这个算子原来假定「权重比特征图小」。a16w8_target 上权重只占
+    // L1 的 5%，全驻是免费的。但上报的两个形状（ci=192 的 36x14，cout 192/256 和
+    // 256/256，3x3）把比例倒过来了 —— 光两套权重就是 774 KiB 和 1,032 KiB，后者
+    // 是 1 MiB L1 的 98%，剩给 fm + mid + bias + 量化表的只有 16 KiB，而 fm 最省
+    // 也要 18 KiB。全驻结构性放不下，而 L0B 早就把权重折成 6~9 段了，同一时刻只有
+    // 一段在 L0B 里 —— 整套留在 L1 对这类形状是纯浪费。
+    //
+    // **先试全驻，装不下才退到滚动。** 所以今天所有能过的形状一个字节都不变 ——
+    // 和 l0cStride、tileK 那两笔同样的风险面：只能把「拒」变成「过」。
+    //
+    // 滚动只在 l0bChunks > 1 时有意义：l0bChunks == 1 时「一段」就是整套，装不下
+    // 整套等于装不下一段。
+    //
+    // 代价：权重要从 GM 重读，次数 = 消费它的 M 子块数（conv1 的 t1.n、conv2 的
+    // nRun*t2.n）—— 因为 hc 循环嵌在 M 子块循环**里面**。要把 hc 提到外面就得给
+    // 每个 M 子块各留一块 L0C，多数形状放不下（impl.h 里 conv2 那段注释记的就是
+    // 这件事）。M 很小的形状（这两个用例的 t1.n 都是 1）重读次数就是 1，和全驻的
+    // 前缀一次灌完等价；M 大的形状会翻 t1.n 倍。PickHb 因此**优先选不滚动的候选**，
+    // 见下面那段。
     g.fmElems = g.xRows * g.wInMax * p.ci;
     g.midElems = g.m1Max * p.cout1;
-    g.w1Elems = Align(p.cout1, MMAD_M0) * g.k1;
-    g.w2Elems = Align(p.cout2, MMAD_M0) * g.k2;
-
-    g.fmAddr = 0;
-    g.midAddr = Align(g.fmAddr + g.fmElems * xBytes, L1_SEG_ALIGN);
-    g.w1Addr = Align(g.midAddr + g.midElems * midBytes, L1_SEG_ALIGN);
-    g.w2Addr = Align(g.w1Addr + g.w1Elems * weightBytes, L1_SEG_ALIGN);
-    g.b1Addr = Align(g.w2Addr + g.w2Elems * weightBytes, L1_SEG_ALIGN);
-    g.b1Bytes = Align(p.cout1 * biasBytes, L1_SEG_ALIGN);
-    g.b2Addr = g.b1Addr + g.b1Bytes;
-    g.b2Bytes = Align(p.cout2 * biasBytes, L1_SEG_ALIGN);
-    // per-channel 反量化表：一个通道一个 uint64。fixpipe 取的是 L1 地址，所以它
-    // 得常驻。不带这条通路时长度 0，一个字节都不占 —— 否则每个形状都要为一个
-    // 用不上的段让出 4 KB，本来放得下的会被拒掉。
-    g.dq2Addr = g.b2Addr + g.b2Bytes;
-    g.dq2Bytes = (p.hasDeqScale2 != 0) ? Align(p.cout2 * (int)sizeof(long long), L1_SEG_ALIGN) : 0;
-    g.q1Addr = g.dq2Addr + g.dq2Bytes;
-    g.q1Bytes = (p.hasQuantScale1 != 0) ? Align(p.cout1 * (int)sizeof(long long), L1_SEG_ALIGN) : 0;
-    g.q2Addr = g.q1Addr + g.q1Bytes;
-    g.q2Bytes = (p.hasQuantScale2 != 0) ? Align(p.cout2 * (int)sizeof(long long), L1_SEG_ALIGN) : 0;
-    g.l1Used = g.q2Addr + g.q2Bytes;
-    if (l1Budget > 0 && g.l1Used > l1Budget) {
+    const int w1Full = Align(p.cout1, MMAD_M0) * g.k1;
+    const int w2Full = Align(p.cout2, MMAD_M0) * g.k2;
+    // 滚动时的段大小 x 2（乒乓两个槽）。段本身就是 L0B 的一段，所以必然 <= L0B。
+    const int w1Ring = 2 * Align(p.cout1, MMAD_M0) * g.l0bChunkK1;
+    const int w2Ring = 2 * Align(p.cout2, MMAD_M0) * g.l0bChunkK2;
+    const bool w1CanStage = (g.l0bChunks1 > 1) && (w1Ring < w1Full);
+    const bool w2CanStage = (g.l0bChunks2 > 1) && (w2Ring < w2Full);
+    // 试的顺序：全驻 -> 只滚大的那套 -> 只滚小的那套 -> 都滚。
+    // 先滚大的是因为它腾出的空间多；两个都能单独装下时选它更可能一次就成。
+    const bool w2Bigger = (w2Full - w2Ring) >= (w1Full - w1Ring);
+    int modes[4];
+    modes[0] = 0;
+    modes[1] = w2Bigger ? 2 : 1;
+    modes[2] = w2Bigger ? 1 : 2;
+    modes[3] = 3;
+    // l1Budget <= 0 是「不限」—— 老代码里那条 if (l1Budget > 0 && ...) 的语义，
+    // 离线扫盘会这么调。
+    const int budget = (l1Budget > 0) ? l1Budget : 0x7fffffff;
+    int used = -1;
+    for (int mi = 0; mi < 4; ++mi) {
+        const int mode = modes[mi];
+        const int s1 = (mode & 1) != 0 ? 1 : 0;
+        const int s2 = (mode & 2) != 0 ? 1 : 0;
+        if ((s1 != 0 && !w1CanStage) || (s2 != 0 && !w2CanStage)) {
+            continue;
+        }
+        g.w1Stage = s1;
+        g.w2Stage = s2;
+        g.w1Elems = (s1 != 0) ? w1Ring : w1Full;
+        g.w2Elems = (s2 != 0) ? w2Ring : w2Full;
+        LayOutL1(p, g, xBytes, midBytes, weightBytes, biasBytes);
+        if (g.l1Used <= budget) {
+            used = mode;
+            break;
+        }
+    }
+    if (used < 0) {
         return RJ_L1;
+    }
+
+    if (p.cout1 > BT_SLOT_ELEMS || p.cout2 > BT_SLOT_ELEMS) {
+        return RJ_BT;
     }
 
     g.xPlane = p.ci * p.hi * p.wi;
@@ -1044,6 +1196,7 @@ FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
     // 卡在哪里。一条都没有就说「没有任何 band 高度成立」。
     int bestHb = 0;
     long long bestCost = 0;
+    int bestStage = 3;
     int firstReal = RJ_NO_HB;
     for (int hb = 1; hb <= ho2; ++hb) {
         if ((ho2 % hb) != 0) {
@@ -1058,9 +1211,16 @@ FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
         }
         const long long rounds = CeilDiv(probe.chunkTotal, aicNum);
         const long long cost = rounds * (long long)probe.midRows;
-        if (bestHb == 0 || cost < bestCost || (cost == bestCost && hb > bestHb)) {
+        // **不滚动的候选一律优于滚动的。** 滚动要把权重从 GM 重读 t1.n 次（hc 循环
+        // 嵌在 M 子块循环里面），代价和 midRows 不是一个量纲，硬塞进 cost 里会把
+        // 现有形状的 hb 选择也搅动。分两级比较就干净了 —— 而且今天所有能过的形状
+        // 都是不滚动的，所以这一段对它们逐字不变。
+        const int stg = probe.w1Stage + probe.w2Stage;
+        if (bestHb == 0 || stg < bestStage || (stg == bestStage && (cost < bestCost ||
+                                               (cost == bestCost && hb > bestHb)))) {
             bestHb = hb;
             bestCost = cost;
+            bestStage = stg;
         }
     }
     // bestHb == 0 不在这里返回 —— 切列还能把 L1 救回来（每段的 fm / mid 都窄一截），
@@ -1077,6 +1237,7 @@ FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
     int bestHb2 = 0;
     int bestNw = 1;
     long long bestCost2 = 0;
+    int bestStage2 = 3;
     const int nwMax = MinI(aicNum, wo2);
     for (int hb = 1; hb <= ho2; ++hb) {
         if ((ho2 % hb) != 0) {
@@ -1099,11 +1260,15 @@ FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
             const long long perChunk =
                 (long long)probe.midRows * probe.wSubMax + probe.k1 + probe.k2;
             const long long cost = rounds * perChunk;
-            if (bestHb2 == 0 || cost < bestCost2 ||
-                (cost == bestCost2 && (nw < bestNw || (nw == bestNw && hb > bestHb2)))) {
+            // 同上：不滚动的一律优先。
+            const int stg = probe.w1Stage + probe.w2Stage;
+            if (bestHb2 == 0 || stg < bestStage2 ||
+                (stg == bestStage2 && (cost < bestCost2 ||
+                 (cost == bestCost2 && (nw < bestNw || (nw == bestNw && hb > bestHb2)))))) {
                 bestHb2 = hb;
                 bestNw = nw;
                 bestCost2 = cost;
+                bestStage2 = stg;
             }
         }
     }

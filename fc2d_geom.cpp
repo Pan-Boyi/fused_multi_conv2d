@@ -70,9 +70,20 @@ int main(int argc, char** argv)
     Geometry g;
     const int rc = PickHb(p, aic, l1, g);
     if (rc != RJ_OK) {
-        std::fprintf(stderr, "不支持: %s\n", RejectText(rc));
+        // 带上共用头的修订号。这份头是**算子那份的副本**，过期了预检的结论就和
+        // 算子的 tiling 不一致 —— 而不带版本号的话，两边报的是一模一样的一句话，
+        // 从输出上完全分辨不出来「是形状真不行」还是「这份副本旧了」。
+        // 真实踩过：算子那边连推了三笔纯 tiling 改动（tileK 受 L0B 限、权重按段
+        // 滚动、几何修订号），副本没跟着重拷，于是预检一直在用旧判据拒，而算子包
+        // 其实已经能跑了 —— 白花了一整轮来回。重拷见 README 的 --sync-shape-header。
+        std::fprintf(stderr, "不支持[%s]: %s\n", FC2D_GEOM_REV, RejectText(rc));
+        std::fprintf(stderr, "    （这份 fused_conv2d_shape.h 是算子那份的副本。"
+                             "如果算子那边比 %s 更新，先跑 "
+                             "python3 fc2d.py --sync-shape-header <ops-nn>/conv/fused_conv2d/"
+                             "op_kernel/fused_conv2d_shape.h）\n", FC2D_GEOM_REV);
         return 1;
     }
+    std::printf("    [%s] ", FC2D_GEOM_REV);
     std::printf("    conv1 -> %dx%d, conv2 -> %dx%d | 分核 %d 行带 x %d 列段 = %d 块"
                 "（每带 %d 行、每段 %d 列）| L1 %d/%d 字节 (%.0f%%) | "
                 "tileK %d/%d, M 子块 <=%d/%d 个位置, "
