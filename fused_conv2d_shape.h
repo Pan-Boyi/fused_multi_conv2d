@@ -86,11 +86,12 @@ namespace FusedConv2dShape {
 //   5  conv1 的 L0C 双缓冲，多一个 l0cStride 字段（821f2dea）
 //   6  tileK 必须被 L0B 压住（7c3ff143）
 //   7  权重可按 L0B 段在 L1 里滚动，多 w1Stage / w2Stage 两个字段（a56527ee）
+//   8  PickHb 的代价函数算上权重重灌的真实倍数（W 分核会乘 hb）
 // **只能是宏。** 不要写成 constexpr const char* —— ccec 把字符串字面量放在 __gm__
 // 地址空间里，`const __gm__ char[N]` 转不成 `const char*`，device 那条编译链直接挂。
 // 这也是 RejectText() 被 #if !defined(__NPU_ARCH__) 包起来的同一个理由。
 // 宏只是一个 token，谁需要谁自己用，两条编译链都安全。
-#define FC2D_GEOM_REV "geom7"
+#define FC2D_GEOM_REV "geom8"
 
 // ---------------------------------------------------------------------------
 // 5102 的片上容量。**只有这一组仍然是编译期常量** —— 它们是芯片属性，不是形状。
@@ -1253,12 +1254,34 @@ FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
                 continue;
             }
             // 一个 chunk 的代价 = conv1 要算的位置数（band 重叠和列 halo 都在里面）
-            //                   + 每个 chunk 都要重灌一次的两套权重。
+            //                   + 两套权重重灌进 L0B 的量。
             // 后面那一项是防止「越切越好」的：只看第一项的话切得越碎每块越小，代价
             // 单调下降，最后会切成一堆只搬权重的碎片。
+            //
+            // **重灌的次数不是 1。** 权重装得进 L0B（l0bChunks == 1）时才是每 chunk
+            // 一次（kernel 把 L0NZ2NZ 提到 M 循环外面）；折了段就落到「每个 M 子块把
+            // 每一段各灌一遍」那一支，于是
+            //     conv1  t1.n 次        conv2  nRun * t2.n 次
+            // 而 W 分核会让 rowsPerRun 变 1、nRun 变 hb（见 MakeBandLite），所以切列
+            // 对折了段的 conv2 是 **hb 倍** 的权重重灌。
+            //
+            // 原来这里写死 k1 + k2，低估了这个倍数，后果是真机上量到的：
+            // bb_Conv_458_Conv_460（ci=192 的 36x14，cout 192/256，3x3）选出
+            // hb=9 nwseg=4，nRun=9、l0bChunks2=9，于是 conv2 每个 chunk 要把 w2
+            // 重灌 9*9 = 81 段 = 3.98 MB，而它的 img2col 只有 31 KB —— **权重是
+            // img2col 的 128 倍**，MTE1 下界 31us 对着 cube 下界 6.3us，实测 47us，
+            // 比两个卷积分开跑（18.6us）慢 2.5 倍。
             const long long rounds = CeilDiv(probe.chunkTotal, aicNum);
+            const int t1nCost = CeilDiv(probe.m1Max, probe.mMax1);
+            const int nRunCost = (probe.nwseg == 1) ? 1 : probe.hb;
+            const int mRunCost = (probe.nwseg == 1) ? (probe.hb * probe.wo2) : probe.wseg;
+            const int t2nCost = CeilDiv(mRunCost, probe.mMax2);
+            const long long w1Reload =
+                (probe.l0bChunks1 == 1) ? probe.k1 : (long long)t1nCost * probe.k1;
+            const long long w2Reload =
+                (probe.l0bChunks2 == 1) ? probe.k2 : (long long)nRunCost * t2nCost * probe.k2;
             const long long perChunk =
-                (long long)probe.midRows * probe.wSubMax + probe.k1 + probe.k2;
+                (long long)probe.midRows * probe.wSubMax + w1Reload + w2Reload;
             const long long cost = rounds * perChunk;
             // 同上：不滚动的一律优先。
             const int stg = probe.w1Stage + probe.w2Stage;
