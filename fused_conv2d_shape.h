@@ -92,11 +92,13 @@ namespace FusedConv2dShape {
 //  10  代价函数补上 fixpipe 和权重的 GM 读，并且从「取大」改成「求和」
 //      —— geom9 在 bb_Conv_22.0_Conv_27.0 上把 45.36us 推到了 54.40us，
 //      因为「取大」会被漏掉的那一项骗过去
+//  11  滚动权重在 MTE2 里按「消费它的 M 子块数」算（不再一刀切 x2）；
+//      PickHb 第二趟加两条护栏：2% 近似并列带用确定性键裁决、切列要 20% 保证金
 // **只能是宏。** 不要写成 constexpr const char* —— ccec 把字符串字面量放在 __gm__
 // 地址空间里，`const __gm__ char[N]` 转不成 `const char*`，device 那条编译链直接挂。
 // 这也是 RejectText() 被 #if !defined(__NPU_ARCH__) 包起来的同一个理由。
 // 宏只是一个 token，谁需要谁自己用，两条编译链都安全。
-#define FC2D_GEOM_REV "geom10"
+#define FC2D_GEOM_REV "geom11"
 
 // ---------------------------------------------------------------------------
 // 5102 的片上容量。**只有这一组仍然是编译期常量** —— 它们是芯片属性，不是形状。
@@ -1294,6 +1296,24 @@ FC2D_GEOM_FN long long CoreCostCycles(const Geometry& g, int chunksPerCore)
             const long long gmReq = (long long)b.nRun * b.t2.n * cout2A;
             const long long gmBytes = (long long)b.nRun * b.mRun * cout2A * yBytes;
             fix += gmReq * FIX_GM_REQ_CYC_X2 / 2 + gmBytes / FIX_GM_BYTES_PER_CYC;
+            // 滚动权重的重读也走 MTE2。次数 = 消费它的 M 子块数 —— 和上面 MTE1
+            // 里那个倍数是**同一条规则**（hc 循环嵌在 M 子块循环里面，见 impl.h 的
+            // w1SegTotal / w2SegTotal）。geom10 在函数末尾按「一刀切 x2」记，在
+            // t1.n == nRun * t2.n == 1 的形状上高估一倍：bb_Conv_179_Conv_184
+            // 预测 15.098us 对实测 8.647，bb_Conv_460_Conv_462 预测 12.916 对
+            // 实测 6.964。21 个配对点上 MTE2 这一管的相对误差 RMS 从 29.9% 降到
+            // 15.9%，而且**不改变任何一个形状的选择**。
+            //
+            // 注意它不是一律降价：t1.n 或 nRun*t2.n > 2 时反而涨 —— 切列让 nRun
+            // 变成 hb，这一笔正好加在切列那一侧，方向是对的。
+            long long wRing = 0;
+            if (g.w1Stage != 0) {
+                wRing += (long long)b.t1.n * cout1A * g.k1 * wBytes;
+            }
+            if (g.w2Stage != 0) {
+                wRing += (long long)b.nRun * b.t2.n * cout2A * g.k2 * wBytes;
+            }
+            mte2 += wRing / MTE2_BYTES_PER_CYC;
             const long long scalar = (long long)(b.t1.n + b.nRun * b.t2.n) * SCALAR_TILE_CYC;
             if (cube > wCube) { wCube = cube; }
             if (mte1 > wMte1) { wMte1 = mte1; }
@@ -1302,10 +1322,15 @@ FC2D_GEOM_FN long long CoreCostCycles(const Geometry& g, int chunksPerCore)
             if (scalar > wScalar) { wScalar = scalar; }
         }
     }
-    // 权重从 GM 读：每个核一次，不乘 chunksPerCore。滚动时重读，按两倍粗估。
-    long long wtBytes = ((long long)cout1A * g.k1 + (long long)cout2A * g.k2) * wBytes;
-    if (g.w1Stage + g.w2Stage > 0) {
-        wtBytes *= 2;
+    // **常驻**的那一份权重：内核前导里一次 GM2L1（w*Stage == 0 那一支），
+    // 每个核一次，不乘 chunksPerCore。滚动的那一份已经在 band 循环里按重读次数
+    // 算过了，这里只留常驻。
+    long long wtBytes = 0;
+    if (g.w1Stage == 0) {
+        wtBytes += (long long)cout1A * g.k1 * wBytes;
+    }
+    if (g.w2Stage == 0) {
+        wtBytes += (long long)cout2A * g.k2 * wBytes;
     }
     const long long cpc = chunksPerCore;
     return cpc * (wCube + wMte1 + wMte2 + wFix + wScalar) +
@@ -1405,11 +1430,30 @@ FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
     }
 
     // ---- 第二趟：行方向填不满核，才把 W 也拿出来切 --------------------------
+    // =======================================================================
+    // 第二趟。**两趟枚举**：先统计每个滚动档里的最低代价，再在「近似并列带」里
+    // 用确定性键裁决。两条护栏都在这里，它们**没有数据支持，只降风险**。
+    //
+    // 为什么需要护栏 —— 这个代价函数自己的可信度有多低：
+    //
+    //   * 它在 20 个形状上的 meas/pred 跨度是 **1.38 倍**。而 22_27 上前两名
+    //     （hb=2 和 hb=4）只差 **0.36%**。拿一个 ±30% 的模型去分 0.36% 的差，
+    //     正是 geom9 翻车的同一类局面。
+    //   * 反切列的壁垒是**联合承重**的，两根柱子都很薄：把 fixpipe 项整个删掉，
+    //     22_27 的 hb=4 只赢 1.8%；再把 MTE2_ROW_REQ_CYC 从 8 降到板上反推的
+    //     6.55，hb=11 nwseg=2 反而赢 1.9% —— **回退重演**。而 fixpipe 的三个
+    //     系数是**不可辨识**的（两个独立最小二乘解出 GM 字节项符号相反）。
+    //   * 全部 21 个实测点里只有**一个** nwseg > 1，而且它输了 20%。给切列定价
+    //     的两项（fixpipe 写 GM、MTE2 慢路）各自只有 <= 2 个板上点撑着。
+    //
+    // 所以：B2 的保证金是唯一一条**不依赖那两个定不住的常数**的壁垒。
+    // =======================================================================
     int bestHb2 = 0;
     int bestNw = 1;
-    long long bestCost2 = 0;
-    int bestStage2 = 3;
     const int nwMax = MinI(aicNum, wo2);
+    // ---- A 趟：按滚动档统计最低代价，nwseg==1 和 nwseg>1 分开记 -------------
+    long long bn1[4] = {-1, -1, -1, -1};
+    long long bng[4] = {-1, -1, -1, -1};
     for (int hb = 1; hb <= ho2; ++hb) {
         if ((ho2 % hb) != 0) {
             continue;
@@ -1423,37 +1467,85 @@ FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
                 }
                 continue;
             }
-            // 一个 chunk 的代价 = conv1 要算的位置数（band 重叠和列 halo 都在里面）
-            //                   + 两套权重重灌进 L0B 的量。
-            // 后面那一项是防止「越切越好」的：只看第一项的话切得越碎每块越小，代价
-            // 单调下降，最后会切成一堆只搬权重的碎片。
-            //
-            // **重灌的次数不是 1。** 权重装得进 L0B（l0bChunks == 1）时才是每 chunk
-            // 一次（kernel 把 L0NZ2NZ 提到 M 循环外面）；折了段就落到「每个 M 子块把
-            // 每一段各灌一遍」那一支，于是
-            //     conv1  t1.n 次        conv2  nRun * t2.n 次
-            // 而 W 分核会让 rowsPerRun 变 1、nRun 变 hb（见 MakeBandLite），所以切列
-            // 对折了段的 conv2 是 **hb 倍** 的权重重灌。
-            //
-            // 原来这里写死 k1 + k2，低估了这个倍数，后果是真机上量到的：
-            // bb_Conv_458_Conv_460（ci=192 的 36x14，cout 192/256，3x3）选出
-            // hb=9 nwseg=4，nRun=9、l0bChunks2=9，于是 conv2 每个 chunk 要把 w2
-            // 重灌 9*9 = 81 段 = 3.98 MB，而它的 img2col 只有 31 KB —— **权重是
-            // img2col 的 128 倍**，MTE1 下界 31us 对着 cube 下界 6.3us，实测 47us，
-            // 比两个卷积分开跑（18.6us）慢 2.5 倍。
-            // 代价 = 最忙那个核上五条管线的**和**（见 CoreCostCycles）。
             const int bdCap = (aicNum < probe.chunkTotal) ? aicNum : probe.chunkTotal;
             const int cpc = CeilDiv(probe.chunkTotal, bdCap);
             const long long cost = CoreCostCycles(probe, cpc);
-            // 同上：不滚动的一律优先。
             const int stg = probe.w1Stage + probe.w2Stage;
-            if (bestHb2 == 0 || stg < bestStage2 ||
-                (stg == bestStage2 && (cost < bestCost2 ||
-                 (cost == bestCost2 && (nw < bestNw || (nw == bestNw && hb > bestHb2)))))) {
-                bestHb2 = hb;
-                bestNw = nw;
-                bestCost2 = cost;
-                bestStage2 = stg;
+            if (nw == 1) {
+                if (bn1[stg] < 0 || cost < bn1[stg]) {
+                    bn1[stg] = cost;
+                }
+            } else {
+                if (bng[stg] < 0 || cost < bng[stg]) {
+                    bng[stg] = cost;
+                }
+            }
+        }
+    }
+    // 不滚动的一律优先 —— 和之前一样，滚动档是第一级键。
+    int useStage = -1;
+    for (int st = 0; st < 4; ++st) {
+        if (bn1[st] >= 0 || bng[st] >= 0) {
+            useStage = st;
+            break;
+        }
+    }
+    if (useStage >= 0) {
+        const long long nw1Best = bn1[useStage];
+        const long long nwgBest = bng[useStage];
+        // ---- B2 切列保证金 ------------------------------------------------
+        // nwseg > 1 必须比最好的 nwseg == 1 便宜 >= 20% 才进候选。
+        // 20% 的来历（诚实版）：唯一那个能量 A/B 的形状上，模型说 nw=2 比 hb=4
+        // 贵 13.6%，板上贵 19.9% —— **模型低估切列惩罚 6.3 个百分点**。20% 约是
+        // 这个低估的三倍余量。它不是拟合出来的，是按唯一一个观测定的。
+        //
+        // **没有合法的 nwseg == 1 时无条件放行。** 那是 L1 的救命通道
+        // （wide1790 的 ho2 = 1；以及 nw=1 时只剩 hb=1 / midRows=kh 的那一类，
+        // 那些形状上切列能便宜 80%），不是性能选择。
+        const bool nwgOk = (nwgBest >= 0) && (nw1Best < 0 || nwgBest * 5 <= nw1Best * 4);
+        long long adminMin = -1;
+        if (nw1Best >= 0) {
+            adminMin = nw1Best;
+        }
+        if (nwgOk && (adminMin < 0 || nwgBest < adminMin)) {
+            adminMin = nwgBest;
+        }
+        // ---- B1 近似并列带 --------------------------------------------------
+        const long long cutoff = adminMin + adminMin / 50;   // 2%
+        // 带内按 (cpc 小, nw 小, hb 大) 裁决。
+        // **cpc 小优先**：模型里唯一剩下的结构性歧义 —— 常驻权重到底是每核读一次
+        // 还是每 chunk 读一次 —— 在 cpc 上单调，而现在取的是对高 cpc 有利的那一支
+        // （源码语义是每核一次，见上面 wtBytes 那一段）。L0B 权重重灌、scalar 前导、
+        // fixpipe 每指令地板、L0C 排空也都随 cpc 线性重复，方向一致。并列时取低
+        // cpc，等于选那个「在两种假设下都成立」的候选。
+        int keyCpc = 0, keyNw = 0, keyHb = 0;
+        for (int hb = 1; hb <= ho2; ++hb) {
+            if ((ho2 % hb) != 0) {
+                continue;
+            }
+            for (int nw = 1; nw <= nwMax; ++nw) {
+                if (DeriveWith(p, hb, nw, l1Budget, probe) != RJ_OK) {
+                    continue;
+                }
+                if (probe.w1Stage + probe.w2Stage != useStage) {
+                    continue;
+                }
+                if (nw > 1 && !nwgOk) {
+                    continue;
+                }
+                const int bdCap = (aicNum < probe.chunkTotal) ? aicNum : probe.chunkTotal;
+                const int cpc = CeilDiv(probe.chunkTotal, bdCap);
+                if (CoreCostCycles(probe, cpc) > cutoff) {
+                    continue;
+                }
+                if (bestHb2 == 0 || cpc < keyCpc ||
+                    (cpc == keyCpc && (nw < keyNw || (nw == keyNw && hb > keyHb)))) {
+                    bestHb2 = hb;
+                    bestNw = nw;
+                    keyCpc = cpc;
+                    keyNw = nw;
+                    keyHb = hb;
+                }
             }
         }
     }
