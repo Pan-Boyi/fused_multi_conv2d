@@ -23,6 +23,36 @@
     "必然失败，而且报出来是一句和认证毫无关系的「远端建目录失败」。",
     "换一台能免密的机器就把它改成 key 或 auto。",
     "",
+    "名字以 mixk_ 开头的五条是**两层 kernel 大小不同**的（kernel 写成长度 4 的",
+    "[kh1, kw1, kh2, kw2]，需要算子 geom12 及以后）。每条都配了一个已有的对照，",
+    "不是凑覆盖率：",
+    "",
+    "  mixk_1x1_3x3_2227  对照 bb_Conv_22.0_Conv_27.0 实测 45.36us",
+    "      3x3>3x3: hb=4 ct=11 bd=6 L1 50%  ->  1x1>3x3: hb=2 ct=22 bd=8 L1 28%",
+    "      问 conv1 去掉 halo + 腾出 L1 换来的「chunkTotal 被 8 整除」在板上值多少。",
+    "  mixk_3x3_1x1_2227  同一组张量，反过来只把 conv2 换成 1x1",
+    "      hb=2 ct=22 bd=8 L1 26%。midRows == hb（conv2 没有纵向 halo）。",
+    "      和上一条一起把 45.36us 拆成「哪一层的 9 个抽头更贵」。",
+    "  mixk_1x1_3x3_tgt   对照 a16w8_target。**五条里最干净的单变量对比**：",
+    "      hb / chunkTotal / blockDim / tileK / L0B 折段和 a16w8_target 逐项相同",
+    "      （hb=4 ct=22 tileK 32/32 折 1/1），只有 conv1 的核和 L1 占用不同",
+    "      （97% -> 88%）。输出尺寸也一样是 88x160。",
+    "  mixk_1x3_3x1_turn  两层非方而且**转了 90 度**（conv1 1x3 / conv2 3x1，pad 跟着转）",
+    "      H 和 W 四个核两两不同，kh/kw 写串一定错。int8 通路在板上是逐位对账的，",
+    "      所以这条是混合核的**正确性门禁** —— CPU 仿真过了不等于板上的",
+    "      load3d / fixpipe 也对。",
+    "  mixk_1x1_3x3_1790 对照 wide1790。Ho2=1 必然切列，nwseg=8 —— 这是",
+    "      **全 campaign 第二个 nwseg>1 的板上点**（第一个是 wide1790 本身）。",
+    "      给切列定价的两项（fixpipe 写 GM、MTE2 慢路）现在各自只有 <=2 个点撑着，",
+    "      而 fixpipe 那三个系数是不可辨识的。变量受控得还不错：conv2 完全不动，",
+    "      每段 mid 的列数不变（220），只有 conv1 侧变 —— xRows 5->3、",
+    "      每段 x 222->220 列、权重小 9 倍。L1 161,792 -> 100,352。",
+    "",
+    "**这五条要求 atc 那台机器上装的是 geom12 及以后的算子包。**装的是旧包时",
+    "kernel_size 的后两个值会被忽略、两层都按 [kh1,kw1] 算，于是推出来的 y 形状和",
+    "声明的对不上，atc 报「shape 对不上」—— 是响的，不会静默算错，但别误判成本",
+    "配置写错了。",
+    "",
     "profile.msprof 是远端 msprof 的**绝对路径，写死，不搜 PATH**。远端那个 ssh 是",
     "非交互 shell，读不到 ~/.bashrc 里 source 的 set_env.sh —— 搜 PATH 会说「没有",
     "msprof」而其实装着；机器上有好几套 CANN 时还可能搜到不是这次要用的那一套。",
@@ -364,6 +394,161 @@
       "strides": [
         1,
         1
+      ],
+      "pads": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "bias": true,
+      "relu": [
+        true,
+        true
+      ]
+    },
+    {
+      "name": "mixk_1x1_3x3_2227",
+      "dtype": "a16w8",
+      "n": 1,
+      "ci": 128,
+      "hi": 44,
+      "wi": 80,
+      "cout1": 128,
+      "cout2": 128,
+      "kernel": [
+        1,
+        1,
+        3,
+        3
+      ],
+      "strides": [
+        1,
+        1
+      ],
+      "pads": [
+        0,
+        0,
+        1,
+        1
+      ],
+      "bias": true,
+      "relu": [
+        true,
+        true
+      ]
+    },
+    {
+      "name": "mixk_3x3_1x1_2227",
+      "dtype": "a16w8",
+      "n": 1,
+      "ci": 128,
+      "hi": 44,
+      "wi": 80,
+      "cout1": 128,
+      "cout2": 128,
+      "kernel": [
+        3,
+        3,
+        1,
+        1
+      ],
+      "strides": [
+        1,
+        1
+      ],
+      "pads": [
+        1,
+        1,
+        0,
+        0
+      ],
+      "bias": true,
+      "relu": [
+        true,
+        true
+      ]
+    },
+    {
+      "name": "mixk_1x1_3x3_tgt",
+      "dtype": "a16w8",
+      "n": 1,
+      "ci": 32,
+      "hi": 352,
+      "wi": 640,
+      "cout1": 64,
+      "cout2": 64,
+      "kernel": [
+        1,
+        1,
+        3,
+        3
+      ],
+      "strides": [
+        2,
+        2
+      ],
+      "pads": [
+        0,
+        0,
+        1,
+        1
+      ],
+      "bias": true,
+      "relu": [
+        true,
+        true
+      ]
+    },
+    {
+      "name": "mixk_1x3_3x1_turn",
+      "dtype": "int8",
+      "n": 1,
+      "ci": 64,
+      "hi": 64,
+      "wi": 64,
+      "cout1": 64,
+      "cout2": 64,
+      "kernel": [
+        1,
+        3,
+        3,
+        1
+      ],
+      "strides": [
+        1,
+        1
+      ],
+      "pads": [
+        0,
+        1,
+        1,
+        0
+      ],
+      "bias": true,
+      "relu": [
+        true,
+        true
+      ]
+    },
+    {
+      "name": "mixk_1x1_3x3_1790",
+      "dtype": "s8f16",
+      "n": 1,
+      "ci": 64,
+      "hi": 5,
+      "wi": 1790,
+      "cout1": 64,
+      "cout2": 2,
+      "kernel": [
+        1,
+        1,
+        3,
+        3
+      ],
+      "strides": [
+        1,
+        7
       ],
       "pads": [
         0,
