@@ -67,11 +67,15 @@ Y_ELEM_BYTES = 2          # fp16 那条；int8 那条用 1，见 decode_y()
 # case 文件的头（version 6）。**形状全在 spec 里**，脚本不再写死任何一个维度 ——
 # gen_case 写它，fc2d.py 从它生成 singleop.json，本脚本从它下发属性，三处同源。
 CASE_VERSION = 6
+# 末尾的 kh2 / kw2 是 conv2 的核，**只能往后加**：老的 .bin 在这两个位置上是 0，
+# 而那时两层必然同核，所以退回 kh / kw 就是对的 —— 老文件不用重新生成，
+# CASE_VERSION 也不动。gen_case 现在写进去的是**解析后**的值，不是 0。
+# 注意这张表是被 _check_spec_keys_in_sync() 正则逐字比对的，**列表里不能写注释**。
 SPEC_KEYS = [
     "n", "ci", "hi", "wi", "cout1", "cout2", "kh", "kw", "s1", "s2",
     "ph1", "pw1", "ph2", "pw2", "elem_bytes", "bias", "relu1", "relu2",
     "shift1", "shift2", "ho2", "wo2", "safe_f1", "safe_f2", "out_fp16",
-    "dtype_mode",
+    "dtype_mode", "kh2", "kw2",
 ]
 SPEC_N = 32
 HDR_FMT = "<8sIIQQQ" + "%di" % SPEC_N + "II"
@@ -1018,7 +1022,13 @@ def main():
             rc = acl.aclopSetAttrBool(attr, nm.encode(), 1 if v else 0)
             if rc != ACL_SUCCESS:
                 die("aclopSetAttrBool(%s=%s) = %d" % (nm, v, rc))
-        for nm, vals in (("kernel_size", [info["kh"], info["kw"]]),
+        # 两层同核时发长度 2（和 .om 的签名一致），不同核时发长度 4。
+        # 老的 .bin 在 kh2/kw2 上是 0，退回 kh/kw 正好。
+        kh2 = info.get("kh2") or info["kh"]
+        kw2 = info.get("kw2") or info["kw"]
+        ksize = ([info["kh"], info["kw"]] if (kh2, kw2) == (info["kh"], info["kw"])
+                 else [info["kh"], info["kw"], kh2, kw2])
+        for nm, vals in (("kernel_size", ksize),
                          ("strides", [info["s1"], info["s2"]]),
                          ("pads", [info["ph1"], info["pw1"], info["ph2"], info["pw2"]])):
             arr = (ctypes.c_int64 * len(vals))(*vals)
@@ -1026,9 +1036,9 @@ def main():
             if rc != ACL_SUCCESS:
                 die("aclopSetAttrListInt(%s=%s) = %d" % (nm, vals, rc))
         print("算子属性: fixed_shift=%d/%d relu=%s/%s a16w8_shift1=29 "
-              "kernel=%dx%d strides=%d/%d pads=%d,%d/%d,%d"
+              "kernel=%dx%d>%dx%d strides=%d/%d pads=%d,%d/%d,%d"
               % (shift1, shift2, bool(info["relu1"]), bool(info["relu2"]),
-                 info["kh"], info["kw"], info["s1"], info["s2"],
+                 info["kh"], info["kw"], kh2, kw2, info["s1"], info["s2"],
                  info["ph1"], info["pw1"], info["ph2"], info["pw2"]))
 
         def launch():

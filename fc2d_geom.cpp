@@ -41,8 +41,11 @@ int main(int argc, char** argv)
     p.wi = ArgInt(argc, argv, "--wi", 112);
     p.cout1 = ArgInt(argc, argv, "--cout1", 64);
     p.cout2 = ArgInt(argc, argv, "--cout2", 96);
-    p.kh = ArgInt(argc, argv, "--kh", 3);
-    p.kw = ArgInt(argc, argv, "--kw", 3);
+    p.kh1 = ArgInt(argc, argv, "--kh", 3);
+    p.kw1 = ArgInt(argc, argv, "--kw", 3);
+    // conv2 的核。不给就是 0 = 沿用 conv1（S::Kh2 / S::Kw2 负责翻译）。
+    p.kh2 = ArgInt(argc, argv, "--kh2", 0);
+    p.kw2 = ArgInt(argc, argv, "--kw2", 0);
     p.stride1 = ArgInt(argc, argv, "--s1", 1);
     p.stride2 = ArgInt(argc, argv, "--s2", 2);
     p.padH1 = ArgInt(argc, argv, "--ph1", 1);

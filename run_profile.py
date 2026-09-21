@@ -23,6 +23,7 @@ FusedConv2d 上板执行 + profiling 的总驱动 —— **全部配置来自一
 
        {"name": "base", "dtype": "both", "ci": 32, "hi": 288, "wi": 112,
         "cout1": 64, "cout2": 96, "kernel": [3,3], "strides": [1,2],
+        # kernel 也可以写 [kh1, kw1, kh2, kw2]，两层不同核（比如 [1,1,3,3]）
         "pads": [1,1], "bias": true, "relu": [true,false], "fixed_shift": [42,42]}
 
    dtype 写 "both" 会自动展开成 fp16 和 int8 两条；`a16w8` 显式表示
@@ -633,9 +634,11 @@ def main():
     print("共 %d 条:" % len(cases))
     for c in cases:
         ph1, pw1, ph2, pw2 = c["pads"]
-        print("  %-18s %-5s n%d %d->%d->%d %dx%d k%dx%d s%d/%d p%d,%d/%d,%d bias=%s relu=%s/%s shift=%d/%d"
+        k = c["kernel"]
+        ktxt = ("%dx%d" % (k[0], k[1]) if k[:2] == k[2:] else "%dx%d>%dx%d" % tuple(k))
+        print("  %-18s %-5s n%d %d->%d->%d %dx%d k%-9s s%d/%d p%d,%d/%d,%d bias=%s relu=%s/%s shift=%d/%d"
               % (c["name"], c["dtype"], c["n"], c["ci"], c["cout1"], c["cout2"], c["hi"], c["wi"],
-                 c["kernel"][0], c["kernel"][1], c["strides"][0], c["strides"][1],
+                 ktxt, c["strides"][0], c["strides"][1],
                  ph1, pw1, ph2, pw2, c["bias"], c["relu"][0], c["relu"][1],
                  c["fixed_shift"][0], c["fixed_shift"][1]))
     if args.list:

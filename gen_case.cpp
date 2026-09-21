@@ -3,6 +3,7 @@
  *
  *   ./gen_case out.bin --dtype fp16|int8|s8f16|a16w8 --n 1 --ci 32 --hi 288 --wi 112 \
  *              --cout1 64 --cout2 96 --kh 3 --kw 3 --s1 1 --s2 2 \
+ *              [--kh2 N --kw2 N]   # conv2 的核，不给 = 和 conv1 同大小
  *              --ph1 1 --pw1 1 --ph2 1 --pw2 1 --bias 0 --relu1 1 --relu2 1 \
  *              --shift1 42 --shift2 42
  *
@@ -94,6 +95,10 @@ enum SpecIdx {
     SPEC_OUT_FP16,
     // 精确区分 fp16 / int8 / s8f16 / a16w8。elemBytes 只描述 x，不足以表达混合通路。
     SPEC_DTYPE_MODE,
+    // **只能往后加。** 旧的 .bin 在这两个位置上是 0，而 0 正好就是「conv2 沿用
+    // conv1 的核」，所以老文件不用重新生成，CASE_VERSION 也不用动。
+    SPEC_KH2,
+    SPEC_KW2,
     SPEC_COUNT
 };
 static_assert(SPEC_COUNT <= SPEC_N, "spec 数组放不下");
@@ -157,7 +162,8 @@ int main(int argc, char** argv)
     if (argc < 2) {
         std::fprintf(stderr,
                      "用法: %s <out.bin> [--dtype fp16|int8|s8f16|a16w8] [--n N] [--ci N] [--hi N] [--wi N]\n"
-                     "        [--cout1 N] [--cout2 N] [--kh N] [--kw N] [--s1 N] [--s2 N]\n"
+                     "        [--cout1 N] [--cout2 N] [--kh N] [--kw N] [--kh2 N] [--kw2 N]\n"
+                     "        [--s1 N] [--s2 N]\n"
                      "        [--ph1 N] [--pw1 N] [--ph2 N] [--pw2 N]\n"
                      "        [--bias 0|1] [--relu1 0|1] [--relu2 0|1] [--shift1 N] [--shift2 N]\n"
                      "缺省就是这个算子最早那组固定形状（32->64->96, 288x112, 3x3, s1/2, pad1）。\n",
@@ -197,8 +203,14 @@ int main(int argc, char** argv)
     c.wi = ArgInt(argc, argv, "--wi", c.wi);
     c.cout1 = ArgInt(argc, argv, "--cout1", c.cout1);
     c.cout2 = ArgInt(argc, argv, "--cout2", c.cout2);
-    c.kh = ArgInt(argc, argv, "--kh", c.kh);
-    c.kw = ArgInt(argc, argv, "--kw", c.kw);
+    // --kh/--kw 是 conv1 的（也是 conv2 的缺省）；--kh2/--kw2 只在两层不同核时给。
+    // 0 = 沿用 conv1，和 Case::Kh2() / S::Params::kh2 是同一条约定。
+    c.kh1 = ArgInt(argc, argv, "--kh", c.kh1);
+    c.kw1 = ArgInt(argc, argv, "--kw", c.kw1);
+    c.kh1 = ArgInt(argc, argv, "--kh1", c.kh1);
+    c.kw1 = ArgInt(argc, argv, "--kw1", c.kw1);
+    c.kh2 = ArgInt(argc, argv, "--kh2", c.kh2);
+    c.kw2 = ArgInt(argc, argv, "--kw2", c.kw2);
     c.stride1 = ArgInt(argc, argv, "--s1", c.stride1);
     c.stride2 = ArgInt(argc, argv, "--s2", c.stride2);
     c.padH1 = ArgInt(argc, argv, "--ph1", c.padH1);
@@ -253,8 +265,10 @@ int main(int argc, char** argv)
     spec[SPEC_WI] = c.wi;
     spec[SPEC_COUT1] = c.cout1;
     spec[SPEC_COUT2] = c.cout2;
-    spec[SPEC_KH] = c.kh;
-    spec[SPEC_KW] = c.kw;
+    spec[SPEC_KH] = c.kh1;
+    spec[SPEC_KW] = c.kw1;
+    spec[SPEC_KH2] = c.Kh2();
+    spec[SPEC_KW2] = c.Kw2();
     spec[SPEC_S1] = c.stride1;
     spec[SPEC_S2] = c.stride2;
     spec[SPEC_PH1] = c.padH1;
@@ -279,11 +293,11 @@ int main(int argc, char** argv)
     }
     Writer w{f};
 
-    const int64_t fz1k = (int64_t)(c.ci / weightC0) * c.kh * c.kw;
+    const int64_t fz1k = (int64_t)(c.ci / weightC0) * c.kh1 * c.kw1;
     // FRACTAL_Z 的 N 方向**向上补齐到 16**。cout1 必然是 C0 的整数倍所以除得尽，
     // 但 cout2 不一定（可以是 2），写成整除会算出 0 —— filter2 的 shape 直接错。
     const int64_t fz1n = (c.cout1 + 15) / 16;
-    const int64_t fz2k = (int64_t)(c.cout1 / weightC0) * c.kh * c.kw;
+    const int64_t fz2k = (int64_t)(c.cout1 / weightC0) * c.Kh2() * c.Kw2();
     const int64_t fz2n = (c.cout2 + 15) / 16;
     const std::vector<int64_t> xDims = {c.n, c.ci, c.hi, c.wi};
     const std::vector<int64_t> yDims = {c.n, c.cout2, c.Ho2(), c.Wo2()};
@@ -333,7 +347,7 @@ int main(int argc, char** argv)
         w.Tensor("quant_scale1", ACL_DT_UINT64, {(int64_t)c.cout1}, q1.data(), q1.size() * 8);
         w.Tensor("y_expect", ACL_DT_FLOAT16, yDims, g.yF16.data(), g.yF16.size() * 2);
         w.Tensor("w1_nchw", ACL_DT_INT8,
-                 {(int64_t)c.cout1, (int64_t)c.ci, (int64_t)c.kh, (int64_t)c.kw},
+                 {(int64_t)c.cout1, (int64_t)c.ci, (int64_t)c.kh1, (int64_t)c.kw1},
                  g.w1Nchw.data(), g.w1Nchw.size());
     } else if (outFp16) {
         // ---- int8 进 / fp16 出 ------------------------------------------------
@@ -372,7 +386,7 @@ int main(int argc, char** argv)
         w.Tensor("dequant_scale2", ACL_DT_UINT64, {(int64_t)c.cout2}, g.deq.data(), g.deq.size() * 8);
         w.Tensor("quant_scale1", ACL_DT_UINT64, {(int64_t)c.cout1}, q1.data(), q1.size() * 8);
         w.Tensor("y_expect", ACL_DT_FLOAT16, yDims, g.yF16.data(), g.yF16.size() * 2);
-        w.Tensor("w1_nchw", ACL_DT_INT8, {(int64_t)c.cout1, (int64_t)c.ci, (int64_t)c.kh, (int64_t)c.kw},
+        w.Tensor("w1_nchw", ACL_DT_INT8, {(int64_t)c.cout1, (int64_t)c.ci, (int64_t)c.kh1, (int64_t)c.kw1},
                  g.w1Nchw.data(), g.w1Nchw.size());
     } else if (c.elemBytes == 2) {
         f16path::Result g = f16path::Build(c);
@@ -449,7 +463,7 @@ int main(int argc, char** argv)
         w.Tensor("y_exact", ACL_DT_FLOAT16, yDims, g.yExact.data(), g.yExact.size() * 2);
         // 第 8 个张量：把 conv1 的 fp16 权重按 NCHW 也存一份，出问题时能在主机上
         // 重算任何中间量，不用回头再生成一次。
-        w.Tensor("w1_nchw", ACL_DT_FLOAT16, {(int64_t)c.cout1, (int64_t)c.ci, (int64_t)c.kh, (int64_t)c.kw},
+        w.Tensor("w1_nchw", ACL_DT_FLOAT16, {(int64_t)c.cout1, (int64_t)c.ci, (int64_t)c.kh1, (int64_t)c.kw1},
                  g.w1Nchw.data(), g.w1Nchw.size() * 2);
     } else {
         int8path::Result g = int8path::Build(c);
@@ -485,7 +499,7 @@ int main(int argc, char** argv)
         w.Tensor("quant_scale1", ACL_DT_UINT64, {(int64_t)c.cout1}, q1.data(), q1.size() * 8);
         w.Tensor("quant_scale2", ACL_DT_UINT64, {(int64_t)c.cout2}, q2.data(), q2.size() * 8);
         w.Tensor("y_expect", ACL_DT_INT8, yDims, g.y.data(), g.y.size());
-        w.Tensor("w1_nchw", ACL_DT_INT8, {(int64_t)c.cout1, (int64_t)c.ci, (int64_t)c.kh, (int64_t)c.kw},
+        w.Tensor("w1_nchw", ACL_DT_INT8, {(int64_t)c.cout1, (int64_t)c.ci, (int64_t)c.kh1, (int64_t)c.kw1},
                  g.w1Nchw.data(), g.w1Nchw.size());
     }
 

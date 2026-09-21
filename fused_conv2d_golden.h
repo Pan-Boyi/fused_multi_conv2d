@@ -50,7 +50,7 @@ constexpr int DEFAULT_ATTR_SHIFT = 42;
 struct Case {
     int n = 1, ci = 32, hi = 288, wi = 112;
     int cout1 = 64, cout2 = 96;
-    int kh = 3, kw = 3;
+    int kh1 = 3, kw1 = 3;   // **conv1 的**核。conv2 的是下面的 kh2 / kw2
     int stride1 = 1, stride2 = 2;
     int padH1 = 1, padW1 = 1, padH2 = 1, padW2 = 1;
     bool bias = false;
@@ -58,20 +58,33 @@ struct Case {
     int elemBytes = 2; // 2 = fp16 定点，1 = int8 量化
     int shift1 = DEFAULT_ATTR_SHIFT, shift2 = DEFAULT_ATTR_SHIFT;
 
+    // conv2 的核。**0 = 沿用 conv1**，和算子共用头里 S::Params 的 kh2/kw2 是
+    // 同一条约定，所以既有的按名字赋值一个字都不用改。读它们用 Kh2() / Kw2()。
+    int kh2 = 0, kw2 = 0;
+
+    int Kh2() const { return kh2 == 0 ? kh1 : kh2; }
+    int Kw2() const { return kw2 == 0 ? kw1 : kw2; }
     int C0() const { return 32 / elemBytes; }
-    int Ho1() const { return (hi + 2 * padH1 - kh) / stride1 + 1; }
-    int Wo1() const { return (wi + 2 * padW1 - kw) / stride1 + 1; }
-    int Ho2() const { return (Ho1() + 2 * padH2 - kh) / stride2 + 1; }
-    int Wo2() const { return (Wo1() + 2 * padW2 - kw) / stride2 + 1; }
+    int Ho1() const { return (hi + 2 * padH1 - kh1) / stride1 + 1; }
+    int Wo1() const { return (wi + 2 * padW1 - kw1) / stride1 + 1; }
+    int Ho2() const { return (Ho1() + 2 * padH2 - Kh2()) / stride2 + 1; }
+    int Wo2() const { return (Wo1() + 2 * padW2 - Kw2()) / stride2 + 1; }
     long XElems() const { return (long)n * ci * hi * wi; }
     long YElems() const { return (long)n * cout2 * Ho2() * Wo2(); }
-    long W1Elems() const { return (long)cout1 * ci * kh * kw; }
-    long W2Elems() const { return (long)cout2 * cout1 * kh * kw; }
+    long W1Elems() const { return (long)cout1 * ci * kh1 * kw1; }
+    long W2Elems() const { return (long)cout2 * cout1 * Kh2() * Kw2(); }
     std::string Text() const
     {
         char buf[256];
-        snprintf(buf, sizeof(buf), "n%d %d->%d->%d %dx%d k%dx%d s%d/%d p%d,%d/%d,%d %s%s%s -> %dx%d %s", n,
-                 ci, cout1, cout2, hi, wi, kh, kw, stride1, stride2, padH1, padW1, padH2, padW2,
+        // 两层同核时打 k3x3（和以前逐字相同），不同核时打 k1x1>3x3。
+        char kbuf[32];
+        if (kh1 == Kh2() && kw1 == Kw2()) {
+            snprintf(kbuf, sizeof(kbuf), "k%dx%d", kh1, kw1);
+        } else {
+            snprintf(kbuf, sizeof(kbuf), "k%dx%d>%dx%d", kh1, kw1, Kh2(), Kw2());
+        }
+        snprintf(buf, sizeof(buf), "n%d %d->%d->%d %dx%d %s s%d/%d p%d,%d/%d,%d %s%s%s -> %dx%d %s", n,
+                 ci, cout1, cout2, hi, wi, kbuf, stride1, stride2, padH1, padW1, padH2, padW2,
                  bias ? "bias " : "", relu1 ? "relu1 " : "", relu2 ? "relu2" : "", Ho2(), Wo2(),
                  elemBytes == 2 ? "fp16" : "int8");
         return std::string(buf);
@@ -379,8 +392,8 @@ inline Result Build(const Case& c)
             r.b2[i] = F32ToF16Bits((float)(i - c.cout2 / 2) / 64.0f);
         }
     }
-    WeightToFractalZ<uint16_t>(r.w1Nchw.data(), c.ci, c.cout1, c.kh, c.kw, 16, r.w1Dev);
-    WeightToFractalZ<uint16_t>(r.w2Nchw.data(), c.cout1, c.cout2, c.kh, c.kw, 16, r.w2Dev);
+    WeightToFractalZ<uint16_t>(r.w1Nchw.data(), c.ci, c.cout1, c.kh1, c.kw1, 16, r.w1Dev);
+    WeightToFractalZ<uint16_t>(r.w2Nchw.data(), c.cout1, c.cout2, c.Kh2(), c.Kw2(), 16, r.w2Dev);
 
     r.yExpect.assign((size_t)c.YElems(), 0);
     r.yExact.assign((size_t)c.YElems(), 0);
@@ -389,7 +402,7 @@ inline Result Build(const Case& c)
     for (int b = 0; b < c.n; ++b) {
         std::vector<double> acc1, abs1;
         ConvRaw(r.xNchw.data() + (size_t)b * c.ci * c.hi * c.wi, r.w1Nchw.data(), c.ci, c.hi, c.wi, c.cout1,
-                ho1, wo1, c.kh, c.kw, c.stride1, c.padH1, c.padW1, acc1, &abs1);
+                ho1, wo1, c.kh1, c.kw1, c.stride1, c.padH1, c.padW1, acc1, &abs1);
         double p, pp;
         const int f1 = MaxSafeDeqExp(acc1, abs1, r.b1.data(), c.cout1, ho1 * wo1, &p, &pp);
         if (b == 0 || f1 < r.safeF1) {
@@ -402,7 +415,7 @@ inline Result Build(const Case& c)
         std::vector<uint16_t> mid;
         FixedEpilogue(acc1, r.b1.data(), c.cout1, ho1 * wo1, c.shift1, c.relu1, mid, &r.sat);
         std::vector<double> acc2, abs2;
-        ConvRaw(mid.data(), r.w2Nchw.data(), c.cout1, ho1, wo1, c.cout2, ho2, wo2, c.kh, c.kw, c.stride2,
+        ConvRaw(mid.data(), r.w2Nchw.data(), c.cout1, ho1, wo1, c.cout2, ho2, wo2, c.Kh2(), c.Kw2(), c.stride2,
                 c.padH2, c.padW2, acc2, &abs2);
         const int f2 = MaxSafeDeqExp(acc2, abs2, r.b2.data(), c.cout2, ho2 * wo2, &p, &pp);
         if (b == 0 || f2 < r.safeF2) {
@@ -551,8 +564,8 @@ inline Result Build(const Case& c, bool fp16Out = false)
             r.b2[i] = (i - c.cout2 / 2) * 91;
         }
     }
-    WeightToFractalZ<int8_t>(r.w1Nchw.data(), c.ci, c.cout1, c.kh, c.kw, 32, r.w1Dev);
-    WeightToFractalZ<int8_t>(r.w2Nchw.data(), c.cout1, c.cout2, c.kh, c.kw, 32, r.w2Dev);
+    WeightToFractalZ<int8_t>(r.w1Nchw.data(), c.ci, c.cout1, c.kh1, c.kw1, 32, r.w1Dev);
+    WeightToFractalZ<int8_t>(r.w2Nchw.data(), c.cout1, c.cout2, c.Kh2(), c.Kw2(), 32, r.w2Dev);
 
     const int32_t* pb1 = c.bias ? r.b1.data() : nullptr;
     const int32_t* pb2 = c.bias ? r.b2.data() : nullptr;
@@ -561,7 +574,7 @@ inline Result Build(const Case& c, bool fp16Out = false)
     std::vector<std::vector<int32_t>> acc1(c.n), acc2(c.n);
     for (int b = 0; b < c.n; ++b) {
         ConvInt8(r.xNchw.data() + (size_t)b * c.ci * c.hi * c.wi, r.w1Nchw.data(), pb1, c.ci, c.hi, c.wi,
-                 c.cout1, ho1, wo1, c.kh, c.kw, c.stride1, c.padH1, c.padW1, acc1[b]);
+                 c.cout1, ho1, wo1, c.kh1, c.kw1, c.stride1, c.padH1, c.padW1, acc1[b]);
     }
     {
         std::vector<int32_t> all;
@@ -575,7 +588,7 @@ inline Result Build(const Case& c, bool fp16Out = false)
         for (size_t i = 0; i < mid.size(); ++i) {
             mid[i] = Req8(acc1[b][i], r.scale1, c.relu1);
         }
-        ConvInt8(mid.data(), r.w2Nchw.data(), pb2, c.cout1, ho1, wo1, c.cout2, ho2, wo2, c.kh, c.kw,
+        ConvInt8(mid.data(), r.w2Nchw.data(), pb2, c.cout1, ho1, wo1, c.cout2, ho2, wo2, c.Kh2(), c.Kw2(),
                  c.stride2, c.padH2, c.padW2, acc2[b]);
     }
     if (fp16Out) {

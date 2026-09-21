@@ -94,11 +94,13 @@ namespace FusedConv2dShape {
 //      因为「取大」会被漏掉的那一项骗过去
 //  11  滚动权重在 MTE2 里按「消费它的 M 子块数」算（不再一刀切 x2）；
 //      PickHb 第二趟加两条护栏：2% 近似并列带用确定性键裁决、切列要 20% 保证金
+//  12  两层的 kernel 大小分开：kh1/kw1 和 kh2/kw2。以前两层共用一个 kh/kw，
+//      1x1 接 3x3 这种组合根本表达不出来
 // **只能是宏。** 不要写成 constexpr const char* —— ccec 把字符串字面量放在 __gm__
 // 地址空间里，`const __gm__ char[N]` 转不成 `const char*`，device 那条编译链直接挂。
 // 这也是 RejectText() 被 #if !defined(__NPU_ARCH__) 包起来的同一个理由。
 // 宏只是一个 token，谁需要谁自己用，两条编译链都安全。
-#define FC2D_GEOM_REV "geom11"
+#define FC2D_GEOM_REV "geom12"
 
 // ---------------------------------------------------------------------------
 // 5102 的片上容量。**只有这一组仍然是编译期常量** —— 它们是芯片属性，不是形状。
@@ -196,8 +198,11 @@ struct Params {
     int wi;
     int cout1;     // conv1 输出通道 == conv2 输入通道
     int cout2;     // conv2 输出通道 == y 的通道
-    int kh;        // 两个卷积共用同一个 kernel 大小
-    int kw;
+    // **conv1 的 kernel。conv2 的是下面的 kh2 / kw2。** 两层不必一样大 ——
+    // 1x1 降维接 3x3 是最常见的一种，而且它对这个算子特别划算：conv1 的窗口只有
+    // 一行一列，band 之间就没有 halo，重复计算全部来自 conv2。
+    int kh1;
+    int kw1;
     int stride1;
     int stride2;
     // pad 分 H / W 两个方向，每个方向上下（左右）对称。非方核必须能分开给 ——
@@ -218,6 +223,14 @@ struct Params {
     int biasElemBytes = 0;
     int hasQuantScale1 = 0; // per-channel VREQ8 table for conv1 -> int8 mid
     int hasQuantScale2 = 0; // per-channel VREQ8 table for conv2 -> int8 y
+    // conv2 的 kernel 大小。**0 表示沿用 conv1 的 kh1 / kw1** —— 和上面
+    // weightElemBytes 那一组是同一条约定，所以既有的按位置初始化一个字都不用改，
+    // 也不会因为漏填而静默拿到 0。想要两层不同大小时按名字赋这两个字段。
+    //
+    // 读它们只能通过 Kh2() / Kw2()，**不要直接读 p.kh2** —— 直接读会在「继承」
+    // 的那一路拿到 0。
+    int kh2 = 0;
+    int kw2 = 0;
 };
 
 FC2D_GEOM_CE int WeightElemBytes(const Params& p)
@@ -232,6 +245,10 @@ FC2D_GEOM_CE int ParamBiasElemBytes(const Params& p)
 {
     return p.biasElemBytes == 0 ? BiasElemBytes(p.elemBytes) : p.biasElemBytes;
 }
+// conv2 的 kernel 大小，0 = 沿用 conv1。**这一层之后的代码一律只用这两个函数**，
+// 不直接读 p.kh2 / p.kw2。
+FC2D_GEOM_CE int Kh2(const Params& p) { return p.kh2 == 0 ? p.kh1 : p.kh2; }
+FC2D_GEOM_CE int Kw2(const Params& p) { return p.kw2 == 0 ? p.kw1 : p.kw2; }
 
 // M 方向的分块。**整个算子只有这一条分块公式**：把 total 行按 gran 切成 units 个
 // 单位，均分成 n 块，余数摊给靠前的块。
@@ -385,7 +402,7 @@ struct Geometry {
 
     int c0, weightC0, midC0, c1, midC1;
     int ho1, wo1, ho2, wo2;
-    int k1, k2;          // 两个卷积的矩阵乘 K = C1*kh*kw*C0
+    int k1, k2;          // 两个卷积的矩阵乘 K：k1 = Ci*kh1*kw1，k2 = Cout1*kh2*kw2
 
     int hb, nchunk;      // 每个 band 出多少行 conv2 输出 / 一张图几个 band
     // 列方向的分核。一个 chunk = 一个 band x 一个列段，所以
@@ -553,7 +570,7 @@ FC2D_GEOM_FN bool PickL0bChunks(int cout, int k, int elemBytes, int tileK, int& 
 // ---------------------------------------------------------------------------
 struct FlatGeom {
     // ---- 形状（img2col / Dn2Nz 直接要）----
-    int n, ci, hi, wi, cout1, cout2, kh, kw, stride1, stride2;
+    int n, ci, hi, wi, cout1, cout2, kh1, kw1, kh2, kw2, stride1, stride2;
     int padH1, padW1, padH2, padW2, elemBytes;
     int weightElemBytes, midElemBytes, biasElemBytes;
     // ---- 由形状推出来的 ----
@@ -587,8 +604,10 @@ struct FlatGeom {
     X(wi, win)                \
     X(cout1, cout1)           \
     X(cout2, cout2)           \
-    X(kh, kh)                 \
-    X(kw, kw)                 \
+    X(kh1, kh1)               \
+    X(kw1, kw1)               \
+    X(kh2, kh2)               \
+    X(kw2, kw2)               \
     X(stride1, stride1)       \
     X(stride2, stride2)       \
     X(padH1, padH1)           \
@@ -655,8 +674,10 @@ FC2D_GEOM_FN void Flatten(const Geometry& g, int chunksPerCore, FlatGeom& f)
     f.wi = g.p.wi;
     f.cout1 = g.p.cout1;
     f.cout2 = g.p.cout2;
-    f.kh = g.p.kh;
-    f.kw = g.p.kw;
+    f.kh1 = g.p.kh1;
+    f.kw1 = g.p.kw1;
+    f.kh2 = Kh2(g.p);
+    f.kw2 = Kw2(g.p);
     f.stride1 = g.p.stride1;
     f.stride2 = g.p.stride2;
     f.padH1 = g.p.padH1;
@@ -769,7 +790,7 @@ FC2D_GEOM_FN void MakeBandLite(const FlatGeom& f, int band, int wg, BandLite& b)
 
     // conv1 侧：产出 mid 行 [aMid, aMid+midReal) 需要的 x 行区间，两头都可能被钳。
     const int xRaw = f.stride1 * b.aMid - f.padH1;
-    const int xSpan = f.stride1 * (b.midReal - 1) + f.kh;
+    const int xSpan = f.stride1 * (b.midReal - 1) + f.kh1;
     b.xRow0 = MaxI(0, xRaw);
     b.padT1 = b.xRow0 - xRaw;
     const int xEnd = MinI(f.hi, xRaw + xSpan);
@@ -778,15 +799,15 @@ FC2D_GEOM_FN void MakeBandLite(const FlatGeom& f, int band, int wg, BandLite& b)
 
     // ---- 列方向 ----------------------------------------------------------
     // 出 conv2 的列 [outCol0, outCol0+outCols) 需要 mid 的列
-    //   [outCol0*s2 - padW2, (outCol0+outCols-1)*s2 - padW2 + kw)
+    //   [outCol0*s2 - padW2, (outCol0+outCols-1)*s2 - padW2 + kw2)
     // 和 [0, wo1) 求交，交不到的部分就是这一段自己的左右补零。恒等式：
-    //   (wSub + padL2 + padR2 - kw)/s2 + 1 == outCols
+    //   (wSub + padL2 + padR2 - kw2)/s2 + 1 == outCols
     // conv1 那一层同理，出 wSub 列需要 x 的哪一段。
     b.outCol0 = wg * f.wseg;
     b.outCols = MinI(f.wseg, f.wo2 - b.outCol0);
 
     const int mcRaw0 = b.outCol0 * f.stride2 - f.padW2;
-    const int mcRaw1 = (b.outCol0 + b.outCols - 1) * f.stride2 - f.padW2 + f.kw;
+    const int mcRaw1 = (b.outCol0 + b.outCols - 1) * f.stride2 - f.padW2 + f.kw2;
     b.midCol0 = MaxI(0, mcRaw0);
     const int mcEnd = MinI(f.wo1, mcRaw1);
     b.padL2 = b.midCol0 - mcRaw0;
@@ -794,7 +815,7 @@ FC2D_GEOM_FN void MakeBandLite(const FlatGeom& f, int band, int wg, BandLite& b)
     b.wSub = mcEnd - b.midCol0;
 
     const int icRaw0 = b.midCol0 * f.stride1 - f.padW1;
-    const int icRaw1 = (mcEnd - 1) * f.stride1 - f.padW1 + f.kw;
+    const int icRaw1 = (mcEnd - 1) * f.stride1 - f.padW1 + f.kw1;
     b.xCol0 = MaxI(0, icRaw0);
     const int icEnd = MinI(f.wi, icRaw1);
     b.padL1 = b.xCol0 - icRaw0;
@@ -932,9 +953,9 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
         (midBytes != 1 && midBytes != 2) || (biasBytes != 2 && biasBytes != 4)) {
         return RJ_ELEM_BYTES;
     }
-    if (p.n <= 0 || p.ci <= 0 || p.hi <= 0 || p.wi <= 0 || p.cout1 <= 0 || p.cout2 <= 0 || p.kh <= 0 ||
-        p.kw <= 0 || p.stride1 <= 0 || p.stride2 <= 0 || p.padH1 < 0 || p.padW1 < 0 || p.padH2 < 0 ||
-        p.padW2 < 0 || hb <= 0) {
+    if (p.n <= 0 || p.ci <= 0 || p.hi <= 0 || p.wi <= 0 || p.cout1 <= 0 || p.cout2 <= 0 ||
+        p.kh1 <= 0 || p.kw1 <= 0 || Kh2(p) <= 0 || Kw2(p) <= 0 || p.stride1 <= 0 || p.stride2 <= 0 ||
+        p.padH1 < 0 || p.padW1 < 0 || p.padH2 < 0 || p.padW2 < 0 || hb <= 0) {
         return RJ_SHAPE_POSITIVE;
     }
 
@@ -962,22 +983,27 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
     g.c1 = p.ci / g.weightC0;
     g.midC1 = p.cout1 / g.weightC0;
 
-    g.ho1 = (p.hi + 2 * p.padH1 - p.kh) / p.stride1 + 1;
-    g.wo1 = (p.wi + 2 * p.padW1 - p.kw) / p.stride1 + 1;
+    const int kh1 = p.kh1;
+    const int kw1 = p.kw1;
+    const int kh2 = Kh2(p);
+    const int kw2 = Kw2(p);
+
+    g.ho1 = (p.hi + 2 * p.padH1 - kh1) / p.stride1 + 1;
+    g.wo1 = (p.wi + 2 * p.padW1 - kw1) / p.stride1 + 1;
     if (g.ho1 <= 0 || g.wo1 <= 0) {
         return RJ_OUT_EMPTY;
     }
-    g.ho2 = (g.ho1 + 2 * p.padH2 - p.kh) / p.stride2 + 1;
-    g.wo2 = (g.wo1 + 2 * p.padW2 - p.kw) / p.stride2 + 1;
+    g.ho2 = (g.ho1 + 2 * p.padH2 - kh2) / p.stride2 + 1;
+    g.wo2 = (g.wo1 + 2 * p.padW2 - kw2) / p.stride2 + 1;
     if (g.ho2 <= 0 || g.wo2 <= 0) {
         return RJ_OUT_EMPTY;
     }
 
-    g.k1 = p.ci * p.kh * p.kw;
-    g.k2 = p.cout1 * p.kh * p.kw;
-    g.fz1K = g.c1 * p.kh * p.kw;
+    g.k1 = p.ci * kh1 * kw1;
+    g.k2 = p.cout1 * kh2 * kw2;
+    g.fz1K = g.c1 * kh1 * kw1;
     g.fz1N = CeilDiv(p.cout1, MMAD_M0);
-    g.fz2K = g.midC1 * p.kh * p.kw;
+    g.fz2K = g.midC1 * kh2 * kw2;
     g.fz2N = CeilDiv(p.cout2, MMAD_M0);
 
     if ((g.ho2 % hb) != 0) {
@@ -995,7 +1021,8 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
     g.chunkTotal = p.n * g.nchunk * g.nwseg;
 
     // 一个 band 的 conv2 输出行覆盖 midRows 行 conv1 输出（含上下补零）。
-    g.midRows = p.stride2 * (hb - 1) + p.kh;
+    // 这里是 **conv2** 的窗口高度，所以用 kh2。
+    g.midRows = p.stride2 * (hb - 1) + kh2;
     // L1 按**实际可能出现的最大值**排，不按窗口跨度排：任何一个 band 真正算出来的
     // conv1 行数都不会超过 ho1（超出的部分是 conv2 的补零，不是数据），staging 的
     // x 行数同理不会超过 hi。按跨度排会白占 L1，还会把本来放得下的形状拒掉。
@@ -1003,11 +1030,14 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
     // 列方向同理，按**最宽的那个段**排 L1。内部段两侧都没有补零，所以它最宽；
     // 边缘段的一部分窗口落在补零里，真实列数只会更少。
     // 顺带一个副作用：不切列（nwseg = 1）时 wSubMax 也可能小于 wo1 —— stride2
-    // 大于 kw 时 conv2 根本读不到 conv1 最后那几列，以前是白算的。
-    g.wSubMax = MinI(g.wo1, (g.wseg - 1) * p.stride2 + p.kw);
-    g.wInMax = MinI(p.wi, (g.wSubMax - 1) * p.stride1 + p.kw);
+    // 大于 kw2 时 conv2 根本读不到 conv1 最后那几列，以前是白算的。
+    //
+    // 两层各用自己的核：mid 的宽度由 conv2 的窗口定（kw2），x 的宽度由 conv1 的
+    // 窗口定（kw1）。行方向同理，xRows 用 kh1。
+    g.wSubMax = MinI(g.wo1, (g.wseg - 1) * p.stride2 + kw2);
+    g.wInMax = MinI(p.wi, (g.wSubMax - 1) * p.stride1 + kw1);
     g.m1Max = midRowsCap * g.wSubMax;
-    g.xRows = MinI(p.stride1 * (midRowsCap - 1) + p.kh, p.hi);
+    g.xRows = MinI(p.stride1 * (midRowsCap - 1) + kh1, p.hi);
     // 两个 16 位字段：img2col 的 mStartPt（最大到 m1Max）和 Dn2Nz 的 nValue /
     // dstNzC0Stride（都等于 xRows*wi）。超了会静默截断成完全不相干的地址。
     if (g.m1Max > 65535 || (long long)g.xRows * g.wInMax > 65535) {
@@ -1353,25 +1383,25 @@ FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
     if (p.elemBytes != 1 && p.elemBytes != 2) {
         return RJ_ELEM_BYTES;
     }
-    if (p.n <= 0 || p.ci <= 0 || p.hi <= 0 || p.wi <= 0 || p.cout1 <= 0 || p.cout2 <= 0 || p.kh <= 0 ||
-        p.kw <= 0 || p.stride1 <= 0 || p.stride2 <= 0 || p.padH1 < 0 || p.padW1 < 0 || p.padH2 < 0 ||
-        p.padW2 < 0) {
+    if (p.n <= 0 || p.ci <= 0 || p.hi <= 0 || p.wi <= 0 || p.cout1 <= 0 || p.cout2 <= 0 ||
+        p.kh1 <= 0 || p.kw1 <= 0 || Kh2(p) <= 0 || Kw2(p) <= 0 || p.stride1 <= 0 || p.stride2 <= 0 ||
+        p.padH1 < 0 || p.padW1 < 0 || p.padH2 < 0 || p.padW2 < 0) {
         return RJ_SHAPE_POSITIVE;
     }
-    const int ho1 = (p.hi + 2 * p.padH1 - p.kh) / p.stride1 + 1;
+    const int ho1 = (p.hi + 2 * p.padH1 - p.kh1) / p.stride1 + 1;
     if (ho1 <= 0) {
         return RJ_OUT_EMPTY;
     }
-    const int ho2 = (ho1 + 2 * p.padH2 - p.kh) / p.stride2 + 1;
+    const int ho2 = (ho1 + 2 * p.padH2 - Kh2(p)) / p.stride2 + 1;
     if (ho2 <= 0) {
         return RJ_OUT_EMPTY;
     }
 
-    const int wo1 = (p.wi + 2 * p.padW1 - p.kw) / p.stride1 + 1;
+    const int wo1 = (p.wi + 2 * p.padW1 - p.kw1) / p.stride1 + 1;
     if (wo1 <= 0) {
         return RJ_OUT_EMPTY;
     }
-    const int wo2 = (wo1 + 2 * p.padW2 - p.kw) / p.stride2 + 1;
+    const int wo2 = (wo1 + 2 * p.padW2 - Kw2(p)) / p.stride2 + 1;
     if (wo2 <= 0) {
         return RJ_OUT_EMPTY;
     }
@@ -1500,7 +1530,7 @@ FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
         // 这个低估的三倍余量。它不是拟合出来的，是按唯一一个观测定的。
         //
         // **没有合法的 nwseg == 1 时无条件放行。** 那是 L1 的救命通道
-        // （wide1790 的 ho2 = 1；以及 nw=1 时只剩 hb=1 / midRows=kh 的那一类，
+        // （wide1790 的 ho2 = 1；以及 nw=1 时只剩 hb=1 / midRows=kh2 的那一类，
         // 那些形状上切列能便宜 80%），不是性能选择。
         const bool nwgOk = (nwgBest >= 0) && (nw1Best < 0 || nwgBest * 5 <= nw1Best * 4);
         long long adminMin = -1;

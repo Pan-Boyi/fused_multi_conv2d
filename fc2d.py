@@ -39,11 +39,15 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # gen_case.cpp 里 SpecIdx 的顺序。**两边必须一致**，改那边就得改这边。
+# 末尾的 kh2 / kw2 是 conv2 的核，**只能往后加**：老的 .bin 在这两个位置上是 0，
+# 而那时两层必然同核，所以退回 kh / kw 就是对的 —— 老文件不用重新生成，
+# CASE_VERSION 也不动。gen_case 现在写进去的是**解析后**的值，不是 0。
+# 注意这张表是被 _check_spec_keys_in_sync() 正则逐字比对的，**列表里不能写注释**。
 SPEC_KEYS = [
     "n", "ci", "hi", "wi", "cout1", "cout2", "kh", "kw", "s1", "s2",
     "ph1", "pw1", "ph2", "pw2", "elem_bytes", "bias", "relu1", "relu2",
     "shift1", "shift2", "ho2", "wo2", "safe_f1", "safe_f2", "out_fp16",
-    "dtype_mode",
+    "dtype_mode", "kh2", "kw2",
 ]
 SPEC_N = 32
 HDR_FMT = "<8sIIQQQ" + "%di" % SPEC_N + "II"
@@ -124,9 +128,14 @@ def normalise(case, index):
     # s8f16 要显式写 —— 它多一个输入，不是前两条的变体。
     if out["dtype"] not in ("fp16", "int8", "s8f16", "a16w8", "both"):
         die("case %s 的 dtype 只能是 fp16 / int8 / s8f16 / a16w8 / both" % out["name"])
+    # kernel 接受两种长度，和 pads 同一条约定：
+    #   [kh, kw]                 两个卷积同一个核（老写法）
+    #   [kh1, kw1, kh2, kw2]     两层分开给，比如 1x1 接 3x3
     k = out["kernel"]
-    if not isinstance(k, list) or len(k) != 2:
-        die("case %s 的 kernel 要写成 [kh, kw]" % out["name"])
+    if not isinstance(k, list) or len(k) not in (2, 4):
+        die("case %s 的 kernel 要写成 [kh, kw] 或 [kh1, kw1, kh2, kw2]" % out["name"])
+    if len(k) == 2:
+        out["kernel"] = [k[0], k[1], k[0], k[1]]
     s = out["strides"]
     if not isinstance(s, list) or len(s) != 2:
         die("case %s 的 strides 要写成 [stride1, stride2]（两个卷积各一个）" % out["name"])
@@ -153,6 +162,7 @@ def gen_case_argv(c, out_path):
         "--n", str(c["n"]), "--ci", str(c["ci"]), "--hi", str(c["hi"]), "--wi", str(c["wi"]),
         "--cout1", str(c["cout1"]), "--cout2", str(c["cout2"]),
         "--kh", str(c["kernel"][0]), "--kw", str(c["kernel"][1]),
+        "--kh2", str(c["kernel"][2]), "--kw2", str(c["kernel"][3]),
         "--s1", str(c["strides"][0]), "--s2", str(c["strides"][1]),
         "--ph1", str(ph1), "--pw1", str(pw1), "--ph2", str(ph2), "--pw2", str(pw2),
         "--bias", "1" if c["bias"] else "0",
@@ -205,8 +215,12 @@ def singleop_json(spec):
     yt = "float16" if outFp16 else "int8"
     weight_c0 = 16 if filter_fp16 else 32
     mid_c0 = 16 if fp16 else 32
+    # 两层各按自己的核。老的 .bin 在 kh2/kw2 上是 0 —— 那时两层必然同核，
+    # 所以退回 kh/kw 就是对的。
+    kh2 = spec.get("kh2") or spec["kh"]
+    kw2 = spec.get("kw2") or spec["kw"]
     fz1k = (spec["ci"] // weight_c0) * spec["kh"] * spec["kw"]
-    fz2k = (spec["cout1"] // mid_c0) * spec["kh"] * spec["kw"]
+    fz2k = (spec["cout1"] // mid_c0) * kh2 * kw2
     inputs = [
         {"format": "ND", "shape": [spec["n"], spec["ci"], spec["hi"], spec["wi"]], "type": xt},
         {"format": "ND", "shape": [fz1k, (spec["cout1"] + 15) // 16, 16, weight_c0], "type": wt},
@@ -245,7 +259,11 @@ def singleop_json(spec):
             {"name": "fixed_shift2", "type": "int", "value": spec["shift2"]},
             {"name": "relu1", "type": "bool", "value": bool(spec["relu1"])},
             {"name": "relu2", "type": "bool", "value": bool(spec["relu2"])},
-            {"name": "kernel_size", "type": "list_int", "value": [spec["kh"], spec["kw"]]},
+            # 两层同核时发长度 2（和以前逐字相同的 .om 签名，老 .om 不会失配），
+            # 不同核时发长度 4。
+            {"name": "kernel_size", "type": "list_int",
+             "value": ([spec["kh"], spec["kw"]] if (kh2, kw2) == (spec["kh"], spec["kw"])
+                       else [spec["kh"], spec["kw"], kh2, kw2])},
             {"name": "strides", "type": "list_int", "value": [spec["s1"], spec["s2"]]},
             {"name": "pads", "type": "list_int",
              "value": [spec["ph1"], spec["pw1"], spec["ph2"], spec["pw2"]]},
@@ -310,6 +328,7 @@ def do_check(c, l1):
             "--n", str(c["n"]), "--ci", str(c["ci"]), "--hi", str(c["hi"]), "--wi", str(c["wi"]),
             "--cout1", str(c["cout1"]), "--cout2", str(c["cout2"]),
             "--kh", str(c["kernel"][0]), "--kw", str(c["kernel"][1]),
+            "--kh2", str(c["kernel"][2]), "--kw2", str(c["kernel"][3]),
             "--s1", str(c["strides"][0]), "--s2", str(c["strides"][1]),
             "--ph1", str(ph1), "--pw1", str(pw1), "--ph2", str(ph2), "--pw2", str(pw2),
             "--l1", str(l1)]
@@ -471,9 +490,11 @@ def main():
     print("共 %d 条:" % len(cases))
     for c in cases:
         ph1, pw1, ph2, pw2 = c["pads"]
-        print("  %-16s %-5s n%d %d->%d->%d  %dx%d  k%dx%d s%d/%d p%d,%d/%d,%d  bias=%s relu=%s/%s"
+        k = c["kernel"]
+        ktxt = ("%dx%d" % (k[0], k[1]) if k[:2] == k[2:] else "%dx%d>%dx%d" % tuple(k))
+        print("  %-16s %-5s n%d %d->%d->%d  %dx%d  k%-9s s%d/%d p%d,%d/%d,%d  bias=%s relu=%s/%s"
               % (c["name"], c["dtype"], c["n"], c["ci"], c["cout1"], c["cout2"], c["hi"], c["wi"],
-                 c["kernel"][0], c["kernel"][1], c["strides"][0], c["strides"][1],
+                 ktxt, c["strides"][0], c["strides"][1],
                  ph1, pw1, ph2, pw2, c["bias"], c["relu"][0], c["relu"][1]))
     if args.list:
         return 0

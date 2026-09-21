@@ -146,7 +146,7 @@ cases.json 里的一条
 | `dtype` | `fp16` | `fp16` / `int8` / `s8f16` / `a16w8` / `both`（`both` 展开成 `<name>_fp16` 和 `<name>_int8`）|
 | `n` `ci` `hi` `wi` | 1 / 32 / 288 / 112 | 输入形状 NCHW |
 | `cout1` `cout2` | 64 / 96 | 两层的输出通道 |
-| `kernel` | `[3, 3]` | `[kh, kw]`，两层共用 |
+| `kernel` | `[3, 3]` | `[kh, kw]`（两层同核）或 `[kh1, kw1, kh2, kw2]`（两层各一个核，比如 `[1,1,3,3]` 是 1x1 接 3x3） |
 | `strides` | `[1, 2]` | `[stride1, stride2]`，两层各一个 |
 | `pads` | `[1, 1]` | `[p1, p2]`（H/W 同值）或 `[padH1, padW1, padH2, padW2]`。非方核必须用长度 4 的那种 |
 | `bias` | `false` | 带不带 bias（两层一起）|
