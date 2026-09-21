@@ -89,11 +89,14 @@ namespace FusedConv2dShape {
 //   8  PickHb 的代价函数算上权重重灌的真实倍数（W 分核会乘 hb）
 //   9  PickHb 的代价函数换成「最忙核上 cube/MTE1/MTE2 取大」，并且「行方向
 //      喂满核」的判据从「chunk 够核数那么多」改成「chunk 能被核数整除」
+//  10  代价函数补上 fixpipe 和权重的 GM 读，并且从「取大」改成「求和」
+//      —— geom9 在 bb_Conv_22.0_Conv_27.0 上把 45.36us 推到了 54.40us，
+//      因为「取大」会被漏掉的那一项骗过去
 // **只能是宏。** 不要写成 constexpr const char* —— ccec 把字符串字面量放在 __gm__
 // 地址空间里，`const __gm__ char[N]` 转不成 `const char*`，device 那条编译链直接挂。
 // 这也是 RejectText() 被 #if !defined(__NPU_ARCH__) 包起来的同一个理由。
 // 宏只是一个 token，谁需要谁自己用，两条编译链都安全。
-#define FC2D_GEOM_REV "geom9"
+#define FC2D_GEOM_REV "geom10"
 
 // ---------------------------------------------------------------------------
 // 5102 的片上容量。**只有这一组仍然是编译期常量** —— 它们是芯片属性，不是形状。
@@ -112,23 +115,35 @@ constexpr int L1_SEG_ALIGN = 512;     // fixpipe 的 L1->FB 取数要求每段 5
 constexpr int MMAD_M0 = 16;           // cube 的 M 粒度；N 粒度也是 16
 
 // ---------------------------------------------------------------------------
-// 三条管线的**每周期字节数**。和 L0A_BYTES 一样是芯片属性，不是形状 —— 由上板
-// 实测反推（cube 时钟 1.37 GHz，见下面 BusiestCoreCycles 的注释）：
+// 各条管线的速率。和 L0A_BYTES 一样是芯片属性，不是形状 —— 全部由 20 个真机形状
+// 的六管实测反推（cube 时钟 1.37 GHz，标定见下面 CoreCostCycles 的注释）。
 //
-//   MTE1  148 GB/s -> 108 B/cyc   L1 -> L0A / L0B
-//   MTE2  165 GB/s -> 120 B/cyc   GM -> L1，**整块**搬（一条指令覆盖一大片）
-//   MTE2   27 GB/s ->  20 B/cyc   GM -> L1，**逐行**搬（切了列之后每行一条 Dn2Nz）
+// **这一组在 geom10 重标过。** geom9 用的 MTE1 = 108 B/cyc 对小形状高估了约 1.8
+// 倍（bb_Conv_179_Conv_184 预测 17.7us、实测 9.08us），而且当时完全没有 fixpipe。
 //
-// 最后那一条是 bb_Conv_454_Conv_456 上量出来的，它是 W 分核真正的代价：切列让
-// bd.wIn != wi，LoadFmChannels 落到逐行那一支，于是 21 行 x 128 通道 = 2688 次
-// 30 字节的跨步读，449 KB 花掉 16.7us = 27 GB/s；整宽时是 128 次 840 字节的读，
-// 165 GB/s。**六倍。** 代价函数必须看得见这一条，否则它会为了把 chunk 数凑成 8
-// 的倍数去切列，然后在 MTE2 上把省下来的 cube 时间赔进去还不够 —— a16w8_target
-// 上就是 cube 省 8us、MTE2 从 14us 涨到 72us。
+//   MTE1        190 B/cyc            L1 -> L0A / L0B
+//   MTE2        120 B/cyc            GM -> L1，整块搬
+//   MTE2 慢路   每次请求 8 周期 + 上面那个带宽
+//               切了列之后 bd.wIn != wi，LoadFmChannels 落到逐行那一支：每行每
+//               通道一次跨步读。bb_Conv_454_Conv_456 上是 21x128 = 2688 次 30 字节
+//               花 16.7us；bb_Conv_22.0_Conv_27.0 上是 15x128 = 1920 次 84 字节
+//               花 10.2us。**按请求数算，不是按字节算** —— geom9 按字节定价，
+//               在后者上低估了一倍。
+//   fixpipe L1  290 B/cyc            conv1 的 fixpipe 写 mid 到 L1，连续
+//   fixpipe GM  每次请求 19/2 周期 + 105 B/cyc
+//               conv2 的 fixpipe 写 y 到 GM。**y 是 NCHW，所以一条 run 要对每个
+//               输出通道各发一次写**，每次只有 mRun * yBytes 字节连续。切列让
+//               rowsPerRun 变 1、nRun 变 hb，请求数就乘 hb。
+//   scalar      每个 M 子块 420 周期 + 每次 launch 4000 周期
 // ---------------------------------------------------------------------------
-constexpr int MTE1_BYTES_PER_CYC = 108;
-constexpr int MTE2_BULK_BYTES_PER_CYC = 120;
-constexpr int MTE2_ROW_BYTES_PER_CYC = 20;
+constexpr int MTE1_BYTES_PER_CYC = 190;
+constexpr int MTE2_BYTES_PER_CYC = 120;
+constexpr int MTE2_ROW_REQ_CYC = 8;
+constexpr int FIX_L1_BYTES_PER_CYC = 290;
+constexpr int FIX_GM_BYTES_PER_CYC = 105;
+constexpr int FIX_GM_REQ_CYC_X2 = 19;  // 9.5 周期，翻倍存以免用浮点
+constexpr int SCALAR_TILE_CYC = 420;
+constexpr int SCALAR_BASE_CYC = 4000;
 
 // M 方向最多切几块。分块表是定长数组，超了就拒 —— 与其在 device 上越界，不如在
 // tiling 阶段说「这个形状我服务不了」。
@@ -1171,31 +1186,57 @@ FC2D_GEOM_FN int DeriveWithHb(const Params& p, int hb, int l1Budget, Geometry& g
 }
 
 // ---------------------------------------------------------------------------
-// 一个几何在**最忙那个核**上要多少周期 —— cube / MTE1 / MTE2 三条管线取大。
-// 这就是 PickHb 的代价函数。
+// 一个几何在**最忙那个核**上的代价（周期）—— 五条管线**求和**。
+// 这就是 PickHb 的目标函数。
 //
-// 为什么要三条一起看，而不是只看 cube、或只看「重复计算的行数」：这三条互相拉扯，
-// 只看任何一条都会被另外两条打回来。20 个真机形状上验过（误差 -13% ~ +1%）：
+// ===========================================================================
+// 为什么是求和，不是取大 —— 这一条是花了一次真机回退换来的
+// ===========================================================================
+// geom9 用的是 max(cube, MTE1, MTE2)。它在 bb_Conv_22.0_Conv_27.0 上选了
+// hb=11 nwseg=2，把实测从 45.36us 推到了 **54.40us**。事后六管对照：
 //
-//   只看 cube    -> 去切列凑满 8 个核，MTE2 落到逐行慢路。a16w8_target 上是
-//                   cube 34.7 -> 31.0us，而 MTE2 14 -> 73us。
-//   只看 MTE1    -> 权重重灌是 MTE1 的大头，于是把 hb 选到最大、chunk 数选到最少，
-//                   核闲着。
-//   只看重复行数 -> 就是 geom8 的代价函数。它看不见核的占用率，ho2 = 44 的形状
-//                   选出 chunkTotal = 11（6 个核各 2 个、2 个核闲着）。
+//                geom8 (hb=4 nw=1)   geom9 (hb=11 nw=2)
+//        mac         33.276              22.546      <- geom9 确实省了 10.7us
+//        fixpipe      3.887              11.206      <- geom9 完全没有这一项
+//        mte2         5.016              12.034      <- geom9 低估一倍
+//        mte1        13.037              15.064
+//        scalar       5.680               7.380      <- geom9 也没有这一项
+//        total       45.360              54.400
 //
-// 一条 mmad 吃多少 K 取决于 **A 侧**的宽度：fp16 是 16x16x16、int8 是 16x16x32，
-// 两条都是一周期一条。所以 A16W8 的 conv1（A 是 fp16 的 x）只有一半的 MAC 吞吐，
-// 比同形状的 int8 卷积贵一倍 —— 这不是实现选择，是 cube 的属性，融不融合都一样。
-// conv2 的 A 是 int8 的 mid，走 32 那一支。
+// max 的毛病就在这里：**漏掉一项，它就被骗过去**。geom9 只看见 cube 从 33.6 降到
+// 22.5，就选了后者。而求和对每一条管线单调，漏项只会让代价偏低一个常数，不会让
+// 排序翻过来 —— 实测 19 个点里，sum(五管) 排序全对，而 max 排错。
 //
-// 周期 -> 时间用 1.37 GHz：bb_Conv_179_Conv_184 单跑的两个 int8 卷积一共
-// 221,184 条 tile-op，8 核均分 27,648 条，实测 mac 20.179us —— 正好 1.370 GHz，
-// 也就是说那两个卷积跑在 cube 峰值上。同一把尺子量融合后的 mac，20 个形状都对得上。
+// 求和当然高估了重叠：实测 total / sum(五管) 在 0.47 到 0.83 之间（重叠好的大形状
+// 在低端）。但**这是排序函数，不是时间预测器** —— 一个一致的倍率偏差不影响选择。
+// 真要预测绝对时间的话，19 个点上 sum 的相对误差是 +12% ~ +69%。
+//
+// ===========================================================================
+// 各项的来历
+// ===========================================================================
+// cube  一条 mmad 吃多少 K 取决于 **A 侧**的宽度：fp16 是 16x16x16、int8 是
+//       16x16x32，两条都是一周期一条。所以 A16W8 的 conv1（A 是 fp16 的 x）只有
+//       一半的 MAC 吞吐，比同形状的 int8 卷积贵一倍 —— 这不是实现选择，是 cube
+//       的属性，融不融合都一样。conv2 的 A 是 int8 的 mid，走 32 那一支。
+//       时钟标定：bb_Conv_179_Conv_184 单跑的两个 int8 卷积一共 221,184 条
+//       tile-op，8 核均分 27,648 条，实测 mac 20.179us —— 正好 1.370 GHz。
+//
+// MTE1  两条 img2col + 两套权重进 L0B。权重重灌的次数不是 1：l0bChunks > 1 时是
+//       每个 M 子块把每一段各灌一遍，而 W 分核会让 conv2 的 nRun 变成 hb。
+//
+// MTE2  fm 进 L1，**加上整套权重从 GM 读进来**。geom9 只算了 fm，而 19 个实测点
+//       里有 14 个是**权重主导**的 —— bb_Conv_460_Conv_462 的权重 1008 KB 对 fm
+//       58 KB。加上权重之后这 14 个点落在实测的 0.94 ~ 1.20 倍之内。
+//       权重是**每个核读一次**（内核前导里的 GM2L1，w*Stage == 0 时整套常驻 L1），
+//       所以它不乘 chunksPerCore；滚动时要重读，按两倍粗估。
+//
+// fix   conv1 写 L1（连续，纯带宽）和 conv2 写 GM 要分开定价，见上面常量那一段。
+//
+// scalar 按 M 子块数算。它在 nRun 大的时候也涨（22.0_27.0 上 5.68 -> 7.38）。
 //
 // **只有 host 走这条。** 选完把 hb / nwseg 下发，kernel 只调 DeriveWith。
 // ---------------------------------------------------------------------------
-FC2D_GEOM_FN long long BusiestCoreCycles(const Geometry& g, int chunksPerCore)
+FC2D_GEOM_FN long long CoreCostCycles(const Geometry& g, int chunksPerCore)
 {
     FlatGeom f;
     Flatten(g, chunksPerCore, f);
@@ -1204,6 +1245,8 @@ FC2D_GEOM_FN long long BusiestCoreCycles(const Geometry& g, int chunksPerCore)
     const int xBytes = g.p.elemBytes;
     const int midBytes = MidElemBytes(g.p);
     const int wBytes = WeightElemBytes(g.p);
+    // y 的元素宽度：带反量化表的出口是 fp16，否则和 mid 同宽。
+    const int yBytes = g.p.hasDeqScale2 ? 2 : midBytes;
     const int kPerMmad1 = (xBytes == 2) ? 16 : 32;
     const int kPerMmad2 = (midBytes == 2) ? 16 : 32;
     // 中间的 band 彼此逐字相同，只有首尾两个的 pad 不一样；列段同理。所以取
@@ -1211,7 +1254,7 @@ FC2D_GEOM_FN long long BusiestCoreCycles(const Geometry& g, int chunksPerCore)
     // ho2 上千的形状那是上百万次 MakeBandLite，白花在 tiling 上。
     int bands[3] = {0, g.nchunk / 2, g.nchunk - 1};
     int wsegs[3] = {0, g.nwseg / 2, g.nwseg - 1};
-    long long worst = 0;
+    long long wCube = 0, wMte1 = 0, wMte2 = 0, wFix = 0, wScalar = 0;
     for (int bi = 0; bi < 3; ++bi) {
         for (int wj = 0; wj < 3; ++wj) {
             const int band = bands[bi];
@@ -1232,9 +1275,6 @@ FC2D_GEOM_FN long long BusiestCoreCycles(const Geometry& g, int chunksPerCore)
                             (cout2A / MMAD_M0) * (g.k2 / kPerMmad2);
                 }
             }
-            // MTE1：两条 img2col，加两套权重进 L0B。权重重灌的次数不是 1 —— 见
-            // 下面 PickHb 第二趟里那一大段（l0bChunks > 1 时是每个 M 子块把每一段
-            // 各灌一遍，而 W 分核会让 conv2 的 nRun 变成 hb）。
             long long mte1Bytes = (long long)b.m1 * g.k1 * xBytes +
                                   (long long)b.nRun * b.mRun * g.k2 * midBytes;
             mte1Bytes += (g.l0bChunks1 == 1) ? (long long)cout1A * g.k1 * wBytes
@@ -1242,30 +1282,40 @@ FC2D_GEOM_FN long long BusiestCoreCycles(const Geometry& g, int chunksPerCore)
             mte1Bytes += (g.l0bChunks2 == 1)
                              ? (long long)cout2A * g.k2 * wBytes
                              : (long long)b.nRun * b.t2.n * cout2A * g.k2 * wBytes;
-            // MTE2：fm 进 L1。整宽走整块快路，切了列就是逐行 —— 差六倍。
-            const long long fmBytes = (long long)b.xRows * b.wIn * g.p.ci * xBytes;
-            const int fmRate =
-                (b.wIn == g.p.wi) ? MTE2_BULK_BYTES_PER_CYC : MTE2_ROW_BYTES_PER_CYC;
-            long long mx = cube;
             const long long mte1 = mte1Bytes / MTE1_BYTES_PER_CYC;
-            const long long mte2 = fmBytes / fmRate;
-            if (mte1 > mx) {
-                mx = mte1;
+            // fm 进 L1。整宽走整块快路；切了列就是逐行，按**请求数**算。
+            const long long fmBytes = (long long)b.xRows * b.wIn * g.p.ci * xBytes;
+            long long mte2 = fmBytes / MTE2_BYTES_PER_CYC;
+            if (b.wIn != g.p.wi) {
+                mte2 += (long long)b.xRows * g.p.ci * MTE2_ROW_REQ_CYC;
             }
-            if (mte2 > mx) {
-                mx = mte2;
-            }
-            if (mx > worst) {
-                worst = mx;
-            }
+            // fixpipe：conv1 -> L1 连续；conv2 -> GM 每个输出通道一次写。
+            long long fix = (long long)b.m1 * cout1A * 4 / FIX_L1_BYTES_PER_CYC;
+            const long long gmReq = (long long)b.nRun * b.t2.n * cout2A;
+            const long long gmBytes = (long long)b.nRun * b.mRun * cout2A * yBytes;
+            fix += gmReq * FIX_GM_REQ_CYC_X2 / 2 + gmBytes / FIX_GM_BYTES_PER_CYC;
+            const long long scalar = (long long)(b.t1.n + b.nRun * b.t2.n) * SCALAR_TILE_CYC;
+            if (cube > wCube) { wCube = cube; }
+            if (mte1 > wMte1) { wMte1 = mte1; }
+            if (mte2 > wMte2) { wMte2 = mte2; }
+            if (fix > wFix) { wFix = fix; }
+            if (scalar > wScalar) { wScalar = scalar; }
         }
     }
-    return worst * (long long)chunksPerCore;
+    // 权重从 GM 读：每个核一次，不乘 chunksPerCore。滚动时重读，按两倍粗估。
+    long long wtBytes = ((long long)cout1A * g.k1 + (long long)cout2A * g.k2) * wBytes;
+    if (g.w1Stage + g.w2Stage > 0) {
+        wtBytes *= 2;
+    }
+    const long long cpc = chunksPerCore;
+    return cpc * (wCube + wMte1 + wMte2 + wFix + wScalar) +
+           wtBytes / MTE2_BYTES_PER_CYC + SCALAR_BASE_CYC;
 }
 
 // ---------------------------------------------------------------------------
 // band 高度的选择。**只有 host 走这条**，选完把 hb 下发，kernel 只调 DeriveWithHb。
-// 代价函数是上面的 BusiestCoreCycles，那里写了为什么必须三条管线一起看。
+// 代价函数是上面的 CoreCostCycles，那里写了为什么是五条管线**求和**而不是取大
+// —— 那一条是 geom9 在真机上退了 9us 换来的。
 // ---------------------------------------------------------------------------
 FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
 {
@@ -1391,13 +1441,10 @@ FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
             // 重灌 9*9 = 81 段 = 3.98 MB，而它的 img2col 只有 31 KB —— **权重是
             // img2col 的 128 倍**，MTE1 下界 31us 对着 cube 下界 6.3us，实测 47us，
             // 比两个卷积分开跑（18.6us）慢 2.5 倍。
-            // 代价 = 最忙那个核的周期数，三条管线取大（见 BusiestCoreCycles）。
-            // 上一版这里是一个手写的代理量：midRows * wSubMax + 两套权重的重灌量，
-            // 再乘轮数。它有两个毛病 —— 单位不齐（位置数和 K 元素数直接相加），
-            // 而且看不见核的占用率、也看不见 MTE2 的搬运粒度。现在直接算真东西。
+            // 代价 = 最忙那个核上五条管线的**和**（见 CoreCostCycles）。
             const int bdCap = (aicNum < probe.chunkTotal) ? aicNum : probe.chunkTotal;
             const int cpc = CeilDiv(probe.chunkTotal, bdCap);
-            const long long cost = BusiestCoreCycles(probe, cpc);
+            const long long cost = CoreCostCycles(probe, cpc);
             // 同上：不滚动的一律优先。
             const int stg = probe.w1Stage + probe.w2Stage;
             if (bestHb2 == 0 || stg < bestStage2 ||
