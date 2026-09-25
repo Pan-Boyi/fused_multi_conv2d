@@ -96,11 +96,15 @@ namespace FusedConv2dShape {
 //      PickHb 第二趟加两条护栏：2% 近似并列带用确定性键裁决、切列要 20% 保证金
 //  12  两层的 kernel 大小分开：kh1/kw1 和 kh2/kw2。以前两层共用一个 kh/kw，
 //      1x1 接 3x3 这种组合根本表达不出来
+//  13  L0B 按**半个**挑段，腾出第二个槽 —— 权重的 L1->L0B 灌载从此能压在上一段的
+//      mmad 底下。geom12 里 L0B 是整个 kernel 唯一一个单缓冲的级（l0bFree/
+//      l0bReady 是 SEvent，L0NZ2NZ 的目标没有槽号），每个段边界都是
+//      「MMA 退休 -> 灌 64KB -> MMA 发射」的硬串行
 // **只能是宏。** 不要写成 constexpr const char* —— ccec 把字符串字面量放在 __gm__
 // 地址空间里，`const __gm__ char[N]` 转不成 `const char*`，device 那条编译链直接挂。
 // 这也是 RejectText() 被 #if !defined(__NPU_ARCH__) 包起来的同一个理由。
 // 宏只是一个 token，谁需要谁自己用，两条编译链都安全。
-#define FC2D_GEOM_REV "geom12"
+#define FC2D_GEOM_REV "geom13"
 
 // ---------------------------------------------------------------------------
 // 5102 的片上容量。**只有这一组仍然是编译期常量** —— 它们是芯片属性，不是形状。
@@ -110,6 +114,11 @@ namespace FusedConv2dShape {
 constexpr int L0A_BYTES = 64 * 1024;
 constexpr int L0A_SLOT_BYTES = L0A_BYTES / 2; // 双缓冲，一槽 32,768
 constexpr int L0B_BYTES = 64 * 1024;
+// L0B 也双缓冲，一槽 32,768。**但它是软的** —— 和 L0A_SLOT_BYTES 不同，这里只是
+// PickL0bChunks 的首选预算；装不下就退回整个 L0B、单缓冲（geom12 的行为），
+// 靠 l0bPP1 / l0bPP2 告诉 kernel 走哪条路。理由：ping-pong 是性能优化，不该让
+// 任何一个本来能过的形状被拒。
+constexpr int L0B_SLOT_BYTES = L0B_BYTES / 2;
 constexpr int L0C_BYTES = 256 * 1024;
 constexpr int L0C_ELEMS = L0C_BYTES / 4; // int32 累加器
 constexpr int BT_BYTES = 4 * 1024;
@@ -421,6 +430,8 @@ struct Geometry {
     int mMax1, mMax2;                // 一个 M 子块最多几个位置（不是行）
     int l0bChunks1, l0bChunkK1, tilesPerChunk1;  // 权重按 K 折几段
     int l0bChunks2, l0bChunkK2, tilesPerChunk2;
+    int l0bPP1, l0bPP2;              // 该层的段能不能 ping-pong（1=两个槽，0=单缓冲）
+    int l0bSlot1Elems, l0bSlot2Elems;   // 一个槽的元素数；单缓冲时是 0（两个槽号同址）
 
     int l0aSlotElems;    // 一个 L0A 槽的元素数（按 elemBytes）
     int l0bElems;        // L0B 要多少元素（两个卷积取大）
@@ -525,9 +536,10 @@ FC2D_GEOM_FN KChoice PickTileK(int k, int c0, int elemBytes, int cout, int total
     return best;
 }
 
-// 整套权重能不能一次装进 L0B；装不下就按 K 折。折出来的每段仍要是 tileK 的整数倍，
-// 否则 img2col 的 K 偏移和 L0B 里的偏移对不上。
-FC2D_GEOM_FN bool PickL0bChunks(int cout, int k, int elemBytes, int tileK, int& chunks, int& chunkK)
+// 整套权重能不能一次装进给定预算；装不下就按 K 折。折出来的每段仍要是 tileK 的
+// 整数倍，否则 img2col 的 K 偏移和 L0B 里的偏移对不上。
+FC2D_GEOM_FN bool PickL0bChunksIn(int cout, int k, int elemBytes, int tileK, int budget,
+                                  int& chunks, int& chunkK)
 {
     const int coutA = Align(cout, MMAD_M0);
     for (int c = 1; c <= k / tileK; ++c) {
@@ -538,13 +550,34 @@ FC2D_GEOM_FN bool PickL0bChunks(int cout, int k, int elemBytes, int tileK, int& 
         if ((ck % tileK) != 0) {
             continue;
         }
-        if (coutA * ck * elemBytes <= L0B_BYTES) {
+        if (coutA * ck * elemBytes <= budget) {
             chunks = c;
             chunkK = ck;
             return true;
         }
     }
     return false;
+}
+
+// **先按半个 L0B 找**：每段只占一半，另一半就能同时装下一段，L0NZ2NZ 压在上一段的
+// mmad 底下（kernel 侧 l0bFree / l0bReady 随之从 SEvent 换成 DEvent，见 impl.h）。
+// 半个装不下才退回整个 —— 那就是 geom12 的单缓冲。
+//
+// **故意不动 PickTileK 的 ckMax**（它仍按整个 L0B 算）。把 ckMax 也减半会让一部分
+// 形状换 tileK：62.0_199.0 和 192_295 的 128 -> 64、460_462 的 192 -> 96，而 tileK
+// 变了 mMax 跟着变、M 子块数跟着变，等于顺手改了几何。这一笔只想动 L0B 的分段。
+// 34 个板上形状实测：hb / nwseg / chunkTotal / blockDim / chunksPerCore / 最忙核
+// tile-ops / 滚动档**全部逐字不变**，只有段数和段长变，以及 5 个形状的 l1Used 下降
+// （滚动权重缓冲跟着段长减半）。
+FC2D_GEOM_FN bool PickL0bChunks(int cout, int k, int elemBytes, int tileK, int& chunks,
+                                int& chunkK, int& pingpong)
+{
+    if (PickL0bChunksIn(cout, k, elemBytes, tileK, L0B_SLOT_BYTES, chunks, chunkK)) {
+        pingpong = 1;
+        return true;
+    }
+    pingpong = 0;
+    return PickL0bChunksIn(cout, k, elemBytes, tileK, L0B_BYTES, chunks, chunkK);
 }
 
 // ---------------------------------------------------------------------------
@@ -582,6 +615,8 @@ struct FlatGeom {
     int tileK1, tileK2;
     int l0bChunks1, l0bChunkK1, tilesPerChunk1;
     int l0bChunks2, l0bChunkK2, tilesPerChunk2;
+    int l0bPP1, l0bPP2;
+    int l0bSlot1Elems, l0bSlot2Elems;
     int l0bElems, l0cElems, l0cStride;
     int w1Stage, w2Stage;   // 权重在 L1 里的摆法，见 Geometry
     // ---- L1 地址表（字节地址）----
@@ -644,6 +679,10 @@ struct FlatGeom {
     X(l0bChunks2, l0bChunks2) \
     X(l0bChunkK2, l0bChunkK2) \
     X(tilesPerChunk2, tilesPerChunk2) \
+    X(l0bPP1, l0bPP1)         \
+    X(l0bPP2, l0bPP2)         \
+    X(l0bSlot1Elems, l0bSlot1Elems) \
+    X(l0bSlot2Elems, l0bSlot2Elems) \
     X(l0bElems, l0bElems)     \
     X(l0cElems, l0cElems)     \
     X(l0cStride, l0cStride)   \
@@ -717,6 +756,10 @@ FC2D_GEOM_FN void Flatten(const Geometry& g, int chunksPerCore, FlatGeom& f)
     f.l0bChunks2 = g.l0bChunks2;
     f.l0bChunkK2 = g.l0bChunkK2;
     f.tilesPerChunk2 = g.tilesPerChunk2;
+    f.l0bPP1 = g.l0bPP1;
+    f.l0bPP2 = g.l0bPP2;
+    f.l0bSlot1Elems = g.l0bSlot1Elems;
+    f.l0bSlot2Elems = g.l0bSlot2Elems;
     f.l0bElems = g.l0bElems;
     f.l0cElems = g.l0cElems;
     f.l0cStride = g.l0cStride;
@@ -1066,9 +1109,38 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
     g.tileK2 = kc2.tileK;
     g.mMax2 = kc2.mMax;
 
-    if (!PickL0bChunks(p.cout1, g.k1, weightBytes, g.tileK1, g.l0bChunks1, g.l0bChunkK1) ||
-        !PickL0bChunks(p.cout2, g.k2, weightBytes, g.tileK2, g.l0bChunks2, g.l0bChunkK2)) {
+    if (!PickL0bChunks(p.cout1, g.k1, weightBytes, g.tileK1, g.l0bChunks1, g.l0bChunkK1,
+                       g.l0bPP1) ||
+        !PickL0bChunks(p.cout2, g.k2, weightBytes, g.tileK2, g.l0bChunks2, g.l0bChunkK2,
+                       g.l0bPP2)) {
         return RJ_L0B;
+    }
+    // **给通道流式加载让路。** MakeFmLoadSpec 把 conv1 的那一笔 fm MTE2 拆成
+    // 「前 tileK1 个通道」和「其余」，让后半段压在第一条全 M 的 mmad 底下 —— 它的
+    // 前提之一是 l0bChunks1 == 1。L0B ping-pong 会把 conv1 的权重折成两段，
+    // 这个前提就没了。两者只能要一个：
+    //   流式加载省的是**一整笔 fm 的 GM 读**（wide1790 上 ci=64、nwseg=8，
+    //     那是整个 band 的特征图）
+    //   ping-pong 省的是一次 L1->L0B（几十 KB，而且走的是 MTE1 不是 MTE2）
+    // 前者大一个量级，所以让路。
+    //
+    // 只有 nwseg > 1 才可能走到这里 —— MakeFmLoadSpec 的第一个条件就是它。
+    // 34 个板上形状**全是 nwseg == 1**，一个都不受影响；受影响的是
+    // wide1790 那一类靠切列才放得进 L1 的极宽形状。
+    if (nwseg > 1 && g.l0bPP1 != 0) {
+        int c1 = 0, ck1 = 0;
+        if (PickL0bChunksIn(p.cout1, g.k1, weightBytes, g.tileK1, L0B_BYTES, c1, ck1) && c1 == 1) {
+            g.l0bChunks1 = c1;
+            g.l0bChunkK1 = ck1;
+        }
+    }
+    // 只有一段时 ping-pong 没有意义（没有"下一段"可以预灌），而且 w*Resident 那条
+    // 路整套权重一次灌完、根本不进段环。统一在这里压平，kernel 侧就只看这一个标志。
+    if (g.l0bChunks1 == 1) {
+        g.l0bPP1 = 0;
+    }
+    if (g.l0bChunks2 == 1) {
+        g.l0bPP2 = 0;
     }
     g.tilesPerChunk1 = g.l0bChunkK1 / g.tileK1;
     g.tilesPerChunk2 = g.l0bChunkK2 / g.tileK2;
@@ -1099,13 +1171,20 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
     }
     g.l0aSlotElems = L0A_SLOT_BYTES / MaxI(xBytes, midBytes);
 
+    // 一段的字节数，以及该层在 L0B 里的总占用（ping-pong 时两个槽）。两层不同时
+    // 在用 L0B（conv1 整个跑完才轮到 conv2），所以取大而不是求和。
     const int l0b1 = Align(p.cout1, MMAD_M0) * g.l0bChunkK1 * weightBytes;
     const int l0b2 = Align(p.cout2, MMAD_M0) * g.l0bChunkK2 * weightBytes;
-    const int l0bMax = MaxI(l0b1, l0b2);
+    const int use1 = l0b1 * (g.l0bPP1 != 0 ? 2 : 1);
+    const int use2 = l0b2 * (g.l0bPP2 != 0 ? 2 : 1);
+    const int l0bMax = MaxI(use1, use2);
     if (l0bMax > L0B_BYTES) {
         return RJ_L0B;
     }
     g.l0bElems = l0bMax / weightBytes;
+    // 槽间距。单缓冲时是 0 —— 两个槽号指向同一块，和 geom12 逐字等价。
+    g.l0bSlot1Elems = (g.l0bPP1 != 0) ? l0b1 / weightBytes : 0;
+    g.l0bSlot2Elems = (g.l0bPP2 != 0) ? l0b2 / weightBytes : 0;
 
     const int l0c1 = Align(g.mMax1, MMAD_M0) * Align(p.cout1, MMAD_M0);
     const int l0c2 = Align(g.mMax2, MMAD_M0) * Align(p.cout2, MMAD_M0);
