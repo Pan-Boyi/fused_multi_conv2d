@@ -137,7 +137,7 @@ constexpr int MMAD_M0 = 16;           // cube 的 M 粒度；N 粒度也是 16
 //   MTE1        190 B/cyc            L1 -> L0A / L0B
 //   MTE2        120 B/cyc            GM -> L1，整块搬
 //   MTE2 慢路   每次请求 8 周期 + 上面那个带宽
-//               切了列之后 bd.wIn != wi，LoadFmChannels 落到逐行那一支：每行每
+//               切了列之后 currentBand.wIn != wi，LoadFmChannels 落到逐行那一支：每行每
 //               通道一次跨步读。bb_Conv_454_Conv_456 上是 21x128 = 2688 次 30 字节
 //               花 16.7us；bb_Conv_22.0_Conv_27.0 上是 15x128 = 1920 次 84 字节
 //               花 10.2us。**按请求数算，不是按字节算** —— geom9 按字节定价，
@@ -472,7 +472,7 @@ FC2D_GEOM_FN KChoice PickTileK(int k, int c0, int elemBytes, int cout, int total
     const int mCapC = L0C_ELEMS / Align(cout, MMAD_M0);
     // **L0B 的上限。** 这一条以前不在这里，后果是一整类形状被无谓拒掉：
     // PickL0bChunks 要求折出来的每一段 chunkK 都是 tileK 的整数倍（img2col 的 K 偏移
-    // k0 = hc*chunkK + t*tileK 和 L0B 里的偏移必须对得上），而每一段又要装进 L0B。
+    // k0 = l0bLoadChunkIdx*chunkK + t*tileK 和 L0B 里的偏移必须对得上），而每一段又要装进 L0B。
     // 于是 chunkK >= tileK 且 align16(cout)*chunkK*weightBytes <= L0B_BYTES，
     //     => tileK <= ckMax = L0B_BYTES / (align16(cout) * weightBytes)
     // 这条既必要也充分 —— 充分是因为 chunkK = tileK 永远合法（tileK 整除 k，所以
@@ -795,16 +795,16 @@ struct BandLite {
     int padL2, padR2;       // conv2 在这一段两侧的补零（内部段是 0，边缘段才有）
     int xCol0, wIn;         // 要灌进 L1 的 x 列区间
     int padL1, padR1;
-    int m1;       // midReal * wSub
+    int conv1MPerBand;       // midReal * wSub
     // conv2 的输出在 GM(NCHW) 里按行连续。整幅宽度时一个 run 覆盖整个 band（和
     // 不切列时完全一样）；切了列之后一个 run 只能是一行 —— fixpipe 的一段连续
     // 写要是跨了行，就会写到下一行的开头去。
     int rowsPerRun, mRun, nRun;
-    TileSpec t1;  // conv1 的 M 分块（对 midReal x wSub 的全部位置）
-    TileSpec t2;  // conv2 的 M 分块（对一个 run 的全部位置）
+    TileSpec conv1Tile;  // conv1 的 M 分块（对 midReal x wSub 的全部位置）
+    TileSpec conv2Tile;  // conv2 的 M 分块（对一个 run 的全部位置）
 };
 
-FC2D_GEOM_FN void MakeBandLite(const FlatGeom& f, int band, int wg, BandLite& b)
+FC2D_GEOM_FN void MakeBandLite(const FlatGeom& f, int band, int woSegIdx, BandLite& b)
 {
     b.outRow0 = band * f.hb;
 
@@ -830,7 +830,7 @@ FC2D_GEOM_FN void MakeBandLite(const FlatGeom& f, int band, int wg, BandLite& b)
     // 和 [0, wo1) 求交，交不到的部分就是这一段自己的左右补零。恒等式：
     //   (wSub + padL2 + padR2 - kw2)/s2 + 1 == outCols
     // conv1 那一层同理，出 wSub 列需要 x 的哪一段。
-    b.outCol0 = wg * f.wseg;
+    b.outCol0 = woSegIdx * f.wseg;
     b.outCols = MinI(f.wseg, f.wo2 - b.outCol0);
 
     const int mcRaw0 = b.outCol0 * f.stride2 - f.padW2;
@@ -851,13 +851,13 @@ FC2D_GEOM_FN void MakeBandLite(const FlatGeom& f, int band, int wg, BandLite& b)
 
     // conv1 的 M 空间：midReal 行 x wSub 列的**全部位置**，可以切到行内 —— mid 在
     // L1 里就是这么连续排的（行距 wSub），所以扁平区间直接对应一块矩形。
-    b.m1 = b.midReal * b.wSub;
-    b.t1 = MakeTileSpec(b.m1, f.mMax1, 1);
+    b.conv1MPerBand = b.midReal * b.wSub;
+    b.conv1Tile = MakeTileSpec(b.conv1MPerBand, f.mMax1, 1);
 
     b.rowsPerRun = (b.outCols == f.wo2) ? f.hb : 1;
     b.mRun = b.rowsPerRun * b.outCols;
     b.nRun = f.hb / b.rowsPerRun;
-    b.t2 = MakeTileSpec(b.mRun, f.mMax2, 1);
+    b.conv2Tile = MakeTileSpec(b.mRun, f.mMax2, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -877,7 +877,7 @@ FC2D_GEOM_FN void MakeBandLite(const FlatGeom& f, int band, int wg, BandLite& b)
 struct Band {
     int img;      // batch 里的第几张图
     int band;     // 图内第几个 band
-    int wg;       // 图内第几个列段
+    int woSegIdx;       // 图内第几个列段
     int aMid;     // 这个 band 的第一行 conv1 输出（全局行号）
     int midReal;  // 这个 band 真正算出来的 conv1 行数
     int padT2, padB2;
@@ -885,9 +885,9 @@ struct Band {
     int outRow0;  // 这个 chunk 的第一行 conv2 输出（图内行号）
     int outCol0, outCols, midCol0, wSub, padL2, padR2, xCol0, wIn, padL1, padR1;
     int rowsPerRun, mRun, nRun;
-    int m1;       // midReal * wSub
-    TileTable t1; // conv1 的 M 分块
-    TileTable t2; // conv2 的 M 分块（对一个 run）
+    int conv1MPerBand;       // midReal * wSub
+    TileTable conv1Tile; // conv1 的 M 分块
+    TileTable conv2Tile; // conv2 的 M 分块（对一个 run）
 };
 
 FC2D_GEOM_FN Band MakeBand(const Geometry& g, int chunk)
@@ -895,19 +895,19 @@ FC2D_GEOM_FN Band MakeBand(const Geometry& g, int chunk)
     FlatGeom f;
     Flatten(g, 1, f);
     // chunk 的拆法：列段跑得最快，其次是 band，最后是图。kernel 侧那个自增
-    // （wg -> band -> img）必须和这里一致。
+    // （woSegIdx -> band -> img）必须和这里一致。
     const int perImg = g.nchunk * g.nwseg;
     const int img = chunk / perImg;
     const int rem = chunk - img * perImg;
     const int band = rem / g.nwseg;
-    const int wg = rem - band * g.nwseg;
+    const int woSegIdx = rem - band * g.nwseg;
     BandLite lb;
-    MakeBandLite(f, band, wg, lb);
+    MakeBandLite(f, band, woSegIdx, lb);
 
     Band b;
     b.img = img;
     b.band = band;
-    b.wg = wg;
+    b.woSegIdx = woSegIdx;
     b.aMid = lb.aMid;
     b.midReal = lb.midReal;
     b.padT2 = lb.padT2;
@@ -930,9 +930,9 @@ FC2D_GEOM_FN Band MakeBand(const Geometry& g, int chunk)
     b.rowsPerRun = lb.rowsPerRun;
     b.mRun = lb.mRun;
     b.nRun = lb.nRun;
-    b.m1 = lb.m1;
-    b.t1 = MakeTiles(lb.m1, g.mMax1, 1);
-    b.t2 = MakeTiles(lb.mRun, g.mMax2, 1);
+    b.conv1MPerBand = lb.conv1MPerBand;
+    b.conv1Tile = MakeTiles(lb.conv1MPerBand, g.mMax1, 1);
+    b.conv2Tile = MakeTiles(lb.mRun, g.mMax2, 1);
     return b;
 }
 
@@ -1213,11 +1213,11 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
     // 滚动只在 l0bChunks > 1 时有意义：l0bChunks == 1 时「一段」就是整套，装不下
     // 整套等于装不下一段。
     //
-    // 代价：权重要从 GM 重读，次数 = 消费它的 M 子块数（conv1 的 t1.n、conv2 的
-    // nRun*t2.n）—— 因为 hc 循环嵌在 M 子块循环**里面**。要把 hc 提到外面就得给
+    // 代价：权重要从 GM 重读，次数 = 消费它的 M 子块数（conv1 的 conv1Tile.n、conv2 的
+    // nRun*conv2Tile.n）—— 因为 l0bLoadChunkIdx 循环嵌在 M 子块循环**里面**。要把 l0bLoadChunkIdx 提到外面就得给
     // 每个 M 子块各留一块 L0C，多数形状放不下（impl.h 里 conv2 那段注释记的就是
-    // 这件事）。M 很小的形状（这两个用例的 t1.n 都是 1）重读次数就是 1，和全驻的
-    // 前缀一次灌完等价；M 大的形状会翻 t1.n 倍。PickHb 因此**优先选不滚动的候选**，
+    // 这件事）。M 很小的形状（这两个用例的 conv1Tile.n 都是 1）重读次数就是 1，和全驻的
+    // 前缀一次灌完等价；M 大的形状会翻 conv1Tile.n 倍。PickHb 因此**优先选不滚动的候选**，
     // 见下面那段。
     g.fmElems = g.xRows * g.wInMax * p.ci;
     g.midElems = g.m1Max * p.cout1;
@@ -1345,30 +1345,30 @@ FC2D_GEOM_FN long long CoreCostCycles(const Geometry& g, int chunksPerCore)
     for (int bi = 0; bi < 3; ++bi) {
         for (int wj = 0; wj < 3; ++wj) {
             const int band = bands[bi];
-            const int wg = wsegs[wj];
-            if (band < 0 || wg < 0) {
+            const int woSegIdx = wsegs[wj];
+            if (band < 0 || woSegIdx < 0) {
                 continue;
             }
             BandLite b;
-            MakeBandLite(f, band, wg, b);
+            MakeBandLite(f, band, woSegIdx, b);
             long long cube = 0;
-            for (int i = 0; i < b.t1.n; ++i) {
-                cube += (long long)(Align(TileRows(b.t1, i), MMAD_M0) / MMAD_M0) *
+            for (int i = 0; i < b.conv1Tile.n; ++i) {
+                cube += (long long)(Align(TileRows(b.conv1Tile, i), MMAD_M0) / MMAD_M0) *
                         (cout1A / MMAD_M0) * (g.k1 / kPerMmad1);
             }
             for (int r = 0; r < b.nRun; ++r) {
-                for (int q = 0; q < b.t2.n; ++q) {
-                    cube += (long long)(Align(TileRows(b.t2, q), MMAD_M0) / MMAD_M0) *
+                for (int q = 0; q < b.conv2Tile.n; ++q) {
+                    cube += (long long)(Align(TileRows(b.conv2Tile, q), MMAD_M0) / MMAD_M0) *
                             (cout2A / MMAD_M0) * (g.k2 / kPerMmad2);
                 }
             }
-            long long mte1Bytes = (long long)b.m1 * g.k1 * xBytes +
+            long long mte1Bytes = (long long)b.conv1MPerBand * g.k1 * xBytes +
                                   (long long)b.nRun * b.mRun * g.k2 * midBytes;
             mte1Bytes += (g.l0bChunks1 == 1) ? (long long)cout1A * g.k1 * wBytes
-                                             : (long long)b.t1.n * cout1A * g.k1 * wBytes;
+                                             : (long long)b.conv1Tile.n * cout1A * g.k1 * wBytes;
             mte1Bytes += (g.l0bChunks2 == 1)
                              ? (long long)cout2A * g.k2 * wBytes
-                             : (long long)b.nRun * b.t2.n * cout2A * g.k2 * wBytes;
+                             : (long long)b.nRun * b.conv2Tile.n * cout2A * g.k2 * wBytes;
             const long long mte1 = mte1Bytes / MTE1_BYTES_PER_CYC;
             // fm 进 L1。整宽走整块快路；切了列就是逐行，按**请求数**算。
             const long long fmBytes = (long long)b.xRows * b.wIn * g.p.ci * xBytes;
@@ -1377,29 +1377,29 @@ FC2D_GEOM_FN long long CoreCostCycles(const Geometry& g, int chunksPerCore)
                 mte2 += (long long)b.xRows * g.p.ci * MTE2_ROW_REQ_CYC;
             }
             // fixpipe：conv1 -> L1 连续；conv2 -> GM 每个输出通道一次写。
-            long long fix = (long long)b.m1 * cout1A * 4 / FIX_L1_BYTES_PER_CYC;
-            const long long gmReq = (long long)b.nRun * b.t2.n * cout2A;
+            long long fix = (long long)b.conv1MPerBand * cout1A * 4 / FIX_L1_BYTES_PER_CYC;
+            const long long gmReq = (long long)b.nRun * b.conv2Tile.n * cout2A;
             const long long gmBytes = (long long)b.nRun * b.mRun * cout2A * yBytes;
             fix += gmReq * FIX_GM_REQ_CYC_X2 / 2 + gmBytes / FIX_GM_BYTES_PER_CYC;
             // 滚动权重的重读也走 MTE2。次数 = 消费它的 M 子块数 —— 和上面 MTE1
-            // 里那个倍数是**同一条规则**（hc 循环嵌在 M 子块循环里面，见 impl.h 的
+            // 里那个倍数是**同一条规则**（l0bLoadChunkIdx 循环嵌在 M 子块循环里面，见 impl.h 的
             // w1SegTotal / w2SegTotal）。geom10 在函数末尾按「一刀切 x2」记，在
-            // t1.n == nRun * t2.n == 1 的形状上高估一倍：bb_Conv_179_Conv_184
+            // conv1Tile.n == nRun * conv2Tile.n == 1 的形状上高估一倍：bb_Conv_179_Conv_184
             // 预测 15.098us 对实测 8.647，bb_Conv_460_Conv_462 预测 12.916 对
             // 实测 6.964。21 个配对点上 MTE2 这一管的相对误差 RMS 从 29.9% 降到
             // 15.9%，而且**不改变任何一个形状的选择**。
             //
-            // 注意它不是一律降价：t1.n 或 nRun*t2.n > 2 时反而涨 —— 切列让 nRun
+            // 注意它不是一律降价：conv1Tile.n 或 nRun*conv2Tile.n > 2 时反而涨 —— 切列让 nRun
             // 变成 hb，这一笔正好加在切列那一侧，方向是对的。
             long long wRing = 0;
             if (g.w1Stage != 0) {
-                wRing += (long long)b.t1.n * cout1A * g.k1 * wBytes;
+                wRing += (long long)b.conv1Tile.n * cout1A * g.k1 * wBytes;
             }
             if (g.w2Stage != 0) {
-                wRing += (long long)b.nRun * b.t2.n * cout2A * g.k2 * wBytes;
+                wRing += (long long)b.nRun * b.conv2Tile.n * cout2A * g.k2 * wBytes;
             }
             mte2 += wRing / MTE2_BYTES_PER_CYC;
-            const long long scalar = (long long)(b.t1.n + b.nRun * b.t2.n) * SCALAR_TILE_CYC;
+            const long long scalar = (long long)(b.conv1Tile.n + b.nRun * b.conv2Tile.n) * SCALAR_TILE_CYC;
             if (cube > wCube) { wCube = cube; }
             if (mte1 > wMte1) { wMte1 = mte1; }
             if (mte2 > wMte2) { wMte2 = mte2; }
@@ -1417,8 +1417,7 @@ FC2D_GEOM_FN long long CoreCostCycles(const Geometry& g, int chunksPerCore)
     if (g.w2Stage == 0) {
         wtBytes += (long long)cout2A * g.k2 * wBytes;
     }
-    const long long cpc = chunksPerCore;
-    return cpc * (wCube + wMte1 + wMte2 + wFix + wScalar) +
+    return (long long)chunksPerCore * (wCube + wMte1 + wMte2 + wFix + wScalar) +
            wtBytes / MTE2_BYTES_PER_CYC + SCALAR_BASE_CYC;
 }
 
@@ -1482,7 +1481,7 @@ FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
         }
         const long long rounds = CeilDiv(probe.chunkTotal, aicNum);
         const long long cost = rounds * (long long)probe.midRows;
-        // **不滚动的候选一律优于滚动的。** 滚动要把权重从 GM 重读 t1.n 次（hc 循环
+        // **不滚动的候选一律优于滚动的。** 滚动要把权重从 GM 重读 conv1Tile.n 次（l0bLoadChunkIdx 循环
         // 嵌在 M 子块循环里面），代价和 midRows 不是一个量纲，硬塞进 cost 里会把
         // 现有形状的 hb 选择也搅动。分两级比较就干净了 —— 而且今天所有能过的形状
         // 都是不滚动的，所以这一段对它们逐字不变。
@@ -1553,8 +1552,8 @@ FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
                 continue;
             }
             const int bdCap = (aicNum < probe.chunkTotal) ? aicNum : probe.chunkTotal;
-            const int cpc = CeilDiv(probe.chunkTotal, bdCap);
-            const long long cost = CoreCostCycles(probe, cpc);
+            const int chunksPerCore = CeilDiv(probe.chunkTotal, bdCap);
+            const long long cost = CoreCostCycles(probe, chunksPerCore);
             const int stg = probe.w1Stage + probe.w2Stage;
             if (nw == 1) {
                 if (bn1[stg] < 0 || cost < bn1[stg]) {
@@ -1597,13 +1596,13 @@ FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
         }
         // ---- B1 近似并列带 --------------------------------------------------
         const long long cutoff = adminMin + adminMin / 50;   // 2%
-        // 带内按 (cpc 小, nw 小, hb 大) 裁决。
-        // **cpc 小优先**：模型里唯一剩下的结构性歧义 —— 常驻权重到底是每核读一次
-        // 还是每 chunk 读一次 —— 在 cpc 上单调，而现在取的是对高 cpc 有利的那一支
+        // 带内按 (chunksPerCore 小, nw 小, hb 大) 裁决。
+        // **chunksPerCore 小优先**：模型里唯一剩下的结构性歧义 —— 常驻权重到底是每核读一次
+        // 还是每 chunk 读一次 —— 在 chunksPerCore 上单调，而现在取的是对高 chunksPerCore 有利的那一支
         // （源码语义是每核一次，见上面 wtBytes 那一段）。L0B 权重重灌、scalar 前导、
-        // fixpipe 每指令地板、L0C 排空也都随 cpc 线性重复，方向一致。并列时取低
-        // cpc，等于选那个「在两种假设下都成立」的候选。
-        int keyCpc = 0, keyNw = 0, keyHb = 0;
+        // fixpipe 每指令地板、L0C 排空也都随 chunksPerCore 线性重复，方向一致。并列时取低
+        // chunksPerCore，等于选那个「在两种假设下都成立」的候选。
+        int keyChunksPerCore = 0, keyNw = 0, keyHb = 0;
         for (int hb = 1; hb <= ho2; ++hb) {
             if ((ho2 % hb) != 0) {
                 continue;
@@ -1619,15 +1618,15 @@ FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
                     continue;
                 }
                 const int bdCap = (aicNum < probe.chunkTotal) ? aicNum : probe.chunkTotal;
-                const int cpc = CeilDiv(probe.chunkTotal, bdCap);
-                if (CoreCostCycles(probe, cpc) > cutoff) {
+                const int chunksPerCore = CeilDiv(probe.chunkTotal, bdCap);
+                if (CoreCostCycles(probe, chunksPerCore) > cutoff) {
                     continue;
                 }
-                if (bestHb2 == 0 || cpc < keyCpc ||
-                    (cpc == keyCpc && (nw < keyNw || (nw == keyNw && hb > keyHb)))) {
+                if (bestHb2 == 0 || chunksPerCore < keyChunksPerCore ||
+                    (chunksPerCore == keyChunksPerCore && (nw < keyNw || (nw == keyNw && hb > keyHb)))) {
                     bestHb2 = hb;
                     bestNw = nw;
-                    keyCpc = cpc;
+                    keyChunksPerCore = chunksPerCore;
                     keyNw = nw;
                     keyHb = hb;
                 }
