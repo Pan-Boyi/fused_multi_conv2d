@@ -173,15 +173,6 @@ FC2D_GEOM_CE int MinI(int a, int b) { return a < b ? a : b; }
 FC2D_GEOM_CE int MaxI(int a, int b) { return a > b ? a : b; }
 FC2D_GEOM_CE int CeilDiv(int a, int b) { return (a + b - 1) / b; }
 FC2D_GEOM_CE int Align(int a, int m) { return (a + m - 1) / m * m; }
-FC2D_GEOM_CE int GcdI(int a, int b)
-{
-    while (b != 0) {
-        const int t = a % b;
-        a = b;
-        b = t;
-    }
-    return a;
-}
 
 // 两个 bias 段在 L1 里各占一段，长度按**真实的 bias 宽度**补齐到 512 的整数倍。
 // 写死 512 是错的：int8 通路的 bias 是 int32，cout=256 就要 1024 字节，写死之后
@@ -189,10 +180,6 @@ FC2D_GEOM_CE int GcdI(int a, int b)
 // fp16 通路的 bias 是 half，512 字节够 256 个通道，所以这个坑只有 int8 大通道
 // 才够得着。
 FC2D_GEOM_CE int BiasElemBytes(int elemBytes) { return elemBytes == 2 ? 2 : 4; }
-FC2D_GEOM_CE int BiasSegBytes(int cout, int elemBytes)
-{
-    return Align(cout * BiasElemBytes(elemBytes), L1_SEG_ALIGN);
-}
 
 // ---------------------------------------------------------------------------
 // 调用方给的东西。elemBytes 保留为 x 的元素宽度和旧三条同 dtype 通路的兼容入口；
@@ -354,7 +341,6 @@ enum Reject {
     RJ_ELEM_BYTES,     // elemBytes 只能是 1 或 2
     RJ_SHAPE_POSITIVE, // 有维度 <= 0
     RJ_CHANNEL_C0,     // ci 或 cout1 不是 C0 的整数倍
-    RJ_CHANNEL_16,     // cout1 不是 16 的整数倍（mid 要按 NC1HWC0 读）
     RJ_OUT_EMPTY,      // 卷出来是空的
     RJ_HB_DIVIDE,      // hb 不整除 ho2
     RJ_HB_GRAN,        // 【已不再产生】M 切到行内之后没有行粒度这回事了
@@ -383,7 +369,6 @@ FC2D_GEOM_FN const char* RejectText(int r)
         case RJ_ELEM_BYTES: return "elemBytes 只能是 1(int8) 或 2(fp16)";
         case RJ_SHAPE_POSITIVE: return "形状里有非正数";
         case RJ_CHANNEL_C0: return "ci 和 cout1 必须是 C0 的整数倍（C0 = 32/elemBytes）";
-        case RJ_CHANNEL_16: return "cout1 必须是 16 的整数倍（mid 要被 conv2 当 NC1HWC0 读）";
         case RJ_OUT_EMPTY: return "卷积输出为空（kernel 比补零后的输入还大）";
         case RJ_HB_DIVIDE: return "band 高度不整除 ho2";
         case RJ_HB_GRAN: return "band 高度不是 conv2 行粒度的整数倍（hb*wo2 要 16 对齐）";
@@ -433,7 +418,6 @@ struct Geometry {
     int l0bPP1, l0bPP2;              // 该层的段能不能 ping-pong（1=两个槽，0=单缓冲）
     int l0bSlot1Elems, l0bSlot2Elems;   // 一个槽的元素数；单缓冲时是 0（两个槽号同址）
 
-    int l0aSlotElems;    // 一个 L0A 槽的元素数（按 elemBytes）
     int l0bElems;        // L0B 要多少元素（两个卷积取大）
     int l0cElems;        // 共享 L0C 的元素数（int32）
     // L0C 两个槽的元素跨距。**0 表示单缓冲**（一个槽），此时指令流和双缓冲之前
@@ -1020,9 +1004,6 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
     // 到 GM，nSize 给多少写多少；L0B / L0C 那边用的是 align16(cout2)。上一版把它
     // 和 cout1 一起卡了 16，于是 cout2 = 2 这种（FRACTAL_Z 里补齐成 [.., 1, 16, C0]）
     // 直接被拒 —— 而 filter 的 shape 根本分不出 cout2 是 1 还是 16，得从 y 去取。
-    if ((p.cout1 % MMAD_M0) != 0) {
-        return RJ_CHANNEL_16;
-    }
     g.c1 = p.ci / g.weightC0;
     g.midC1 = p.cout1 / g.weightC0;
 
@@ -1169,7 +1150,6 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
     if (l0a1 > L0A_SLOT_BYTES || l0a2 > L0A_SLOT_BYTES) {
         return RJ_TILE_K;
     }
-    g.l0aSlotElems = L0A_SLOT_BYTES / MaxI(xBytes, midBytes);
 
     // 一段的字节数，以及该层在 L0B 里的总占用（ping-pong 时两个槽）。两层不同时
     // 在用 L0B（conv1 整个跑完才轮到 conv2），所以取大而不是求和。
@@ -1279,10 +1259,6 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
     }
     if (used < 0) {
         return RJ_L1;
-    }
-
-    if (p.cout1 > BT_SLOT_ELEMS || p.cout2 > BT_SLOT_ELEMS) {
-        return RJ_BT;
     }
 
     g.xPlane = p.ci * p.hi * p.wi;
