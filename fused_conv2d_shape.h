@@ -343,9 +343,7 @@ enum Reject {
     RJ_CHANNEL_C0,     // ci 或 cout1 不是 C0 的整数倍
     RJ_OUT_EMPTY,      // 卷出来是空的
     RJ_HB_DIVIDE,      // hb 不整除 ho2
-    RJ_HB_GRAN,        // 【已不再产生】M 切到行内之后没有行粒度这回事了
     RJ_MIDROWS,        // 一个 band 的 conv1 行数超过了 ho1
-    RJ_MID_GRAN,       // 【已不再产生】同上
     RJ_TILE_K,         // 找不到合法的 K 切分
     RJ_M_TILES,        // M 方向切出来的块数超过 MAX_M_TILES
     RJ_L0C,            // 一个 M 子块装不进 L0C
@@ -371,16 +369,14 @@ FC2D_GEOM_FN const char* RejectText(int r)
         case RJ_CHANNEL_C0: return "ci 和 cout1 必须是 C0 的整数倍（C0 = 32/elemBytes）";
         case RJ_OUT_EMPTY: return "卷积输出为空（kernel 比补零后的输入还大）";
         case RJ_HB_DIVIDE: return "band 高度不整除 ho2";
-        case RJ_HB_GRAN: return "band 高度不是 conv2 行粒度的整数倍（hb*wo2 要 16 对齐）";
         case RJ_MIDROWS: return "一个 band 需要的 conv1 行数超过了 ho1";
-        case RJ_MID_GRAN: return "某个 band 的 conv1 行数 * wo1 不是 16 的整数倍";
         case RJ_TILE_K: return "找不到既整除 K 又装得进 L0A 的 K 切分";
         case RJ_M_TILES: return "M 方向的块数超过 MAX_M_TILES";
         case RJ_L0C: return "一个 M 子块装不进 L0C";
         case RJ_L0B: return "权重按 K 折之后仍然装不进 L0B";
         case RJ_BT: return "bias 的通道数超过一个 BT 槽（512）";
         case RJ_L1: return "L1 装不下 fm + mid + w1 + w2";
-        case RJ_U16: return "指令字段只有 16 位：mid 的 M（midRows*wo1）或 staging 的位置数（xRows*wi）超过 65535";
+        case RJ_U16: return "指令字段只有 16 位：m1Max（min(midRows,ho1)*wSubMax）或 staging 的位置数（xRows*wInMax）超过 65535";
         case RJ_NO_HB: return "没有任何 band 高度能同时满足全部约束";
         case RJ_WSEG: return "列分段数不合法（必须在 1..wo2 之间）";
         default: return "未知";
@@ -425,7 +421,7 @@ struct Geometry {
     int l0cStride;
 
     // 权重在 L1 里的摆法。0 = 整套常驻（老行为），1 = 按 L0B 段滚动（两个槽）。
-    // 见 DeriveWith 里 PickWeightPlacement 那一段。
+    // 见 DeriveWith 里那个 modes[4] 的循环（全驻 / 只滚大的 / 只滚小的 / 都滚）。
     int w1Stage, w2Stage;
     // L1 常驻段，字节地址（每段 512 对齐）
     int fmElems, midElems, w1Elems, w2Elems;
@@ -876,14 +872,12 @@ FC2D_GEOM_FN void MakeBandLite(const FlatGeom& f, int band, int woSegIdx, BandLi
 // ---------------------------------------------------------------------------
 struct Band {
     int img;      // batch 里的第几张图
-    int band;     // 图内第几个 band
-    int woSegIdx;       // 图内第几个列段
     int aMid;     // 这个 band 的第一行 conv1 输出（全局行号）
     int midReal;  // 这个 band 真正算出来的 conv1 行数
     int padT2, padB2;
     int xRow0, xRows, padT1, padB1;
     int outRow0;  // 这个 chunk 的第一行 conv2 输出（图内行号）
-    int outCol0, outCols, midCol0, wSub, padL2, padR2, xCol0, wIn, padL1, padR1;
+    int outCol0, outCols, wSub, padL2, padR2, xCol0, wIn, padL1, padR1;
     int rowsPerRun, mRun, nRun;
     int conv1MPerBand;       // midReal * wSub
     TileTable conv1Tile; // conv1 的 M 分块
@@ -906,8 +900,6 @@ FC2D_GEOM_FN Band MakeBand(const Geometry& g, int chunk)
 
     Band b;
     b.img = img;
-    b.band = band;
-    b.woSegIdx = woSegIdx;
     b.aMid = lb.aMid;
     b.midReal = lb.midReal;
     b.padT2 = lb.padT2;
@@ -919,7 +911,6 @@ FC2D_GEOM_FN Band MakeBand(const Geometry& g, int chunk)
     b.outRow0 = lb.outRow0;
     b.outCol0 = lb.outCol0;
     b.outCols = lb.outCols;
-    b.midCol0 = lb.midCol0;
     b.wSub = lb.wSub;
     b.padL2 = lb.padL2;
     b.padR2 = lb.padR2;
@@ -1461,7 +1452,7 @@ FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
     }
 
     // ---- 第一趟：不切列。这一趟和加 W 分核之前**逐字相同** ------------------
-    // 报哪一条拒绝原因是有讲究的：整除性（RJ_HB_DIVIDE / RJ_HB_GRAN）对绝大多数候选
+    // 报哪一条拒绝原因是有讲究的：整除性（RJ_HB_DIVIDE）对绝大多数候选
     // hb 都成立，报它等于什么也没说。留住第一条**别的**原因 —— 那才是这个形状真正
     // 卡在哪里。一条都没有就说「没有任何 band 高度成立」。
     int bestHb = 0;
@@ -1474,7 +1465,7 @@ FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
         }
         const int rc = DeriveWith(p, hb, 1, l1Budget, probe);
         if (rc != RJ_OK) {
-            if (firstReal == RJ_NO_HB && rc != RJ_HB_DIVIDE && rc != RJ_HB_GRAN) {
+            if (firstReal == RJ_NO_HB && rc != RJ_HB_DIVIDE) {
                 firstReal = rc;
             }
             continue;
@@ -1545,7 +1536,7 @@ FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
         for (int nw = 1; nw <= nwMax; ++nw) {
             const int rc = DeriveWith(p, hb, nw, l1Budget, probe);
             if (rc != RJ_OK) {
-                if (firstReal == RJ_NO_HB && rc != RJ_HB_DIVIDE && rc != RJ_HB_GRAN &&
+                if (firstReal == RJ_NO_HB && rc != RJ_HB_DIVIDE &&
                     rc != RJ_WSEG) {
                     firstReal = rc;
                 }
