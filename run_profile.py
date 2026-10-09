@@ -81,15 +81,6 @@ import json
 import os
 import shlex
 
-# cann_env 没配时，远端按这个顺序找 set_env.sh。板子上经常只装 nnrt 或 nnae
-# 而不是完整 toolkit，所以三种目录名都要试。
-FC2D_CANN_ENV_CANDIDATES = (
-    "$HOME/Ascend/ascend-toolkit/set_env.sh",
-    "/usr/local/Ascend/ascend-toolkit/set_env.sh",
-    "/usr/local/Ascend/nnae/set_env.sh",
-    "/usr/local/Ascend/nnrt/set_env.sh",
-    "/usr/local/Ascend/set_env.sh",
-)
 import shutil
 import subprocess
 import sys
@@ -100,9 +91,34 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 ALL_STEPS = ["check", "case", "om", "push", "prof", "pull", "export", "parse"]
 
-# --aclnn：走 aclnn 两段式下发而不是 aclopExecuteV2 + .om。
-# aclnn 不需要离线模型（kernel 是 nnopbase 按 OpType 从**算子包**里找的），
-# 所以这个开关一开，om 这一步整步跳过，push 改传 aclnn_launch.py。
+# ---------------------------------------------------------------- 本地 / 远端分工
+#
+# **编译在本地，执行在远端。这是这套 harness 的根本不变量，不要破坏它。**
+#
+#   本地（有 CANN toolkit，没有 NPU）     远端板子（有 MC62，没有 toolkit）
+#   ----------------------------------    ------------------------------------
+#   atc 编 .om                            加载 .om 执行
+#   gen_case 造输入 + golden               读 case.bin，回传实测
+#   libnnopbase / 算子包 / opbuild         只有 libascendcl + runtime + driver
+#
+# **.om 是自包含的** —— atc --singleop 把 kernel 二进制编进去了，所以它能在一台
+# 完全没装 toolkit 的板子上跑。这正是整条链路成立的原因。
+#
+# --aclnn 违反了这个不变量，所以它**不能用于远端执行**：aclnn 是运行时 API，
+# kernel 是 nnopbase 在**执行那一侧**按 OpType 从已装算子包里找的，它需要
+# 执行机上有 libnnopbase.so + 带 FusedConv2d 的算子包。板子上两样都没有。
+# 2026-10-09 实测的环境分布（这是结构性的，不是配置缺失）：
+#   ubuntu2404-arm : toolkit 有（atc、libnnopbase 4.4MB）/ NPU **没有**
+#                    （无 /usr/local/Ascend/driver、无 /dev/davinci*、无 npu-smi）
+#   板子           : NPU 有（嵌入式 MC62）/ toolkit **没有**
+# 没有任何一台机器同时有两者 ⇒ aclnn 在本项目里哪儿都跑不起来。
+# 所以 --aclnn 在这里**直接拒掉**，而不是推到板上再报一个找不到库的错。
+# aclnn_launch.py 本身保留（本地绑定/签名都验过了），等真有一台 toolkit+NPU
+# 的机器时它是现成的。
+#
+# DYNAMIC 输入要上板验证，就必须让产物仍然是**本地编出来的 .om**。而
+# atc --singleop 的 json 表达不了实例数 > 1 的 DYNAMIC（已实测），所以这条
+# 需要另找产出 .om 的办法，不是把执行侧换成 aclnn 就能绕过去的。
 # 为什么要这条路见 aclnn_launch.py 顶上的注释（atc --singleop 的 json 表达不了
 # 实例数 > 1 的 DYNAMIC 输入，而那是扩展到更多层卷积融合的前提）。
 ACLNN = False
@@ -350,31 +366,6 @@ def remote_script(rt, case_name, om_name, use_msprof, msprof):
             "if [ -f %s ]; then source %s >/dev/null 2>&1; "
             "else echo '[REMOTE ERROR] 找不到 %s' >&2; exit 1; fi"
             % (shlex.quote(rt.cann_env), shlex.quote(rt.cann_env), rt.cann_env),
-        ]
-    else:
-        # cann_env 没配时**尽力**自动 source 一个 set_env.sh。
-        # 为什么需要：`ssh host 'cmd'` 是非交互 shell，远端不一定读到
-        # ~/.bashrc 里的 set_env.sh，于是 ASCEND_HOME_PATH / LD_LIBRARY_PATH
-        # 都是空的。singleop 那条路能活下来是因为它只要 libascendcl（acl 模块
-        # 自己带 rpath），但 aclnn 要 libnnopbase.so，没有 LD_LIBRARY_PATH
-        # 就会报 `cannot open shared object file`。
-        # 这里是**best-effort**：找到就 source、找不到就继续往下走（不像
-        # cann_env 显式配了那样 exit 1），并且把结果打到 stderr —— 板子的
-        # 真实布局就是靠这一行回传的。
-        # **不能用 shlex.quote**：它加的是单引号，远端 $HOME 就不展开了，
-        # 那条候选会永远「找不到」而且毫无提示（一个不存在的候选本来就是静默
-        # 跳过的）。实测：在明明有 $HOME/Ascend/ascend-toolkit/set_env.sh 的机器上
-        # 仍然打「没找到」。这些路径是本文件里写死的常量、不是用户输入，
-        # 所以用双引号，让 $HOME 正常展开。
-        cands = " ".join('"%s"' % c for c in FC2D_CANN_ENV_CANDIDATES)
-        lines += [
-            "for _e in %s; do" % cands,
-            "  if [ -f \"$_e\" ]; then source \"$_e\" >/dev/null 2>&1; "
-            "echo \"[REMOTE] source $_e\" >&2; break; fi",
-            "done",
-            "[ -n \"${ASCEND_HOME_PATH:-}\" ] || echo "
-            "'[REMOTE] 警告: 没找到 set_env.sh，ASCEND_HOME_PATH 为空。"
-            "aclnn 路径需要它；在 profile.json 的 remote.cann_env 里配绝对路径' >&2",
         ]
     need = ["case.bin", "run_fused_conv2d.py"]
     need += ["aclnn_launch.py"] if ACLNN else [shlex.quote(om_name)]
@@ -647,6 +638,20 @@ def main():
     args = ap.parse_args()
     global ACLNN
     ACLNN = args.aclnn
+    if ACLNN:
+        # run_profile.py 永远是远端执行（没有本地执行模式），而 aclnn 需要
+        # 执行机上有 toolkit。与其推上去再失败，在这里就说清楚。
+        die("--aclnn 不能用于远端执行。\n"
+            "        这套 harness 的不变量是「编译在本地，执行在远端」：\n"
+            "        atc --singleop 编出的 .om 是**自包含的**（kernel 二进制编在里面），\n"
+            "        所以能在没装 toolkit 的板子上跑。\n"
+            "        aclnn 相反 —— 它是运行时 API，kernel 由 libnnopbase 在**执行那一侧**\n"
+            "        按 OpType 从已装算子包里找。板子上既没有 libnnopbase.so，\n"
+            "        也没有带 FusedConv2d 的算子包，而开发机有 toolkit 却没有 NPU。\n"
+            "        没有一台机器同时具备两者，所以这条路在本项目里不可用。\n"
+            "        想验 DYNAMIC 的话，产物必须仍然是本地编出来的 .om；\n"
+            "        而 atc --singleop 表达不了实例数 > 1 的 DYNAMIC（已实测），\n"
+            "        这一条是真正要解决的问题。见本文件顶部「本地 / 远端分工」。")
 
     doc, remote_cfg, prof_cfg, cases = load_config(args.config)
     if args.cases:

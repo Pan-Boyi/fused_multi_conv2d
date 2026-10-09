@@ -1,5 +1,32 @@
 """aclnn（两段式）下发路径 —— FusedConv2d
 
+⚠️ **这个模块目前在本项目里用不上，原因是环境而不是代码。** 2026-10-09 实测：
+
+    ubuntu2404-arm : CANN toolkit 有（atc、libnnopbase 4.4MB）/ NPU **没有**
+                     （无 /usr/local/Ascend/driver、无 /dev/davinci*、无 npu-smi）
+    板子 MC62      : NPU 有（嵌入式）/ CANN toolkit **没有**
+
+aclnn 是**运行时** API：kernel 由 libnnopbase 在**执行那一侧**按 OpType 从已装
+算子包里找。所以它要求执行机同时有 NPU 和 toolkit（libnnopbase + 算子包）。
+这里没有任何一台机器同时具备 ⇒ 哪儿都跑不起来。这是结构性的，不是配置缺失，
+也不是之前担心的「libnnopbase 不认 mc62」（那条已经证伪：libopapi.so 里有 5 处
+含 mc62 的 socNameList 和真符号并列，闸门是 NnopbaseCheckCurrentSocMatch 的
+字符串比对而不是枚举表）。
+
+对比之所以能跑的那条路：**atc --singleop 编出的 .om 是自包含的** —— kernel
+二进制编在里面，所以它能在一台完全没装 toolkit 的板子上执行。整套 harness 的
+不变量就是「编译在本地，执行在远端」，aclnn 破坏了它。run_profile.py 因此
+在远端模式下直接拒掉 --aclnn，不会再把本模块推到板上。
+
+代码本身是对的、本地验过（符号绑定、argtypes、aclCreateIntArray 真实调用、
+双 flavor 的 opapi 符号探测、libnnopbase 多路发现）。等真有一台 toolkit+NPU
+的机器，它是现成的。仓里 DYNAMIC 算子的标准自验方式也是在这种机器上做的：
+`examples/test_aclnn_<op>.cpp` + `build.sh --run_example <op> eager`，
+g++ 显式 `-lascendcl -lnnopbase`（build.sh:1568/1574）—— 所以那 82 个算子
+从来不会撞到 libnnopbase 找不到的问题，它们根本不在裸板上跑。
+
+---- 以下是原始设计说明，仍然有效 ----
+
 **为什么需要这条路。** `atc --singleop` 的 json **表达不了实例数 > 1 的 DYNAMIC 输入**
 （2026-10-09 实测，见下）。要把 filter / bias 做成 list（为了以后扩展到更多层卷积融合），
 就必须走 aclnn —— 那一侧有 `aclCreateTensorList`。这个模块是那条路的下发实现。
