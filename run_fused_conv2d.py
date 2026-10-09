@@ -767,9 +767,14 @@ def main():
     if use_aclnn:
         argv = [a for a in argv if a != "--aclnn"]
     opapi_so = None
+    nnopbase_so = None
     for _a in list(argv):
         if _a.startswith("--opapi-so="):
             opapi_so = _a.split("=", 1)[1]
+        elif _a.startswith("--nnopbase-so="):
+            # 板上环境没 source set_env.sh 时的手动兜底：直接把 libnnopbase.so
+            # 的绝对路径指过来，绕开所有自动探测。
+            nnopbase_so = _a.split("=", 1)[1]
             argv.remove(_a)
     case_path, op_type, device_id, om_arg = "fused_conv2d_case.bin", "FusedConv2d", 0, None
     positional = []
@@ -1075,7 +1080,8 @@ def main():
             # 生成的那份重名冲突（实测 ld 报 multiple definition）。
             import aclnn_launch
             try:
-                aclnn = aclnn_launch.AclnnLauncher(acl, opapi_so=opapi_so)
+                aclnn = aclnn_launch.AclnnLauncher(
+                    acl, nnopbase_so=nnopbase_so, opapi_so=opapi_so)
             except aclnn_launch.AclnnUnavailable as e:
                 die("aclnn 路径起不来:\n        %s" % e)
             print("  [aclnn] nnopbase: %s" % aclnn.nnopbase_path)

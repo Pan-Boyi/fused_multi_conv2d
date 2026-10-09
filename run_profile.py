@@ -80,6 +80,16 @@ import csv
 import json
 import os
 import shlex
+
+# cann_env 没配时，远端按这个顺序找 set_env.sh。板子上经常只装 nnrt 或 nnae
+# 而不是完整 toolkit，所以三种目录名都要试。
+FC2D_CANN_ENV_CANDIDATES = (
+    "$HOME/Ascend/ascend-toolkit/set_env.sh",
+    "/usr/local/Ascend/ascend-toolkit/set_env.sh",
+    "/usr/local/Ascend/nnae/set_env.sh",
+    "/usr/local/Ascend/nnrt/set_env.sh",
+    "/usr/local/Ascend/set_env.sh",
+)
 import shutil
 import subprocess
 import sys
@@ -119,7 +129,7 @@ REMOTE_DEFAULTS = {
     # 就会在开工之前直接说清楚缺什么。
     "auth": "auto",
     "dir": "",                 # 远端工作目录，脚本会在下面建 fc2d_run/<name>/
-    "cann_env": "",            # 远端要 source 的 set_env.sh，空 = 不 source
+    "cann_env": "",            # 远端要 source 的 set_env.sh；空 = 按下面的清单自动找
     "device": 0,
     "repeat": 10,              # run_fused_conv2d.py 的 REPEAT，计时用
     "warmup": 0,
@@ -340,6 +350,31 @@ def remote_script(rt, case_name, om_name, use_msprof, msprof):
             "if [ -f %s ]; then source %s >/dev/null 2>&1; "
             "else echo '[REMOTE ERROR] 找不到 %s' >&2; exit 1; fi"
             % (shlex.quote(rt.cann_env), shlex.quote(rt.cann_env), rt.cann_env),
+        ]
+    else:
+        # cann_env 没配时**尽力**自动 source 一个 set_env.sh。
+        # 为什么需要：`ssh host 'cmd'` 是非交互 shell，远端不一定读到
+        # ~/.bashrc 里的 set_env.sh，于是 ASCEND_HOME_PATH / LD_LIBRARY_PATH
+        # 都是空的。singleop 那条路能活下来是因为它只要 libascendcl（acl 模块
+        # 自己带 rpath），但 aclnn 要 libnnopbase.so，没有 LD_LIBRARY_PATH
+        # 就会报 `cannot open shared object file`。
+        # 这里是**best-effort**：找到就 source、找不到就继续往下走（不像
+        # cann_env 显式配了那样 exit 1），并且把结果打到 stderr —— 板子的
+        # 真实布局就是靠这一行回传的。
+        # **不能用 shlex.quote**：它加的是单引号，远端 $HOME 就不展开了，
+        # 那条候选会永远「找不到」而且毫无提示（一个不存在的候选本来就是静默
+        # 跳过的）。实测：在明明有 $HOME/Ascend/ascend-toolkit/set_env.sh 的机器上
+        # 仍然打「没找到」。这些路径是本文件里写死的常量、不是用户输入，
+        # 所以用双引号，让 $HOME 正常展开。
+        cands = " ".join('"%s"' % c for c in FC2D_CANN_ENV_CANDIDATES)
+        lines += [
+            "for _e in %s; do" % cands,
+            "  if [ -f \"$_e\" ]; then source \"$_e\" >/dev/null 2>&1; "
+            "echo \"[REMOTE] source $_e\" >&2; break; fi",
+            "done",
+            "[ -n \"${ASCEND_HOME_PATH:-}\" ] || echo "
+            "'[REMOTE] 警告: 没找到 set_env.sh，ASCEND_HOME_PATH 为空。"
+            "aclnn 路径需要它；在 profile.json 的 remote.cann_env 里配绝对路径' >&2",
         ]
     need = ["case.bin", "run_fused_conv2d.py"]
     need += ["aclnn_launch.py"] if ACLNN else [shlex.quote(om_name)]

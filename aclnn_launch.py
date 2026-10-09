@@ -81,6 +81,7 @@ PR 门禁（scripts/ci/check_pkg.sh:102 `build.sh --pkg --vendor_name=$n --ops=$
 """
 
 import ctypes
+import io
 import os
 
 ACL_SUCCESS = 0
@@ -100,6 +101,21 @@ SOFT_DEP_SO_NAMES = ("libgraph.so", "libascendalog.so", "libalog.so")
 # aclCreateTensor / aclCreateTensorList / aclCreateIntArray 都在这里，
 # **libascendcl.so 里一个都没有**（nm -D 实测：libascendcl=0 libnnopbase=1）。
 NNOPBASE_SO_NAME = "libnnopbase.so"
+# 校验候选 libnnopbase 用的符号。只验「文件在不在」是不够的：
+# <root>/<arch>-linux/devlib/ 下那个 libnnopbase.so 只有 329KB（device 侧 stub，
+# 对比 lib64 里的 4.4MB），而 simulator/*/lib 下有 libascendcl 却根本没有
+# libnnopbase —— 从 libascendcl 反推目录时正好会撞上这两种。
+NNOPBASE_PROBE_SYMBOLS = ("aclCreateTensor", "aclCreateTensorList", "aclCreateIntArray")
+# 板子上常见的 CANN 安装根。注意**不只是 ascend-toolkit**：推理板经常只装
+# nnrt（运行时）或 nnae，目录名不一样，之前只认 ASCEND_HOME_PATH 就会全军覆没。
+FALLBACK_CANN_ROOTS = (
+    "/usr/local/Ascend/ascend-toolkit/latest",
+    "/usr/local/Ascend/nnrt/latest",
+    "/usr/local/Ascend/nnae/latest",
+    "~/Ascend/ascend-toolkit/latest",
+    "~/Ascend/nnrt/latest",
+    "~/Ascend/nnae/latest",
+)
 
 
 class AclnnUnavailable(RuntimeError):
@@ -113,23 +129,224 @@ def _die(msg):
     raise AclnnUnavailable(msg)
 
 
+def _reject_explicit(flag, path, why):
+    """显式指定的库被判不可用时，当场失败，**不要**回退到别的候选。
+
+    回退会让 --nnopbase-so / --opapi-so 变成一个静默无效的开关：跑是跑过了，
+    但用的不是你指的那个库，而且什么提示都没有。实测踩过一次
+    （--nnopbase-so 指到 devlib 的 329KB stub，被符号校验拒掉后它悄悄
+    换用了 lib64 里那个，结果看起来一切正常）。
+    """
+    _die("%s 指定的库不可用，已停止（不会回退到其他候选 —— 那会让你的\n"
+         "        指定静默失效）。\n"
+         "        %s\n"
+         "        原因: %s\n"
+         "        要么修掉这个路径，要么去掉 %s 让它自动探测。"
+         % (flag, path, why, flag))
+
+
 # ---------------------------------------------------------------- 找库
-def find_nnopbase_so(explicit=None):
-    if explicit:
-        if not os.path.isfile(explicit):
-            _die("--nnopbase-so 指的文件不存在: %s" % explicit)
-        return explicit
-    roots = []
-    for env in ("ASCEND_HOME_PATH", "ASCEND_TOOLKIT_HOME"):
-        v = os.environ.get(env, "")
-        if v:
-            roots.append(v)
-    cands = [os.path.join(r, "lib64", NNOPBASE_SO_NAME) for r in roots]
-    cands.append(NNOPBASE_SO_NAME)   # 交给 ld.so 按 LD_LIBRARY_PATH 找
+def _libdirs_from_loaded_libascendcl():
+    """从本进程已映射的 libascendcl.so 反推 CANN 的库目录。
+
+    **这是最可靠的一条线索，而且不需要任何环境变量。** 走到这里时
+    run_fused_conv2d.py 已经 `import acl` 并且 acl.init() / set_device 成功了，
+    所以 libascendcl.so 必然已经在 /proc/self/maps 里 —— 不管它是靠
+    LD_LIBRARY_PATH、rpath 还是别的什么找到的。libnnopbase.so 在正常安装里就躺在
+    它旁边（实测 <root>/aarch64-linux/lib64/ 下两个都在）。
+
+    但**不能直接信**：simulator/Kirin*/lib 下有 libascendcl 却没有 libnnopbase，
+    devlib 下那个 libnnopbase 是 329KB 的 device 侧 stub。所以这里只负责产出候选，
+    是否可用由 open_nnopbase_so 按符号校验。
+    """
+    dirs = []
+    try:
+        with io.open("/proc/self/maps", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                i = line.find("/")
+                if i < 0:
+                    continue
+                path = line[i:].strip()
+                base = os.path.basename(path)
+                if base.startswith("libascendcl.so") or base.startswith("libacl_op"):
+                    d = os.path.dirname(path)
+                    if d and d not in dirs:
+                        dirs.append(d)
+    except (IOError, OSError):
+        pass
+    return dirs
+
+
+def _libdirs_from_acl_module():
+    """从 acl.so 这个 python 扩展的位置反推安装根。
+
+    acl.so 住在 <root>/python/site-packages/acl.so（实测），所以往上三层就是 root。
+    这条在 acl.init() 之前也成立，和上面那条是互补的。
+    """
+    dirs = []
+    try:
+        import acl as _acl
+        p = getattr(_acl, "__file__", "") or ""
+    except Exception:
+        p = ""
+    if p:
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(p))))
+        for d in _arch_libdirs(root):
+            if d not in dirs:
+                dirs.append(d)
+    return dirs
+
+
+def _arch_libdirs(root):
+    """一个 CANN 安装根下所有可能放 .so 的目录。
+
+    装好的 toolkit 里 lib64 通常是指向 <arch>-linux/lib64 的 symlink，但不保证
+    （裁剪过的安装、手工拷出来的目录都见过），所以两种都列。
+    """
+    out = [os.path.join(root, "lib64")]
+    for arch in ("aarch64-linux", "x86_64-linux"):
+        out.append(os.path.join(root, arch, "lib64"))
+    return out
+
+
+def _nnopbase_candidates(explicit=None):
+    """按优先级列出所有可能的 libnnopbase.so 路径。"""
+    cands = []
+
+    def add(p):
+        if p and p not in cands:
+            cands.append(p)
+
+    # -- 0. 显式指定
+    add(explicit)
+    add(os.environ.get("FC2D_NNOPBASE_SO", ""))
+
+    # -- 1. 从已加载的 libascendcl 反推（不依赖环境变量，最可靠）
+    for d in _libdirs_from_loaded_libascendcl():
+        add(os.path.join(d, NNOPBASE_SO_NAME))
+    # -- 2. 从 acl.so 的位置反推
+    for d in _libdirs_from_acl_module():
+        add(os.path.join(d, NNOPBASE_SO_NAME))
+
+    # -- 3. 环境变量指出的安装根
+    for env in ("ASCEND_HOME_PATH", "ASCEND_TOOLKIT_HOME", "ASCEND_AICPU_PATH"):
+        root = os.environ.get(env, "")
+        if root:
+            for d in _arch_libdirs(root):
+                add(os.path.join(d, NNOPBASE_SO_NAME))
+    # ASCEND_OPP_PATH 指到 <root>/opp，往上一层才是 root
+    opp = os.environ.get("ASCEND_OPP_PATH", "")
+    if opp:
+        for d in _arch_libdirs(os.path.dirname(opp.rstrip("/"))):
+            add(os.path.join(d, NNOPBASE_SO_NAME))
+
+    # -- 4. LD_LIBRARY_PATH 逐项
+    for d in os.environ.get("LD_LIBRARY_PATH", "").split(":"):
+        if d:
+            add(os.path.join(d, NNOPBASE_SO_NAME))
+
+    # -- 5. 兜底安装根（板子常见布局，含只装运行时的 nnrt / nnae）
+    for root in FALLBACK_CANN_ROOTS:
+        for d in _arch_libdirs(os.path.expanduser(root)):
+            add(os.path.join(d, NNOPBASE_SO_NAME))
+
+    # -- 6. 最后交给 ld.so
+    add(NNOPBASE_SO_NAME)
+    return cands
+
+
+def open_nnopbase_so(explicit=None):
+    """找到并加载 libnnopbase.so，返回 (path, CDLL handle)。
+
+    和 open_opapi_so 同一个路子：**按符号校验，不只看文件在不在**。
+    RTLD_GLOBAL 是必须的 —— autogen 的 aclnn_fused_conv2d.cpp 里那一堆 Nnopbase*
+    是 extern 符号，要靠全局符号表解析；而且 open_opapi_so 探测候选 opapi 库时
+    也依赖它们已经在全局表里。
+
+    **绝不让裸 OSError 逃出去。** 之前就是 dlopen 失败直接抛 OSError，
+    错误信息里只有一个库名，分不清是「环境没设所以压根没去真目录找」还是
+    「环境设了但这个安装没有这个库」。
+    """
+    if explicit and not os.path.isfile(explicit):
+        _die("--nnopbase-so 指的文件不存在: %s" % explicit)
+
+    cands = _nnopbase_candidates(explicit)
+    rejected = []
     for c in cands:
-        if c == NNOPBASE_SO_NAME or os.path.isfile(c):
-            return c
-    _die("找不到 %s。先 source CANN 的 set_env.sh。" % NNOPBASE_SO_NAME)
+        is_explicit = bool(explicit) and c == explicit
+        bare = os.sep not in c
+        if not bare and not os.path.isfile(c):
+            if is_explicit:
+                _reject_explicit("--nnopbase-so", c, "文件不存在")
+            rejected.append((c, "文件不存在"))
+            continue
+        try:
+            h = ctypes.CDLL(c, mode=ctypes.RTLD_GLOBAL)
+        except OSError as e:
+            why = "dlopen 失败: %s" % e
+            if is_explicit:
+                _reject_explicit("--nnopbase-so", c, why)
+            rejected.append((c, why))
+            continue
+        missing = [s for s in NNOPBASE_PROBE_SYMBOLS if getattr(h, s, None) is None]
+        if missing:
+            why = ("加载成功但缺符号: %s（device 侧 stub？）"
+                   % ", ".join(missing))
+            if is_explicit:
+                _reject_explicit("--nnopbase-so", c, why)
+            rejected.append((c, why))
+            continue
+        return c, h
+
+    # 把现场状态全部摊开 —— 板子连不上时，这段输出就是唯一的诊断材料。
+    env_dump = []
+    for k in ("ASCEND_HOME_PATH", "ASCEND_TOOLKIT_HOME", "ASCEND_OPP_PATH",
+              "ASCEND_AICPU_PATH", "LD_LIBRARY_PATH", "PYTHONPATH"):
+        env_dump.append("%s=%s" % (k, os.environ.get(k, "(未设)")))
+    cl_dirs = _libdirs_from_loaded_libascendcl() or ["(/proc/self/maps 里没找到)"]
+
+    # 按「探测记录」里实际出现的失败形态给结论，而不是笼统列一堆可能性。
+    # 这三种的处置完全不同，混在一起说等于没说。
+    dep_missing = [(p, why) for p, why in rejected
+                   if "cannot open shared object" in why and os.sep in p]
+    sym_missing = [(p, why) for p, why in rejected if "缺符号" in why]
+    if dep_missing:
+        diag = (
+            "        → **文件找到了，是它自己的依赖解析不了**（LD_LIBRARY_PATH 没设）。\n"
+            "          2026-10-09 实测：libnnopbase 的依赖闭包是\n"
+            "          libexe_graph → liberror_manager → libacl_rt → libascend_dump →\n"
+            "          libruntime → libruntime_common → libascend_trace → libascend_hal，\n"
+            "          而最后那个 **libascend_hal.so 根本不在 toolkit 里，属于 driver**\n"
+            "          （set_env.sh 会把 /usr/local/Ascend/driver/lib64{,/common,/driver}\n"
+            "          加进 LD_LIBRARY_PATH）。所以**手工指绝对路径没用**，\n"
+            "          FC2D_NNOPBASE_SO 也救不了 —— 必须 source set_env.sh。\n"
+            "          远端跑的话：profile.json 的 remote.cann_env 填板上 set_env.sh 的\n"
+            "          绝对路径（留空时 harness 会按标准路径自动找，但找不到就只能靠你配）。\n"
+            "          本地跑的话：先 source <CANN>/set_env.sh 再执行。\n")
+    elif sym_missing:
+        diag = (
+            "        → **撞上了 device 侧 stub 或 simulator 目录**：库能加载但缺符号。\n"
+            "          <root>/<arch>-linux/devlib/ 下那个只有 329KB（lib64 里的是 4.4MB），\n"
+            "          simulator/*/lib 下有 libascendcl 却没有 libnnopbase。\n"
+            "          换一个安装根，或用 --nnopbase-so 指到 lib64 里那个。\n")
+    else:
+        diag = (
+            "        → **一个候选都没落地**：CANN 环境没 source，而且标准路径下也没有。\n"
+            "          先确认这台机器/板子上到底装没装 CANN，再 source 它的 set_env.sh。\n"
+            "          远端：profile.json 的 remote.cann_env 填 set_env.sh 绝对路径。\n")
+
+    _die("找不到可用的 %s。\n"
+         "        aclnn 这条路**必须**有它 —— aclCreateTensor / aclCreateTensorList /\n"
+         "        aclCreateIntArray 都只在它里面，libascendcl.so 里一个都没有\n"
+         "        （nm -D 实测）。singleop 那条路不需要，所以之前一直没暴露。\n"
+         "%s"
+         "        已加载的 libascendcl.so 所在目录（最可能的正解就在这里）:\n          %s\n"
+         "        当前环境:\n          %s\n"
+         "        探测记录（候选 → 淘汰原因）:\n          %s"
+         % (NNOPBASE_SO_NAME, diag,
+            "\n          ".join(cl_dirs),
+            "\n          ".join(env_dump),
+            "\n          ".join("%s  →  %s" % (p, why) for p, why in rejected) or "(无候选)"))
 
 
 def _preload_soft_deps():
@@ -227,17 +444,26 @@ def open_opapi_so(explicit=None, vendor=None):
     cands = _opapi_candidates(explicit, vendor)
     rejected = []
     for c in cands:
+        is_explicit = bool(explicit) and c == explicit
         bare = os.sep not in c
         if not bare and not os.path.isfile(c):
+            if is_explicit:
+                _reject_explicit("--opapi-so", c, "文件不存在")
             rejected.append((c, "文件不存在"))
             continue
         try:
             h = ctypes.CDLL(c, mode=ctypes.RTLD_GLOBAL)
         except OSError as e:
-            rejected.append((c, "dlopen 失败: %s" % e))
+            why = "dlopen 失败: %s" % e
+            if is_explicit:
+                _reject_explicit("--opapi-so", c, why)
+            rejected.append((c, why))
             continue
         if getattr(h, PROBE_SYMBOL, None) is None:
-            rejected.append((c, "加载成功但没有 %s 符号" % PROBE_SYMBOL))
+            why = "加载成功但没有 %s 符号" % PROBE_SYMBOL
+            if is_explicit:
+                _reject_explicit("--opapi-so", c, why)
+            rejected.append((c, why))
             continue
         return c, h
 
@@ -292,12 +518,9 @@ class AclnnLauncher:
 
     def __init__(self, acl, nnopbase_so=None, opapi_so=None, vendor=None):
         self.acl = acl
-        self.nnopbase_path = find_nnopbase_so(nnopbase_so)
-        # RTLD_GLOBAL：生成的 aclnn_fused_conv2d.cpp 里那一堆 Nnopbase* 符号是
-        # extern 的，要靠全局符号表从 libnnopbase 解析。
         # **必须先加载 nnopbase**：open_opapi_so 是靠真的 dlopen 候选库来探测符号的，
         # nnopbase 不在全局表里时那些候选会以 undefined symbol 失败、被误判成不可用。
-        self.nnop = ctypes.CDLL(self.nnopbase_path, mode=ctypes.RTLD_GLOBAL)
+        self.nnopbase_path, self.nnop = open_nnopbase_so(nnopbase_so)
         self.opapi_path, self.opapi = open_opapi_so(opapi_so, vendor)
         self._bind()
         self._tensors = []
