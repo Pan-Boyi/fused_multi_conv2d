@@ -37,12 +37,47 @@
     aclopAttr + aclopSetAttrInt/Bool/ListInt   属性就是函数参数（int64 / bool / aclIntArray*）
     缺席的 optional 传 UNDEFINED desc 占位     缺席的 optional **直接传 nullptr**
     符号在 libascendcl.so                      张量构造在 libnnopbase.so，
-                                               两段式接口在算子包的 libcust_opapi.so
+                                               两段式接口在 opapi 库里（哪一个见下）
 
 **不需要 .om 是实际的简化**：走 aclnn 时 fc2d.py 的 `om` 步骤整步可以跳过，连带
 singleop.json 的生成、以及「属性值必须和 .om 完全一致否则报 100024」那一整类坑都不存在
 —— aclnn 是按符号直接调的，不做签名匹配。**代价**是 aclnn 没有「板上没装算子包也能靠
 .om 跑」这条退路：板子上必须装好带 FusedConv2d 的 mc62 算子包。
+
+**两段式接口落在哪个 so，取决于用什么命令编，不取决于算子将来归属哪个库。**
+同一份 autogen 源码只因为一个 cmake 开关 `ENABLE_CUSTOM`（ops-nn 的
+CMakeLists.txt:55 `option(ENABLE_CUSTOM ... OFF)`，**默认 OFF = 内置**）分叉：
+
+    ENABLE_CUSTOM=OFF（内置，默认）           ENABLE_CUSTOM=ON（vendor 自定义包）
+    --------------------------------------    ----------------------------------------
+    gen_norm_symbol() → target opapi_nn       gen_cust_symbol() → target cust_opapi
+    libopapi_nn.so                            libcust_opapi.so
+    <arch>-linux/lib64/                       vendors/<name>_nn/op_api/lib/
+    bash build.sh --opapi -f <改动清单>       bash build.sh --pkg --ops=fused_conv2d
+
+`--ops=` 会**无条件**把开关拨到 vendor 侧（build.sh:865-867 的 `ops=*)` 分支里直接
+`ENABLE_CUSTOM=TRUE`），而 `-f` 走的 set_ci_mode（build.sh:1432-1452）只注入
+`-DASCEND_OP_NAME` / `-DASCEND_COMPILE_OPS`、**不碰这个开关** —— 所以「内置 flavor
++ 只编一个算子」必须用 `-f`（`--ops` 和 `--opapi` 还互斥，build.sh:477）。
+
+2026-10-09 实测：`bash build.sh --opapi -f <清单>` 在 ENABLE_CUSTOM=FALSE 下编出
+`build/libopapi_nn.so`（67,880 字节），`nm -D` 里正好两个 aclnn 符号
+—— aclnnFusedConv2d + aclnnFusedConv2dGetWorkspaceSize，NEEDED 只有
+libnnopbase.so。所以算子合进主线后两段式接口就在 libopapi_nn.so 里。
+（注意 62 个未定义符号中 `ge::TypeUtils::*` / `error_message::*` 来自
+libgraph.so，而它**不在** NEEDED 里 —— dlopen 前得先把它拉进全局符号表，
+下面 _preload_soft_deps() 干这事。）
+
+但**开发期上板自验仍然该走 vendor 包**，那不是走偏：上游开发指南
+（docs/zh/develop/aicore_develop_guide.md:405-449 的标准第 3、4 步，:802-806 的
+aclnn 验证就是 export LD_LIBRARY_PATH=.../opp/vendors/<name>_nn/op_api/lib）和
+PR 门禁（scripts/ci/check_pkg.sh:102 `build.sh --pkg --vendor_name=$n --ops=$n`）
+规定的就是它，门禁对 conv2d_v2 / conv3d_v2 / mat_mul_v3 这些**早已在主线内置库**
+的算子也是同样跑法。而且 vendor 包是增量安装、不覆写 toolkit 的 opp/built-in，
+还能把 kernel / tiling / op-info 和 aclnn 一起带上板。
+
+结论：**两种 flavor 都得能找到**。所以下面 open_opapi_so() 按**符号**探测，
+不按文件名猜 —— 文件名是构建模式的产物，符号才是判据。
 """
 
 import ctypes
@@ -52,9 +87,16 @@ ACL_SUCCESS = 0
 ACL_FORMAT_ND = 2
 ACL_MEM_MALLOC_HUGE_FIRST = 0
 
-# 自定义算子包里两段式接口所在的 so。build.sh 编出来的名字就是这个
-# （build 日志里的链接目标 libcust_opapi.so）。
-OPAPI_SO_NAME = "libcust_opapi.so"
+# 两段式接口可能住在这两个 so 的任意一个，取决于编包时 ENABLE_CUSTOM 的取值
+# （见模块 docstring）。列表顺序 = 探测优先级：内置在前，因为算子最终归属内置库，
+# 而手边的 vendor 包往往是旧的。但**真正的判据是符号在不在**，不是名字。
+BUILTIN_OPAPI_SO_NAME = "libopapi_nn.so"    # ENABLE_CUSTOM=OFF → <arch>-linux/lib64
+VENDOR_OPAPI_SO_NAME = "libcust_opapi.so"   # ENABLE_CUSTOM=ON  → vendors/<n>_nn/op_api/lib
+# 探测用的符号：两段式的第一段，autogen 必然导出。
+PROBE_SYMBOL = "aclnnFusedConv2dGetWorkspaceSize"
+# libopapi_nn.so 的 ge::TypeUtils / error_message 符号在这里，而它不在 NEEDED 里。
+# 缺了它 dlopen 直接报 undefined symbol，所以探测前先尽力拉进来。
+SOFT_DEP_SO_NAMES = ("libgraph.so", "libascendalog.so", "libalog.so")
 # aclCreateTensor / aclCreateTensorList / aclCreateIntArray 都在这里，
 # **libascendcl.so 里一个都没有**（nm -D 实测：libascendcl=0 libnnopbase=1）。
 NNOPBASE_SO_NAME = "libnnopbase.so"
@@ -90,29 +132,64 @@ def find_nnopbase_so(explicit=None):
     _die("找不到 %s。先 source CANN 的 set_env.sh。" % NNOPBASE_SO_NAME)
 
 
-def find_opapi_so(explicit=None, vendor=None):
-    """定位自定义算子包的 opapi so。
+def _preload_soft_deps():
+    """把 opapi 库的隐式依赖拉进全局符号表，尽力而为。
 
-    找不到时要说清楚**该怎么办** —— 这是走 aclnn 最容易卡住的一步：算子包装了
-    但没装 op_api 那一半，或者装了但 ASCEND_CUSTOM_OPP_PATH 没指对。
+    内置的 libopapi_nn.so 里 `ge::TypeUtils::FormatToSerialString` /
+    `error_message::ReportInnerErrMsg` / `DlogRecord` 这些是未定义符号，而
+    libgraph.so 和 alog **不在它的 NEEDED 里**（readelf -d 实测只有
+    libnnopbase.so + libstdc++/libgcc/libc）。不先加载就直接 dlopen 会报
+    undefined symbol。失败不致命 —— 很多场景 libascendcl 已经把它们带进来了。
     """
-    if explicit:
-        if not os.path.isfile(explicit):
-            _die("--opapi-so 指的文件不存在: %s" % explicit)
-        return explicit
+    loaded = []
+    for name in SOFT_DEP_SO_NAMES:
+        try:
+            ctypes.CDLL(name, mode=ctypes.RTLD_GLOBAL)
+            loaded.append(name)
+        except OSError:
+            pass
+    return loaded
 
-    # 自定义算子包装的是 op_api/**lib**/，不是 lib64 —— cmake/variables.cmake:77 用的是
-    # `lib`，只有 built-in 那一侧才是 aarch64-linux/lib64（variables.cmake:101）。
-    # 两个都找，顺序无关紧要。
+
+def _opapi_candidates(explicit=None, vendor=None):
+    """按优先级列出所有可能的 opapi so 路径。
+
+    vendor 包装的是 op_api/**lib**/，不是 lib64（cmake/variables.cmake:78 用 `lib`）；
+    内置那侧是 <arch>-linux/lib64（variables.cmake:102），而装好的 toolkit 里
+    lib64 通常是指向它的 symlink。两边的目录名都列上，便宜。
+    """
     LIBDIRS = ("lib", "lib64")
-
     cands = []
-    env = os.environ.get("FC2D_OPAPI_SO", "")
-    if env:
-        cands.append(env)
+
+    def add(p):
+        if p and p not in cands:
+            cands.append(p)
+
+    # -- 0. 显式指定最高优先：用户知道自己在干什么
+    add(explicit)
+    add(os.environ.get("FC2D_OPAPI_SO", ""))
+
+    # -- 1. 内置 flavor：装好的 toolkit，以及本地 build 目录里刚编出来的那个
+    for env in ("ASCEND_HOME_PATH", "ASCEND_TOOLKIT_HOME", "ASCEND_OPP_PATH"):
+        root = os.environ.get(env, "")
+        if not root:
+            continue
+        # ASCEND_OPP_PATH 指到 <root>/opp，往上一层才是 root
+        roots = [root, os.path.dirname(root.rstrip("/"))]
+        for r in roots:
+            add(os.path.join(r, "lib64", BUILTIN_OPAPI_SO_NAME))
+            for arch in ("aarch64-linux", "x86_64-linux"):
+                add(os.path.join(r, arch, "lib64", BUILTIN_OPAPI_SO_NAME))
+    # 本地 ops-nn 工作树里 `build.sh --opapi -f <清单>` 的产物就落在 build/ 根下
+    for root in os.environ.get("FC2D_OPSNN_DIR", "").split(":"):
+        if root:
+            add(os.path.join(root, "build", BUILTIN_OPAPI_SO_NAME))
+
+    # -- 2. vendor flavor：自定义算子包
     for root in os.environ.get("ASCEND_CUSTOM_OPP_PATH", "").split(":"):
         if root:
-            cands += [os.path.join(root, "op_api", d, OPAPI_SO_NAME) for d in LIBDIRS]
+            for d in LIBDIRS:
+                add(os.path.join(root, "op_api", d, VENDOR_OPAPI_SO_NAME))
     opp = os.environ.get("ASCEND_OPP_PATH", "")
     if opp:
         vendors = os.path.join(opp, "vendors")
@@ -124,22 +201,64 @@ def find_opapi_so(explicit=None, vendor=None):
         if os.path.isdir(vendors):
             names += sorted(n for n in os.listdir(vendors) if n != "config.ini")
         for n in names:
-            if n:
-                cands += [os.path.join(vendors, n, "op_api", d, OPAPI_SO_NAME) for d in LIBDIRS]
+            if not n:
+                continue
+            for d in LIBDIRS:
+                add(os.path.join(vendors, n, "op_api", d, VENDOR_OPAPI_SO_NAME))
 
+    # -- 3. 兜底：交给 ld.so 按 LD_LIBRARY_PATH 找（两个名字都试）
+    add(BUILTIN_OPAPI_SO_NAME)
+    add(VENDOR_OPAPI_SO_NAME)
+    return cands
+
+
+def open_opapi_so(explicit=None, vendor=None):
+    """找到并加载带 aclnnFusedConv2d 的 opapi so，返回 (path, CDLL handle)。
+
+    **按符号探测，不按文件名判定。** 名字只决定去哪儿找；一个存在但里面没有
+    aclnnFusedConv2d 的库（比如 CANN 自带的那个 18MB libopapi_nn.so —— 算子还没
+    合进主线时它当然没有我们的符号）必须被跳过而不是被当成答案。所以逐个
+    dlopen + getattr，第一个带符号的赢，并把每个候选的淘汰原因记下来。
+    """
+    if explicit and not os.path.isfile(explicit):
+        _die("--opapi-so 指的文件不存在: %s" % explicit)
+
+    _preload_soft_deps()
+    cands = _opapi_candidates(explicit, vendor)
+    rejected = []
     for c in cands:
-        if c and os.path.isfile(c):
-            return c
+        bare = os.sep not in c
+        if not bare and not os.path.isfile(c):
+            rejected.append((c, "文件不存在"))
+            continue
+        try:
+            h = ctypes.CDLL(c, mode=ctypes.RTLD_GLOBAL)
+        except OSError as e:
+            rejected.append((c, "dlopen 失败: %s" % e))
+            continue
+        if getattr(h, PROBE_SYMBOL, None) is None:
+            rejected.append((c, "加载成功但没有 %s 符号" % PROBE_SYMBOL))
+            continue
+        return c, h
 
-    _die("找不到 %s。走 aclnn 必须装**带 op_api 的**自定义算子包。\n"
-         "        1. 编包: bash build.sh --pkg --soc=mc62 --ops=fused_conv2d\n"
-         "           （算子侧不用改代码：op_host/CMakeLists.txt 已经是 ACLNNTYPE aclnn，\n"
-         "            aclnn 接口由 opbuild 从 OpDef 自动生成）\n"
-         "        2. 装包，再 source 算子包的 set_env.sh，确认 ASCEND_CUSTOM_OPP_PATH 指到 vendors/<name>\n"
-         "        3. 或者直接 --opapi-so <path> / 环境变量 FC2D_OPAPI_SO 指到那个文件\n"
-         "        确认符号在不在: nm -D --defined-only <so> | grep aclnnFusedConv2d\n"
-         "        找过这些位置:\n          %s"
-         % (OPAPI_SO_NAME, "\n          ".join(c for c in cands if c) or "(无)"))
+    _die("所有候选的 opapi 库里都没有 %s。\n"
+         "        两种 flavor 都可以，关键是**那个 so 里得有这个符号**：\n"
+         "        A) 内置（算子最终归属，产出 %s）:\n"
+         "             git diff --name-only upstream/master...HEAD | sed \"s|^|$PWD/|\" > /tmp/fl.txt\n"
+         "             bash build.sh --opapi -f /tmp/fl.txt\n"
+         "           产物在 <ops-nn>/build/%s，用 --opapi-so 直接指过去，\n"
+         "           或者 export FC2D_OPSNN_DIR=<ops-nn 路径>。\n"
+         "           注意不能用 --ops=（它会把 ENABLE_CUSTOM 拨到 vendor 侧）。\n"
+         "        B) vendor 自定义包（上板自验走这条，产出 %s）:\n"
+         "             bash build.sh --pkg --soc=mc62 --ops=fused_conv2d\n"
+         "           装包后 source 算子包的 set_env.sh，确认 ASCEND_CUSTOM_OPP_PATH\n"
+         "           指到 vendors/<name>_nn。\n"
+         "        C) 或者直接 --opapi-so <path> / export FC2D_OPAPI_SO=<path>。\n"
+         "        自己确认符号: nm -D --defined-only <so> | grep aclnnFusedConv2d\n"
+         "        探测记录（候选 → 淘汰原因）:\n          %s"
+         % (PROBE_SYMBOL, BUILTIN_OPAPI_SO_NAME, BUILTIN_OPAPI_SO_NAME,
+            VENDOR_OPAPI_SO_NAME,
+            "\n          ".join("%s  →  %s" % (p, why) for p, why in rejected) or "(无候选)"))
 
 
 # ---------------------------------------------------------------- 工具
@@ -174,11 +293,12 @@ class AclnnLauncher:
     def __init__(self, acl, nnopbase_so=None, opapi_so=None, vendor=None):
         self.acl = acl
         self.nnopbase_path = find_nnopbase_so(nnopbase_so)
-        self.opapi_path = find_opapi_so(opapi_so, vendor)
         # RTLD_GLOBAL：生成的 aclnn_fused_conv2d.cpp 里那一堆 Nnopbase* 符号是
         # extern 的，要靠全局符号表从 libnnopbase 解析。
+        # **必须先加载 nnopbase**：open_opapi_so 是靠真的 dlopen 候选库来探测符号的，
+        # nnopbase 不在全局表里时那些候选会以 undefined symbol 失败、被误判成不可用。
         self.nnop = ctypes.CDLL(self.nnopbase_path, mode=ctypes.RTLD_GLOBAL)
-        self.opapi = ctypes.CDLL(self.opapi_path, mode=ctypes.RTLD_GLOBAL)
+        self.opapi_path, self.opapi = open_opapi_so(opapi_so, vendor)
         self._bind()
         self._tensors = []
         self._arrays = []
@@ -219,10 +339,12 @@ class AclnnLauncher:
         gws = getattr(self.opapi, "aclnnFusedConv2dGetWorkspaceSize", None)
         run = getattr(self.opapi, "aclnnFusedConv2d", None)
         if gws is None or run is None:
-            _die("算子包的 %s 里没有 aclnnFusedConv2d[GetWorkspaceSize] 符号。\n"
-                 "        这个包大概是在 aclnn 生成打开之前编的 —— 重新编包。\n"
+            _die("%s 里缺 aclnnFusedConv2d 第二段的符号。\n"
+                 "        open_opapi_so 探的是 %s（第一段），所以能走到这儿说明\n"
+                 "        那个库只导出了一半 —— 不是「没编 aclnn」，更像是链接\n"
+                 "        时漏了 autogen 的 object，或者库被手工裁过。\n"
                  "        确认用: nm -D --defined-only %s | grep aclnnFusedConv2d"
-                 % (OPAPI_SO_NAME, self.opapi_path))
+                 % (self.opapi_path, PROBE_SYMBOL, self.opapi_path))
         # 签名和 build/autogen/aclnn_fused_conv2d.h 逐位置一致。
         gws.argtypes = [
             c_vp, c_vp, c_vp, c_vp, c_vp, c_vp, c_vp, c_vp,   # x f1 b1 f2 b2 dq2 q1 q2
