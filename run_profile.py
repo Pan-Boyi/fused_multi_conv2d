@@ -90,6 +90,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 ALL_STEPS = ["check", "case", "om", "push", "prof", "pull", "export", "parse"]
 
+# --aclnn：走 aclnn 两段式下发而不是 aclopExecuteV2 + .om。
+# aclnn 不需要离线模型（kernel 是 nnopbase 按 OpType 从**算子包**里找的），
+# 所以这个开关一开，om 这一步整步跳过，push 改传 aclnn_launch.py。
+# 为什么要这条路见 aclnn_launch.py 顶上的注释（atc --singleop 的 json 表达不了
+# 实例数 > 1 的 DYNAMIC 输入，而那是扩展到更多层卷积融合的前提）。
+ACLNN = False
+
 # op_summary 里要看的列。原来的 run_profile.sh 就是这七个，保持一致。
 DEFAULT_COLUMNS = [
     "total_exe_time(us)",
@@ -334,8 +341,10 @@ def remote_script(rt, case_name, om_name, use_msprof, msprof):
             "else echo '[REMOTE ERROR] 找不到 %s' >&2; exit 1; fi"
             % (shlex.quote(rt.cann_env), shlex.quote(rt.cann_env), rt.cann_env),
         ]
+    need = ["case.bin", "run_fused_conv2d.py"]
+    need += ["aclnn_launch.py"] if ACLNN else [shlex.quote(om_name)]
     lines += [
-        "for f in case.bin run_fused_conv2d.py %s; do" % shlex.quote(om_name),
+        "for f in %s; do" % " ".join(need),
         "  [ -f \"$f\" ] || { echo \"[REMOTE ERROR] 缺文件 $f\" >&2; exit 1; }",
         "done",
     ]
@@ -358,8 +367,12 @@ def remote_script(rt, case_name, om_name, use_msprof, msprof):
         "export WARMUP=%d" % rt.warmup,
         "echo '[REMOTE] 开始执行' >&2",
     ]
-    exec_cmd = "python3 run_fused_conv2d.py case.bin FusedConv2d %d %s" % (
-        rt.device, shlex.quote(om_name))
+    if ACLNN:
+        # 不传 .om；--aclnn 让 run_fused_conv2d.py 走两段式。
+        exec_cmd = "python3 run_fused_conv2d.py case.bin FusedConv2d %d --aclnn" % rt.device
+    else:
+        exec_cmd = "python3 run_fused_conv2d.py case.bin FusedConv2d %d %s" % (
+            rt.device, shlex.quote(om_name))
     if use_msprof:
         exec_cmd = "\"$MSPROF\" " + exec_cmd
     lines += [
@@ -401,12 +414,17 @@ def do_push(rt, c, paths, om_file):
     # 每条 case 一个干净目录。**不复用**：aclopSetModelDir 会把目录下所有 .om 都
     # 装进去，留着上一个形状的那个，它可能反而先匹配上，跑出来的是上个形状的结果，
     # 而且不报错。
-    for f in (paths["bin"], om_file, os.path.join(HERE, "run_fused_conv2d.py")):
+    # aclnn 那条路没有 .om，取而代之要把下发模块拷过去。
+    extra = [os.path.join(HERE, "aclnn_launch.py")] if ACLNN else [om_file]
+    for f in [paths["bin"], os.path.join(HERE, "run_fused_conv2d.py")] + extra:
         if not os.path.isfile(f):
             raise RuntimeError("本地缺文件 %s" % f)
     if rt.scp_to(paths["bin"], "%s/case.bin" % wd) != 0:
         raise RuntimeError("拷 case.bin 失败")
-    if rt.scp_to(om_file, "%s/%s" % (wd, os.path.basename(om_file))) != 0:
+    if ACLNN:
+        if rt.scp_to(os.path.join(HERE, "aclnn_launch.py"), "%s/aclnn_launch.py" % wd) != 0:
+            raise RuntimeError("拷 aclnn_launch.py 失败")
+    elif rt.scp_to(om_file, "%s/%s" % (wd, os.path.basename(om_file))) != 0:
         raise RuntimeError("拷 .om 失败")
     # run_fused_conv2d.py 每次都拷。case.bin 的格式和它是配套的，远端留着一份旧的
     # 会报「case 文件版本 N，本脚本认 M」，而那时人往往已经在查算子了。
@@ -416,7 +434,8 @@ def do_push(rt, c, paths, om_file):
 
 
 def do_prof(rt, c, om_file, use_msprof, msprof, show_script=False):
-    script = remote_script(rt, c["name"], os.path.basename(om_file), use_msprof, msprof)
+    script = remote_script(rt, c["name"], os.path.basename(om_file) if om_file else "",
+                           use_msprof, msprof)
     if show_script:
         print("---- 远端将执行 ----")
         print(script)
@@ -587,7 +606,12 @@ def main():
     ap.add_argument("--print-remote-script", action="store_true", help="把远端要执行的 bash 打出来")
     ap.add_argument("--list", action="store_true", help="只列出会做哪些")
     ap.add_argument("--keep-going", action="store_true", help="某条失败了继续做下一条")
+    ap.add_argument("--aclnn", action="store_true",
+                    help="走 aclnn 两段式下发（不需要 .om，自动跳过 om 步骤）。"
+                         "板上必须装了带 FusedConv2d 的 mc62 算子包。")
     args = ap.parse_args()
+    global ACLNN
+    ACLNN = args.aclnn
 
     doc, remote_cfg, prof_cfg, cases = load_config(args.config)
     if args.cases:
@@ -609,6 +633,9 @@ def main():
         cases = [c for c in cases if c["name"] in want]
 
     steps = [s.strip() for s in args.steps.split(",") if s.strip()]
+    if ACLNN and "om" in steps:
+        print("[aclnn] 跳过 om 步骤 —— aclnn 不走离线模型，kernel 直接从算子包找")
+        steps = [s for s in steps if s != "om"]
     bad = [s for s in steps if s not in ALL_STEPS]
     if bad:
         die("--steps 里不认识的步骤 %s，只能是 %s" % (bad, " / ".join(ALL_STEPS)))
@@ -670,7 +697,7 @@ def main():
                 fc2d.do_om(c, paths, soc)
 
             om_file = None
-            if {"push", "prof"} & set(steps):
+            if (not ACLNN) and ({"push", "prof"} & set(steps)):
                 oms = [os.path.join(paths["omdir"], f)
                        for f in os.listdir(paths["omdir"])] if os.path.isdir(paths["omdir"]) else []
                 oms = [f for f in oms if f.endswith(".om")]
