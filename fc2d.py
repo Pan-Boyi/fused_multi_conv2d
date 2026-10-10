@@ -17,15 +17,18 @@ fused_conv2d 上板验证的总驱动 —— **改一个 json 就能换形状**�
 ================================================================================
 为什么要有这个脚本
 ================================================================================
-形状变成运行期之后，一个形状要三样东西对齐：
+形状变成运行期之后，一个形状要两样东西对齐：
     .bin        输入数据 + golden
-    singleop.json / .om   ACL 按 **op 类型 + shape/dtype/format + attr 的值** 匹配
-    执行时设的 attr
-三者只要有一处不一致，板上报的是「算子没找到」（100024 / MatchOpModel fail），
-那条错误信息完全不指向真正的原因，上一版在这上面折过好几次。
+    .onnx / .om 图的形状 + 属性（属性在编译期就烘进 om 了）
+对不上的表现是数值不对或者 atc 直接拒，而不是某个好懂的报错。
 
-这个脚本让三者**都从同一处派生**：json 里的一条 case -> gen_case 的命令行 ->
-.bin 头部的 spec -> singleop.json -> 执行时的 attr。中间没有第二份形状。
+这个脚本让两者**都从同一处派生**：json 里的一条 case -> gen_case 的命令行 ->
+.bin 头部的 spec -> .onnx -> om。中间没有第二份形状。
+
+（历史：原来编 om 走 `atc --singleop`，那条路上属性要在**执行期**逐个下发、
+由 ACL 连 attr 一起匹配 .om，于是「三者有一处不一致 -> 报成算子没找到
+100024 / MatchOpModel fail」。换成图 om 之后属性是编译期烘进去的，
+这一整类失败不存在了。）
 """
 import argparse
 import json
@@ -173,7 +176,7 @@ def gen_case_argv(c, out_path):
 
 # ---------------------------------------------------------------- 读 .bin 的 spec
 def read_spec(path):
-    """把 .bin 头部的 spec 读出来。**singleop.json 只从这里派生**，不从 json 派生 ——
+    """把 .bin 头部的 spec 读出来。**.onnx 只从这里派生**，不从 json 派生 ——
     这样 .bin 和 .om 不可能对不上形状。"""
     with open(path, "rb") as f:
         hdr = f.read(HDR_LEN)
@@ -380,21 +383,53 @@ def do_om(c, paths, soc):
     # 插件要进 vendor 包，ops-nn 侧需要 variables.cmake 里有
     # ONNX_PLUGIN_LIB_INSTALL_DIR、且 gen_cust_symbol() 调了 gen_onnx_plugin_symbol()
     # —— 这两处原来都缺。所以这里只警告不致命：包可能是别人编的，形态未必一样。
-    opp = os.environ.get("ASCEND_CUSTOM_OPP_PATH", "")
-    if not opp:
-        print("  [!] 没设 ASCEND_CUSTOM_OPP_PATH。FusedConv2d 不在 toolkit 的内置算子库里，"
-              "atc 大概会说找不到这个算子。")
+    # 两种装法都要认：
+    #   * 算子**编进 CANN 内置算子库**（线上编包走这条）-> 插件在
+    #     $ASCEND_OPP_PATH/built-in/framework/onnx/，不需要 ASCEND_CUSTOM_OPP_PATH。
+    #   * 本机 `build.sh --ops=fused_conv2d` 编的 **vendor 包** -> 插件在
+    #     $ASCEND_CUSTOM_OPP_PATH/framework/onnx/。
+    # 判据是**有没有插件 .so 并且里面有 FusedConv2d**，不是有没有设某个环境变量 ——
+    # 按环境变量判会在内置装法上误报。
+    def _find_plugins(root):
+        hits = []
+        if not root or not os.path.isdir(root):
+            return hits
+        for d, _dirs, files in os.walk(root):
+            if os.path.basename(d) == "onnx" and "framework" in d:
+                hits += [os.path.join(d, f) for f in files
+                         if f.startswith("liboponnx_plugin") and f.endswith(".so")]
+        return hits
+
+    roots = []
+    for var in ("ASCEND_CUSTOM_OPP_PATH", "ASCEND_OPP_PATH"):
+        v = os.environ.get(var, "")
+        if v:
+            roots.append((var, v))
+    if not roots:
+        home = os.environ.get("ASCEND_HOME_PATH", "")
+        if home:
+            roots.append(("ASCEND_HOME_PATH/opp", os.path.join(home, "opp")))
+    carriers = []
+    for var, root in roots:
+        for so in _find_plugins(root):
+            try:
+                with open(so, "rb") as f:
+                    if b"FusedConv2d" in f.read():
+                        carriers.append((var, so))
+            except OSError:
+                pass
+    if carriers:
+        for var, so in carriers:
+            print("  onnx 解析插件（经 %s）: %s" % (var, so))
+    elif not roots:
+        print("  [!] ASCEND_CUSTOM_OPP_PATH / ASCEND_OPP_PATH / ASCEND_HOME_PATH 一个都没设，"
+              "查不了 onnx 解析插件在不在。先 source <CANN>/set_env.sh。")
     else:
-        found = []
-        for root, _dirs, files in os.walk(opp):
-            if os.path.basename(root) == "onnx" and "framework" in root:
-                found += [f for f in files if f.startswith("liboponnx_plugin") and f.endswith(".so")]
-        if found:
-            print("  onnx 解析插件: %s" % ", ".join(sorted(found)))
-        else:
-            print("  [!] %s 下找不到 framework/onnx/liboponnx_plugin*.so —— "
-                  "atc 多半会报 E10501「IR for Op ... is not registered」。"
-                  "算子包要用带 onnx 插件的版本重编。" % opp)
+        print("  [!] 这些路径下找不到带 FusedConv2d 的 framework/onnx/liboponnx_plugin*.so: %s"
+              % ", ".join("%s=%s" % (v, r) for v, r in roots))
+        print("      atc 多半会报 E10501「IR for Op ... is not registered」或者说不认识这个节点。")
+        print("      内置装法要确认编包时带上了 conv/fused_conv2d/framework/；")
+        print("      vendor 装法要确认 ASCEND_CUSTOM_OPP_PATH 指到 <装到哪>/vendors/<name>_nn。")
 
     import fc2d_onnx
     plan, checker = fc2d_onnx.write_onnx(spec, paths["onnx"])
@@ -418,7 +453,8 @@ def do_om(c, paths, soc):
     if rc != 0:
         die("atc 返回 %d（%s）。常见原因：\n"
             "    * 算子包没装、或 ASCEND_CUSTOM_OPP_PATH 没指到 <装到哪>/vendors/<name>_nn\n"
-            "    * 包里没有 onnx 解析插件 —— 查 vendors/<name>_nn/framework/onnx/liboponnx_plugin_*.so，\n"
+            "    * 包里没有 onnx 解析插件。内置装法查 $ASCEND_OPP_PATH/built-in/framework/onnx/，\n"
+            "      vendor 装法查 $ASCEND_CUSTOM_OPP_PATH/framework/onnx/，文件名 liboponnx_plugin_*.so。\n"
             "      没有的话 atc 会报 E10501「IR for Op ... is not registered」或者说不认识这个节点\n"
             "    * soc_version 不对\n"
             "    * 这个形状被 tiling 拒了（看 ~/ascend/log/ 里的 OP_LOGE）" % (rc, c["name"]))

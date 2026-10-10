@@ -15,11 +15,11 @@ FusedConv2d 上板执行 + profiling 的总驱动 —— **全部配置来自一
 这个脚本替代了原来的 run_profile.sh，多做了三件事
 ================================================================================
 1. **把 build_case 也包进来。** 原来 case.bin 得靠人提前放到远端，形状一变就要
-   自己记得重新生成、重新拷。现在形状或 ABI 变了，case.bin、singleop.json、.om、
+   自己记得重新生成、重新拷。现在形状或 ABI 变了，case.bin、.onnx、.om、
    执行时输入和属性会一起重新产生。
 
 2. **形状 / dtype / 可选属性全部从 json 来。** 原来 dtype 是命令行参数，形状写死
-   在 gen_case 里，属性写死在两份手写的 singleop json 里。现在一条 case 长这样：
+   在 gen_case 里，属性写死在两份手写的单算子 json 里。现在一条 case 长这样：
 
        {"name": "base", "dtype": "both", "ci": 32, "hi": 288, "wi": 112,
         "cout1": 64, "cout2": 96, "kernel": [3,3], "strides": [1,2],
@@ -48,8 +48,9 @@ FusedConv2d 上板执行 + profiling 的总驱动 —— **全部配置来自一
     json 里的一条 case
       -> gen_case 的命令行
       -> case.bin 头部的 spec（32 个 int，形状 + 属性的唯一真相）
-      -> singleop.json（从 spec 读，**不从 json 读**）
-      -> 执行时下发的输入和属性（run_fused_conv2d.py 也从 case.bin 读）
+      -> .onnx（从 spec 读，**不从 json 读**）-> atc --framework=5 -> .om
+      -> 执行时下发的输入（run_fused_conv2d.py 也从 case.bin 读；
+         属性不下发，编译期已烘进 om）
 
 中间没有第二份形状。前四步的实现直接复用 fc2d.py，不另写一份。
 

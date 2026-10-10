@@ -69,7 +69,8 @@ Y_SENTINEL_I8 = 0x7F      # int8 输出的哨兵（一字节，正好是 int8 �
 Y_ELEM_BYTES = 2          # fp16 那条；int8 那条用 1，见 decode_y()
 
 # case 文件的头（version 6）。**形状全在 spec 里**，脚本不再写死任何一个维度 ——
-# gen_case 写它，fc2d.py 从它生成 singleop.json，本脚本从它下发属性，三处同源。
+# gen_case 写它，fc2d.py 从它生成 .onnx（再 atc 编成 om），本脚本从它取输入数据，
+# 三处同源。属性不再下发 —— 图 om 的属性是编译期烘进去的。
 CASE_VERSION = 6
 # 末尾的 kh2 / kw2 是 conv2 的核，**只能往后加**：老的 .bin 在这两个位置上是 0，
 # 而那时两层必然同核，所以退回 kh / kw 就是对的 —— 老文件不用重新生成，
