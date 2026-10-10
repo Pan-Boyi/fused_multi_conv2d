@@ -233,3 +233,32 @@ python3 fc2d.py --sync-shape-header <ops-nn>/conv/fused_conv2d/op_kernel/fused_c
 「该重拷了」的信号。
 
 产物 `out/` 和 `prof_out/` 都在 `.gitignore` 里,不进仓。
+
+## 不上板也能验板侧下发：ACL 桩
+
+板侧那段（模型加载 → 按名字取输入下标 → dataset → `aclmdlExecute` → 读回 → 比对）
+在**没有 NPU 的机器上执行不到** —— 真机 `aclInit` 直接失败（`chipType=0`），
+而 `--dry-run` 是刻意绕开 ACL 分支的。代价是真的：`y_bytes` 的
+`UnboundLocalError` 只是个先用后赋，却要等到板上第一次跑才暴露。
+
+`tests/stub_ascendcl/` 用一个假的 `libascendcl.so` 顶掉真的那个，把整条路径跑完：
+
+```bash
+bash tests/stub_ascendcl/run_stub_test.sh            # out/ 下所有有 om 的 case
+bash tests/stub_ascendcl/run_stub_test.sh base_int8  # 只跑指定的
+```
+
+每条 case 跑**两种定位方式**：
+
+| | 含义 |
+|---|---|
+| 名字 | `aclmdlGetInputIndexByName` 能用 —— 期望的情形 |
+| 退路 | 它全部失败，运行器退回 IR 顺序 |
+
+**两条都要绿。** 退路那条在真板上很可能被用到：ACL 把图 om 的模型输入名报成什么样
+不是我们能控制的，而运行器只有「名字取不到就按 IR 顺序猜」这一条退路，
+靠逐项字节数校验兜底。
+
+桩的 `aclmdlExecute` 把 `case.bin` 里的 `y_expect` 拷进输出缓冲，所以比对、诊断、
+抽样那几段也会真的跑一遍。**它不验数值正确性** —— 那只能靠板子；它验的是
+「这段代码会不会崩、分支走得对不对、字节数核对管不管用」。

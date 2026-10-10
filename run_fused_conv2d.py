@@ -889,10 +889,16 @@ def main():
     print("形状（来自 case 文件的 spec）: %s" % info["shape_text"])
     want_raw = tensors["y_expect"][2]
     yElemBytes = 1 if info["outInt8"] else 2
+    # **定义在这里，不要放进 ACL 分支里。** 它既被 ACL 那段用（核对模型输出字节数、
+    # 读回设备输出），也被分支外的落盘用。原来它在 ACL 分支的后半段才赋值，而我
+    # 在前半段加了一处「模型输出字节数核对」去读它 —— 于是板上第一次跑就
+    # UnboundLocalError。dry-run 不进 ACL 分支，没有 NPU 的机器又在 aclInit 就退出，
+    # 两种本地测法都盖不到那一行。
+    y_bytes = y_elems * yElemBytes
     ySentinel = Y_SENTINEL_I8 if info["outInt8"] else Y_SENTINEL_U16
-    if len(want_raw) != y_elems * yElemBytes:
-        die("golden 输出 %d 字节，按 %d 个 fp16 元素应为 %d"
-            % (len(want_raw), y_elems, y_elems * yElemBytes))
+    if len(want_raw) != y_bytes:
+        die("golden 输出 %d 字节，按 %d 个元素应为 %d"
+            % (len(want_raw), y_elems, y_bytes))
     want = decode_y(want_raw, info["outInt8"])
     print("case 文件 OK：")
     # 只列**存在**的张量：int8 通路没有 y_exact（它的 golden 是精确整数模型，
@@ -1080,7 +1086,7 @@ def main():
 
         # 输出缓冲预填哨兵 127：kernel 一个字节都没写的话，读回来还是 127，
         # 这是"返回码 0 但什么都没算"唯一能被抓住的地方。
-        make_operand(y_dtype, y_dims, bytes([Y_SENTINEL_BYTE]) * (y_elems * yElemBytes))
+        make_operand(y_dtype, y_dims, bytes([Y_SENTINEL_BYTE]) * y_bytes)
 
         # NIN 在下面还当"输出操作数的下标"用（读回 dev_ptrs[NIN]、收尾 range(NIN+1)），
         # 所以它必须等于模型的输入个数，不能再是 len(INPUT_SLOTS)。
@@ -1148,7 +1154,6 @@ def main():
             print("\n[耗时] host 侧墙钟，含下发和同步；设备侧以 msprof 为准")
             report_times(durs)
 
-        y_bytes = y_elems * yElemBytes
         out = ctypes.create_string_buffer(y_bytes)
         check(acl.aclrtMemcpy(ctypes.cast(out, ctypes.c_void_p), y_bytes, dev_ptrs[NIN], y_bytes,   # NIN 号才是输出，别写死
                               ACL_MEMCPY_DEVICE_TO_HOST), "aclrtMemcpy D2H = %d")
