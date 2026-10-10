@@ -5,3 +5,6 @@ gen_case
 fc2d_geom
 *.bin
 *.om
+
+# atc 的预检报告（--check_report 的默认名），跑 om 那步时在 cwd 生成
+check_result.json
