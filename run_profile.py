@@ -123,10 +123,29 @@ DEFAULT_COLUMNS = [
 # aclnn 两段式要求执行机上有 libnnopbase.so 和装好的算子包（kernel 是 nnopbase
 # 在执行那一侧按 OpType 从算子包里找的），板上两样都没有。试过，撤了。
 #
-# 另外两条本地侧的隐式依赖，harness 目前不负责、但缺了 atc 就找不到算子：
+# **编 om 走 onnx，下发走模型 API。** 2026-10-10 定的，原因不是偏好：
+# filters 是 DYNAMIC list，要两个实例（conv1 的核 + conv2 的核），而
+# `atc --singleop` 给 DYNAMIC 输入只实例化一个（两轮实验、2 个算子、3 个 SoC、
+# 4 种 json 键写法，1 个实例能过 FE、>=2 个过不去）。atc 的 --framework 前端走
+# 完整 GE 图流水线，能表达多实例；--mode 只有 1/5/6 三个**输出**方向的转换，
+# 没有 json->om 的入口。所以 onnx 是 atc 这条路上唯一的输入形态。
+# 产物仍是自包含 .om（实测：26043 字节里有 1 个 ELF，kernel 名 9 处），
+# 上面那条不变量保住了。板侧因此从单算子 API 换成 aclmdl*。
+#
+# 本地侧的隐式依赖，harness 只做预检、不负责装：
 #   1. 算子包要先本地编好装上，并 export ASCEND_CUSTOM_OPP_PATH 指到
 #      <装到哪>/vendors/<name>_nn。FusedConv2d 不在 toolkit 的内置库里。
-#   2. local_cann_env 要指向**本机**的 set_env.sh。
+#   2. 算子包里必须有 onnx 解析插件：vendors/<name>_nn/framework/onnx/
+#      liboponnx_plugin_*.so。缺了 atc 报的是 E10501「IR for Op ... is not
+#      registered」，完全不指向真正的原因。ops-nn 侧要两处修才会产出它
+#      （variables.cmake 的 ONNX_PLUGIN_LIB_INSTALL_DIR、symbol.cmake 的
+#      gen_cust_symbol 调 gen_onnx_plugin_symbol）—— 原来 vendor 模式下连 .so
+#      目标都不创建。
+#   3. local_cann_env 要指向**本机**的 set_env.sh。
+#   4. python 包：造 onnx 要 onnx + protobuf；TBE 编 kernel 要 numpy /
+#      decorator / sympy / scipy / psutil。**都不要装在 /tmp 下** —— 踩过一次：
+#      装在 /tmp 的被 tmp 清理抹掉后，GE 报的是「There is no valid so about
+#      OpsKernelInfoStore or GraphOptimizer」，离根因（缺 numpy）隔了五层。
 #
 REMOTE_DEFAULTS = {
     "host": "",
@@ -685,6 +704,9 @@ def main():
             "bin": os.path.join(out_root, c["name"], "case.bin"),
             "omdir": os.path.join(out_root, c["name"], "om"),
             "singleop": os.path.join(out_root, c["name"], "singleop.json"),
+            # 编 om 的输入。singleop 那条已经不用了（DYNAMIC 表达不了），
+            # 但键留着：路径字典是公开结构，去掉会影响别的调用方。
+            "onnx": os.path.join(out_root, c["name"], c["name"] + ".onnx"),
         }
         os.makedirs(os.path.join(out_root, c["name"]), exist_ok=True)
         step("%s   (%s)" % (c["name"], c["dtype"]))

@@ -8,7 +8,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 """FusedConv2d @ 5102 单算子验证 —— 目标机器上不需要编译器。
 
-用 ctypes 直接调 libascendcl.so 里的 aclopExecuteV2，输入和 golden 全部来自
+用 ctypes 直接调 libascendcl.so 里的 aclmdl*（模型 API），输入和 golden 全部来自
 gen_case 生成的 .bin。所以这台机器只要有 python3 + CANN 就够了，不需要 g++、
 不需要 aclnn 头、不需要 numpy。
 
@@ -16,8 +16,8 @@ gen_case 生成的 .bin。所以这台机器只要有 python3 + CANN 就够了�
     默认  fused_conv2d_case.bin  FusedConv2d  0  (无 om)
 
 第 4 个参数 om 可以是**单个 .om 文件**，也可以是装着 .om 的目录：
-    ... 0 om_out/0_FusedConv2d_1.om     只加载这一个（走 aclopLoad）
-    ... 0 om_out                        加载这个目录下所有 .om（走 aclopSetModelDir）
+    ... 0 om_out/base_int8.om           加载这一个（走 aclmdlLoadFromFile）
+    ... 0 om_out                        目录里只有一个 .om 时用它，多于一个就报错
 
 环境变量：
     REL_TOL=1e-3     相对误差判据（默认 1e-3）
@@ -29,10 +29,14 @@ gen_case 生成的 .bin。所以这台机器只要有 python3 + CANN 就够了�
 fc2d.py / run_profile.py 的 om 步骤编出来的单算子离线模型。运行时就从它里面找算子，
 不再要求本机的算子信息库里有这个算子。
 
-注意 aclopSetModelDir 只吃**目录**，而且会把目录下所有 .om 都加载进来。所以给单个
-文件时走的是 aclopLoad(把文件读进内存再注册)，只注册你指定的这一个 —— 目录里有多个
-.om 时这条更干净。老版本的 CANN 没有 aclopLoad 的话，会退回"取所在目录 +
-aclopSetModelDir"，并明确告诉你。
+om 是 atc --framework=5 --model=<x.onnx> 编出来的**图** om，所以下发走
+aclmdlLoadFromFile + aclmdlExecute，而不是单算子的 aclopExecuteV2。为什么不能走
+单算子：filters 是 DYNAMIC list，要两个实例（conv1 的核 + conv2 的核），而
+atc --singleop 给 DYNAMIC 输入只实例化一个。
+
+图 om 必须**指名到文件** —— 没有「把目录里所有 om 都装上、让 ACL 自己匹配」这回事，
+那是单算子 API（aclopSetModelDir）的玩法，也正是它造成过「目录里留着上一个形状的
+om，旧的反而先匹配上」。
 
 判据和 C++ 版完全一致，输出行可以逐字对比。
 """
@@ -83,13 +87,25 @@ HDR_LEN = struct.calcsize(HDR_FMT)
 REC_FMT = "<16sII4qQ"           # name, dtype, ndim, dims[4], nbytes
 REC_LEN = struct.calcsize(REC_FMT)
 
-# 算子的完整 IR ABI 顺序。q1/q2/dq2 在 OpDef 中是 optional，但 aclopExecuteV2
+# 算子的完整 IR ABI 顺序。q1/q2/dq2 在 OpDef 中是 optional；单算子 API（aclopExecuteV2）
 # **不允许把未使用的槽位从数组中删掉**：必须在原位置传
 #   ACL_DT_UNDEFINED / ACL_FORMAT_UNDEFINED 的 desc + nullptr/0 的 DataBuffer。
 # info["order"] 仍只列当前 dtype 真正有数据的输入，用于 case 完整性检查；执行时
 # 始终遍历 INPUT_SLOTS，缺的槽由 optional placeholder 补齐。
+# ORDER / ORDER_* 是**存在性清单**：这条 dtype 通路下 case.bin 里必须有哪些 blob。
+# 它们的内部顺序不参与下发，所以保持原样。
 ORDER = ["x", "filter1", "bias1", "filter2", "bias2"]
-INPUT_SLOTS = ORDER + ["dequant_scale2", "quant_scale1", "quant_scale2"]
+# INPUT_SLOTS 是**IR 顺序**，和上面那个是两件事，所以显式写出、不再从 ORDER 派生。
+#
+# **这个顺序变过。** 老的单算子 ABI 是 x, filter1, bias1, filter2, bias2, ...；
+# filters 改成 DYNAMIC list 之后，它的两个实例必须相邻，于是 filter2 从 3 号位
+# 挪到了 2 号位，bias1/bias2 各往后一格。IR 顺序现在是
+#     x=0, filters[0]=1, filters[1]=2, bias1=3, bias2=4,
+#     dequant_scale2=5, quant_scale1=6, quant_scale2=7
+# （fused_conv2d_def.cpp 的 Input() 调用顺序）。槽位名沿用 case.bin 里的张量名，
+# 这样和 onnx 图的输入名、om 的模型输入名是同一个名字，按名字取下标不需要映射表。
+INPUT_SLOTS = ["x", "filter1", "filter2", "bias1", "bias2",
+               "dequant_scale2", "quant_scale1", "quant_scale2"]
 ORDER_INT8 = ORDER + ["quant_scale1", "quant_scale2"]
 ORDER_S8F16 = ORDER + ["dequant_scale2", "quant_scale1"]
 ORDER_A16W8 = ORDER_S8F16
@@ -109,7 +125,11 @@ DTYPE_A16W8 = 3
 
 
 def runtime_input_slots(info):
-    """返回 aclopExecuteV2 的 8 个 IR 槽；None 表示必须构造空 optional input。"""
+    """返回 8 个 IR 槽；None 表示这条 dtype 通路不传这个 optional 输入。
+
+    现在只用于**打印和完整性检查**。图 om 的下发不看它：缺席的 optional 在图里
+    根本不是模型输入，实际喂数据按模型自己报的输入表来（见 main 里那段）。
+    """
     actual = set(info["order"])
     unknown = actual - set(INPUT_SLOTS)
     if unknown:
@@ -259,8 +279,6 @@ def load_acl():
         ("aclopCreateAttr", [], c_vp),
         ("aclopSetAttrInt", [c_vp, ctypes.c_char_p, ctypes.c_int64], ctypes.c_int),
         ("aclopDestroyAttr", [c_vp], None),
-        ("aclopExecuteV2", [c_cp, c_i, ctypes.POINTER(c_vp), ctypes.POINTER(c_vp),
-                            c_i, ctypes.POINTER(c_vp), ctypes.POINTER(c_vp), c_vp, c_vp], c_i),
     ]
     # 这两个只有用离线模型时才需要，缺了不该在这里就把脚本打死 ——
     # 用到的时候再报，那时的报错还能顺带说清楚该退回哪条路。
@@ -275,9 +293,29 @@ def load_acl():
         # ctypes 会按 int 传指针，报 "Don't know how to convert parameter 4"。
         ("aclopSetAttrListInt", [c_vp, ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int64)],
          ctypes.c_int),
-        ("aclopSetModelDir", [c_cp], c_i),
-        ("aclopLoad", [c_vp, c_sz], c_i),
         ("aclGetRecentErrMsg", [], c_cp),
+        # ---- 模型 API。om 现在是 atc --framework=5 编出来的**图** om，不是
+        # 单算子 om，所以下发走 aclmdl* 而不是 aclopExecuteV2。放可选里的理由同上：
+        # 缺哪个在真正用到的地方集中报一次（见 MODEL_API_SYMS），那时的报错
+        # 还能顺带说清楚是 CANN 太老还是 runtime 不完整。
+        ("aclmdlLoadFromFile", [c_cp, ctypes.POINTER(ctypes.c_uint32)], c_i),
+        ("aclmdlUnload", [ctypes.c_uint32], c_i),
+        ("aclmdlCreateDesc", [], c_vp),
+        ("aclmdlDestroyDesc", [c_vp], c_i),
+        ("aclmdlGetDesc", [c_vp, ctypes.c_uint32], c_i),
+        ("aclmdlGetNumInputs", [c_vp], c_sz),
+        ("aclmdlGetNumOutputs", [c_vp], c_sz),
+        ("aclmdlGetInputSizeByIndex", [c_vp, c_sz], c_sz),
+        ("aclmdlGetOutputSizeByIndex", [c_vp, c_sz], c_sz),
+        ("aclmdlCreateDataset", [], c_vp),
+        ("aclmdlDestroyDataset", [c_vp], c_i),
+        ("aclmdlAddDatasetBuffer", [c_vp, c_vp], c_i),
+        ("aclmdlExecute", [ctypes.c_uint32, c_vp, c_vp], c_i),
+        # 按名字取输入下标。有它就不用赌模型的输入顺序 —— 这是老 run_om.py
+        # 没做而吃过亏的地方（它只用 GetInputNameByIndex 打印给人看，实际按下标喂）。
+        ("aclmdlGetInputIndexByName", [c_vp, c_cp, ctypes.POINTER(c_sz)], c_i),
+        ("aclmdlGetInputNameByIndex", [c_vp, c_sz], c_cp),
+        ("aclmdlGetOutputNameByIndex", [c_vp, c_sz], c_cp),
     ]
     for name, argtypes, restype in sig:
         try:
@@ -816,7 +854,7 @@ def main():
     if repeat < 0:
         die("REPEAT 不能为负")
 
-    print('FusedConv2d @ 5102 单算子验证 —— ctypes + aclopExecuteV2（目标机不需要编译器）')
+    print('FusedConv2d @ 5102 验证 —— ctypes + aclmdl* 图 om（目标机不需要编译器、不需要算子包）')
     print('  case = "%s"   opType = "%s"   device = %d' % (case_path, op_type, device_id))
     print('  om     = %s' % (om_arg if om_arg else "(不用离线模型，走本机算子信息库)"))
     print('  REL_TOL = %g   RATIO_MIN = %g   repeat = %d   warmup = %d\n'
@@ -864,9 +902,11 @@ def main():
         dtype, dims, data = tensors[name]
         print("  %-9s %-6s %-16s %9d 字节" % (name, DTYPE_NAME[dtype], dims, len(data)))
     slots = runtime_input_slots(info)
-    print("ACL 输入槽（固定 8 个）:")
+    # 这是**IR 的** 8 个槽，不是模型的输入表。图 om 里缺席的 optional 不是模型
+    # 输入，所以模型报的输入个数会少于 8；实际喂数据按模型自己报的那张表走。
+    print("IR 输入槽（8 个；标 optional 的在图 om 里不是模型输入）:")
     for i, name in enumerate(slots):
-        print("  %d: %s" % (i, name if name is not None else "<UNDEFINED optional placeholder>"))
+        print("  %d: %s" % (i, name if name is not None else "<这条通路不传>"))
     if info["outInt8"]:
         print("量化系数（header 调试元数据；实际以 per-channel uint64 张量下发）: "
               "quant_scale1=%.9g quant_scale2=%.9g  relu=%s  bias=%s"
@@ -907,38 +947,56 @@ def main():
         print("\n[dry-run] 不碰硬件，用 golden 冒充设备输出走一遍主流程")
         got = want
     else:
+        # 模型 API 的符号在这里集中查一次。放在 load_acl 的可选表里是刻意的：
+        # 缺哪个要在**用到的地方**报，那时才能说清楚替代方案。
+        MODEL_API_SYMS = ("aclmdlLoadFromFile", "aclmdlCreateDesc", "aclmdlGetDesc",
+                          "aclmdlGetNumInputs", "aclmdlGetNumOutputs",
+                          "aclmdlGetInputSizeByIndex", "aclmdlGetOutputSizeByIndex",
+                          "aclmdlCreateDataset", "aclmdlAddDatasetBuffer",
+                          "aclmdlExecute", "aclmdlUnload")
+        lack = [s for s in MODEL_API_SYMS if getattr(acl, s, None) is None]
+        if lack:
+            die("这个 CANN 的 libascendcl.so 里没有模型 API: %s\n"
+                "    om 是 atc --framework=5 编的**图** om，只能用 aclmdl* 加载执行。\n"
+                "    单算子那条（aclopExecuteV2）已经不可用：filters 是 DYNAMIC list，\n"
+                "    atc --singleop 表达不了两个实例。" % ", ".join(lack))
+
         check(acl.aclInit(None), "aclInit = %d")
-        # 离线模型的注册。要在 aclopExecuteV2 之前，和 aclrtSetDevice 的先后无所谓。
-        om_keep = []
-        if om_file is not None:
-            fn = getattr(acl, "aclopLoad", None)
-            if fn is not None:
-                with open(om_file, "rb") as f:
-                    blob = f.read()
-                buf = ctypes.create_string_buffer(blob, len(blob))
-                om_keep.append(buf)  # 挡住 GC，ACL 可能还引用着这块内存
-                check(fn(ctypes.cast(buf, ctypes.c_void_p), len(blob)),
-                      "aclopLoad(%s) = " % os.path.basename(om_file) + "%d")
-                print("  aclopLoad OK (%d 字节)" % len(blob))
-            else:
-                d = os.path.dirname(om_file)
-                smd = getattr(acl, "aclopSetModelDir", None)
-                if smd is None:
-                    die("这个 CANN 的 libascendcl.so 里既没有 aclopLoad 也没有 aclopSetModelDir，\n"
-                        "    用不了离线模型。只能在设备上装带这个算子的算子包。")
-                print("  [!] 这个 CANN 没有 aclopLoad，退回 aclopSetModelDir(%s)。" % d)
-                print("      注意这会把该目录下**所有** .om 都加载进来。")
-                check(smd(d.encode()), "aclopSetModelDir = %d")
-                print("  aclopSetModelDir OK")
-        elif om_dir is not None:
-            fn = getattr(acl, "aclopSetModelDir", None)
-            if fn is None:
-                die("这个 CANN 的 libascendcl.so 里没有 aclopSetModelDir，用不了离线模型目录")
-            check(fn(om_dir.encode()), "aclopSetModelDir(%s) = " % om_dir + "%d")
-            print("  aclopSetModelDir OK")
+        # **顺序要紧**：模型 API 必须先 SetDevice 再加载模型。单算子那条 aclopLoad
+        # 和 SetDevice 的先后无所谓，这条不是。
         check(acl.aclrtSetDevice(device_id), "aclrtSetDevice(" + str(device_id) + ") = %d —— 芯片被占？")
+        # aclmdlExecute 是**同步**的，不吃 stream。这里仍然建一个，只为收尾段对称
+        # （aclrtDestroyStream）以及保证有个 context —— 不参与下发。
         stream = ctypes.c_void_p()
         check(acl.aclrtCreateStream(ctypes.byref(stream)), "aclrtCreateStream = %d")
+
+        # 图 om 必须指名到**文件**。没有「把目录里所有 om 都装上、让 ACL 自己匹配」
+        # 这回事 —— 那是单算子 API 的玩法（aclopSetModelDir），而且正是它导致过
+        # 「目录里留着上一个形状的 om，旧的反而先匹配上」。
+        if om_file is None:
+            if om_dir is None:
+                die("没给 om。图 om 要指名到文件：run_fused_conv2d.py case.bin FusedConv2d <device> <xxx.om>")
+            oms = [f for f in os.listdir(om_dir) if f.endswith(".om")]
+            if len(oms) != 1:
+                die("%s 下有 %d 个 .om（%s）。图 om 要指名到文件，不能靠目录匹配。"
+                    % (om_dir, len(oms), ", ".join(sorted(oms))))
+            om_file = os.path.join(om_dir, oms[0])
+            print("  目录里只有一个 .om，用它: %s" % oms[0])
+        mid = ctypes.c_uint32()
+        check(acl.aclmdlLoadFromFile(om_file.encode(), ctypes.byref(mid)),
+              "aclmdlLoadFromFile(%s) = " % os.path.basename(om_file) + "%d\n"
+              "        这个 om 是在**编译机**上生成的，板上不需要装算子包（kernel 的 ELF\n"
+              "        就在 om 文件里）。加载失败通常是 soc_version 和这块芯片不符。")
+        model_id = mid.value
+        mdesc = acl.aclmdlCreateDesc()
+        if not mdesc:
+            die("aclmdlCreateDesc 返回 null")
+        check(acl.aclmdlGetDesc(mdesc, model_id), "aclmdlGetDesc = %d")
+        n_in = int(acl.aclmdlGetNumInputs(mdesc))
+        n_out = int(acl.aclmdlGetNumOutputs(mdesc))
+        print("  aclmdlLoadFromFile OK: model_id=%d, %d 个输入, %d 个输出" % (model_id, n_in, n_out))
+        if n_out != 1:
+            die("这个模型报了 %d 个输出，FusedConv2d 只有一个 y" % n_out)
 
         keep = []          # 挡住 GC：host 侧缓冲在 memcpy 之前不能被回收
         dev_ptrs, descs, bufs = [], [], []
@@ -961,89 +1019,108 @@ def main():
             dev_ptrs.append(dev)
             descs.append(desc)
             bufs.append(buf)
+        # ---- 按**模型自己报的**输入表喂数据 ----
+        # 和单算子 om 的本质差别：图 om 里缺席的 optional 输入**根本不是模型输入**
+        # （dump 出来是节点输入表里的一个空槽），所以 n_in 是 7 而不是 8，不需要
+        # UNDEFINED 占位。单算子那套「槽位不能压缩、q1/q2 不能左移」的规则在这条
+        # 路上不适用 —— 那条规则是 aclopExecuteV2 按 numInputs 匹配 .om 带来的。
+        present = [n for n in INPUT_SLOTS if n in tensors]
 
-        def make_optional_placeholder():
-            # ACL 的执行期 optional-input 规则和 ATC singleop JSON 一致：槽位不能
-            # 压缩。没有数据的输入仍传 UNDEFINED desc + 空 DataBuffer。只传实际
-            # 张量会改变 numInputs/位置，模型明明加载成功也会 MatchOpModel 100024。
-            desc = acl.aclCreateTensorDesc(ACL_DT_UNDEFINED, 0, None, ACL_FORMAT_UNDEFINED)
-            if not desc:
-                die("aclCreateTensorDesc(UNDEFINED optional input) 返回 null")
-            buf = acl.aclCreateDataBuffer(None, 0)
-            if not buf:
-                acl.aclDestroyTensorDesc(desc)
-                die("aclCreateDataBuffer(nullptr, 0) 返回 null")
-            dev_ptrs.append(None)  # cleanup 时明确跳过 aclrtFree
-            descs.append(desc)
-            bufs.append(buf)
+        # **优先按名字定位下标，不赌模型的输入顺序。** om 的模型输入名就是 onnx 图的
+        # 输入名，而那又是 case.bin 里的张量名 —— fc2d_onnx.py 刻意让三者同名，
+        # 所以正常情况下每个都查得到。老的 run_om.py 在这里吃过亏：它只按下标喂，
+        # GetInputNameByIndex 的结果仅打印给人看。
+        feed, how = [None] * n_in, "名字"
+        idx_by_name = getattr(acl, "aclmdlGetInputIndexByName", None)
+        if idx_by_name is None:
+            how = None
+        else:
+            for slot in present:
+                k = ctypes.c_size_t()
+                if idx_by_name(mdesc, slot.encode(), ctypes.byref(k)) != ACL_SUCCESS:
+                    how = None
+                    break
+                i = int(k.value)
+                if not (0 <= i < n_in) or feed[i] is not None:
+                    how = None
+                    break
+                feed[i] = slot
+        if how is None or any(f is None for f in feed):
+            # 退回 IR 顺序。**这是猜的**，所以要打出来让人看见；下面那段字节数校验
+            # 是唯一的安全网。
+            if n_in != len(present):
+                die("模型报了 %d 个输入，而这条 dtype 通路有 %d 个有数据的槽（%s），\n"
+                    "    而且按名字取下标也没成功 —— 对不上就不能靠顺序猜。\n"
+                    "    先确认这个 .om 是用同一个 case.bin 编的。"
+                    % (n_in, len(present), ", ".join(present)))
+            feed, how = list(present), "IR 顺序（按名字取下标没成功，这是猜的）"
 
-        # 实参 ABI 顺序钉死为 8 个 IR 槽。未使用的 optional input 也必须占位；
-        # 不能把数组压短，更不能让后面的 q1/q2 左移到前一个 optional 的位置。
-        for name in slots:
-            if name is None:
-                make_optional_placeholder()
-            else:
-                dtype, dims, data = tensors[name]
-                make_operand(dtype, dims, data)
+        name_by_idx = getattr(acl, "aclmdlGetInputNameByIndex", None)
+        print("\n模型输入表（定位方式: %s）:" % how)
+        bad = False
+        for i, slot in enumerate(feed):
+            nb = int(acl.aclmdlGetInputSizeByIndex(mdesc, i))
+            mn = "?"
+            if name_by_idx is not None:
+                raw = name_by_idx(mdesc, i)
+                if raw:
+                    mn = raw.decode("utf-8", "replace")
+            data = tensors[slot][2]
+            mark = "OK" if len(data) == nb else "** 模型要 %d，case.bin 给 %d **" % (nb, len(data))
+            if len(data) != nb:
+                bad = True
+            print("  [%d] 模型说 %-16s <- case.bin 的 %-16s %9d 字节  %s" % (i, mn, slot, nb, mark))
+        if bad:
+            die("输入字节数和模型要的对不上。顺序错了也会这样 —— 上面那张表就是模型要的顺序。")
+
+        for slot in feed:
+            dtype, dims, data = tensors[slot]
+            make_operand(dtype, dims, data)
 
         # 输出缓冲预填哨兵 127：kernel 一个字节都没写的话，读回来还是 127，
         # 这是"返回码 0 但什么都没算"唯一能被抓住的地方。
         make_operand(y_dtype, y_dims, bytes([Y_SENTINEL_BYTE]) * (y_elems * yElemBytes))
 
-        NIN = len(INPUT_SLOTS)
-        in_desc = (ctypes.c_void_p * NIN)(*descs[:NIN])
-        in_buf = (ctypes.c_void_p * NIN)(*bufs[:NIN])
-        out_desc = (ctypes.c_void_p * 1)(descs[NIN])
-        out_buf = (ctypes.c_void_p * 1)(bufs[NIN])
+        # NIN 在下面还当"输出操作数的下标"用（读回 dev_ptrs[NIN]、收尾 range(NIN+1)），
+        # 所以它必须等于模型的输入个数，不能再是 len(INPUT_SLOTS)。
+        NIN = n_in
+        out_nb = int(acl.aclmdlGetOutputSizeByIndex(mdesc, 0))
+        if out_nb != y_bytes:
+            die("模型的输出是 %d 字节，case.bin 的 y 是 %d 字节 —— 形状对不上，"
+                "这个 .om 大概不是用这个 case.bin 编的" % (out_nb, y_bytes))
+
+        ds_in = acl.aclmdlCreateDataset()
+        ds_out = acl.aclmdlCreateDataset()
+        if not ds_in or not ds_out:
+            die("aclmdlCreateDataset 返回 null")
+        for i in range(NIN):
+            check(acl.aclmdlAddDatasetBuffer(ds_in, bufs[i]),
+                  "aclmdlAddDatasetBuffer(in %d) = " % i + "%d")
+        check(acl.aclmdlAddDatasetBuffer(ds_out, bufs[NIN]), "aclmdlAddDatasetBuffer(out) = %d")
 
         # 两个定点定标是**必需属性**。顺序和 fused_conv2d_def.cpp 里 Attr() 的调用
         # 顺序一致（fixed_shift1 在前），tiling 侧按 GetInt(0)/GetInt(1) 取。
-        attr = acl.aclopCreateAttr()
-        if not attr:
-            die("aclopCreateAttr 返回 null")
-        setattr_fn = getattr(acl, "aclopSetAttrInt", None)
-        if setattr_fn is None:
-            die("这个 CANN 的 libascendcl.so 里没有 aclopSetAttrInt —— 属性传不下去")
-        # 下发的属性集必须和编 .om 时那份**完全一致** —— ACL 匹配 .om 是连 attr 一起
-        # 匹配的，多设一个或少设一个都会 MatchOpModel fail，而报出来是 100024 /
-        # 「算子没找到」，那条信息完全不指向真正的原因。
+        # **属性不再下发。** 图 om 的属性在编译期就烘进去了，aclmdlExecute 不吃属性。
+        # 于是「下发的属性集和编 .om 时那份对不上 -> MatchOpModel fail -> 报成 100024
+        # 算子没找到」这一整类失败不存在了 —— 那是 aclopExecuteV2 按 op 类型 +
+        # shape/dtype/format + **全部 attr 的值**一起匹配 .om 带来的。
+        # 现在属性的唯一来源是编 om 那一步（fc2d_onnx.tensor_plan），两边不可能不一致。
         #
-        # 所以这里**八个属性一个不少地全设**，fc2d.py 生成 singleop.json 时也全写。
-        # 上一版是两条通路各设一个子集，于是「int8 分支之后又无条件设了 fixed_shift」
-        # 这种事就会炸，而且炸得像算子没装。全集没有这个问题。
-        for fn in ("aclopSetAttrBool", "aclopSetAttrListInt"):
-            if getattr(acl, fn, None) is None:
-                die("这个 CANN 的 libascendcl.so 里没有 %s —— 属性传不下去" % fn)
-        for nm, v in (("fixed_shift1", shift1), ("fixed_shift2", shift2), ("a16w8_shift1", 29)):
-            rc = setattr_fn(attr, nm.encode(), v)
-            if rc != ACL_SUCCESS:
-                die("aclopSetAttrInt(%s=%d) = %d" % (nm, v, rc))
-        for nm, v in (("relu1", bool(info["relu1"])), ("relu2", bool(info["relu2"]))):
-            rc = acl.aclopSetAttrBool(attr, nm.encode(), 1 if v else 0)
-            if rc != ACL_SUCCESS:
-                die("aclopSetAttrBool(%s=%s) = %d" % (nm, v, rc))
-        # 两层同核时发长度 2（和 .om 的签名一致），不同核时发长度 4。
-        # 老的 .bin 在 kh2/kw2 上是 0，退回 kh/kw 正好。
+        # 仍然打出来：它是"这个 .om 到底是按什么几何编的"的唯一人读线索，
+        # 而且 om 里没有地方能直接看到这些值。
+        attr = None
         kh2 = info.get("kh2") or info["kh"]
         kw2 = info.get("kw2") or info["kw"]
-        ksize = ([info["kh"], info["kw"]] if (kh2, kw2) == (info["kh"], info["kw"])
-                 else [info["kh"], info["kw"], kh2, kw2])
-        for nm, vals in (("kernel_size", ksize),
-                         ("strides", [info["s1"], info["s2"]]),
-                         ("pads", [info["ph1"], info["pw1"], info["ph2"], info["pw2"]])):
-            arr = (ctypes.c_int64 * len(vals))(*vals)
-            rc = acl.aclopSetAttrListInt(attr, nm.encode(), len(vals), arr)
-            if rc != ACL_SUCCESS:
-                die("aclopSetAttrListInt(%s=%s) = %d" % (nm, vals, rc))
-        print("算子属性: fixed_shift=%d/%d relu=%s/%s a16w8_shift1=29 "
-              "kernel=%dx%d>%dx%d strides=%d/%d pads=%d,%d/%d,%d"
+        print("算子属性（编译期已烘进 om，此处仅供核对）: fixed_shift=%d/%d relu=%s/%s "
+              "a16w8_shift1=29 kernel=%dx%d>%dx%d strides=%d/%d pads=%d,%d/%d,%d"
               % (shift1, shift2, bool(info["relu1"]), bool(info["relu2"]),
                  info["kh"], info["kw"], kh2, kw2, info["s1"], info["s2"],
                  info["ph1"], info["pw1"], info["ph2"], info["pw2"]))
 
         def launch():
-            return acl.aclopExecuteV2(op_type.encode(), NIN, in_desc, in_buf,
-                                      1, out_desc, out_buf, attr, stream)
+            # aclmdlExecute 是**同步**的：返回时 kernel 已经跑完，不需要
+            # aclrtSynchronizeStream。（异步要的是 aclmdlExecuteAsync + stream。）
+            return acl.aclmdlExecute(model_id, ds_in, ds_out)
 
         # 总共下发 warmup + repeat 次；只有后 repeat 次计入统计。
         durs = []
@@ -1052,22 +1129,17 @@ def main():
             ret = launch()
             if ret != ACL_SUCCESS:
                 if k == 0:
-                    die('aclopExecuteV2("%s") = %d\n'
-                        "        走 .om（已 aclopSetModelDir）时最常见的其实不是「没装」，而是**匹配不上**：\n"
-                        "          ACL 拿 op 类型 + 每个 tensor 的 shape/dtype/format + **全部 attr 的值**\n"
-                        "          一起去匹配 .om，任何一项对不上都报成这个「算子没找到」。\n"
-                        "          本次下发的属性: fixed_shift1=%d fixed_shift2=%d\n"
-                        "          编 .om 时用的值在同目录的 singleop.json 里，先比这两个数。\n"
-                        "          对不上 -> 重跑 om 那一步（singleop.json 是从这个 .bin 的 spec 现生成的，\n"
-                        "                    所以只要用同一个 .bin 就不会对不上）\n"
-                        "        真的没装 -> grep -ri '\"%s\"' $ASCEND_OPP_PATH/built-in/op_impl/ai_core/tbe/config/\n"
-                        "        装了但选不出 kernel -> shape/dtype 和 binary.json 里登记的组合对不上"
-                        % (op_type, ret, shift1, shift2, op_type))
-                die("第 %d 次 aclopExecuteV2 = %d" % (k + 1, ret))
-            ret = acl.aclrtSynchronizeStream(stream)
-            if ret != ACL_SUCCESS:
-                die("第 %d 次 aclrtSynchronizeStream = %d —— kernel 可能 abort 了，查 device 日志"
-                    % (k + 1, ret))
+                    die("aclmdlExecute(model_id=%d) = %d\n"
+                        "        模型已经加载成功了，所以不是「算子没装」—— kernel 的 ELF 就在\n"
+                        "        om 文件里。图 om 走到这一步失败，先看这几条：\n"
+                        "          * 输入个数/字节数：上面那张模型输入表已经逐项核过了，\n"
+                        "            如果那里全 OK，就不是形状问题。\n"
+                        "          * device 侧日志（~/ascend/log/ 或 /var/log/npu）里的 AI Core 异常。\n"
+                        "          * 这个 .om 的 soc_version 和这块芯片是否一致。\n"
+                        "        注意：属性对不上导致的 MatchOpModel fail 在这条路上**不可能**发生，\n"
+                        "        属性是编译期烘进 om 的，没有运行期匹配这回事。"
+                        % (model_id, ret))
+                die("第 %d 次 aclmdlExecute = %d" % (k + 1, ret))
             dt = (time.perf_counter() - t0) * 1e6
             if k >= warmup:
                 durs.append(dt)
@@ -1185,12 +1257,18 @@ def main():
                  % ("int8" if info["outInt8"] else "fp16", y_dims[1], y_dims[2], y_dims[3]))
 
     if not dry_run:
-        acl.aclopDestroyAttr(attr)
+        if attr is not None:
+            acl.aclopDestroyAttr(attr)
+        acl.aclmdlDestroyDataset(ds_in)
+        acl.aclmdlDestroyDataset(ds_out)
         for i in range(NIN + 1):
             acl.aclDestroyDataBuffer(bufs[i])
             acl.aclDestroyTensorDesc(descs[i])
             if dev_ptrs[i]:
                 acl.aclrtFree(dev_ptrs[i])
+        # 先卸模型再销毁 desc：desc 是从 model_id 取出来的。
+        acl.aclmdlUnload(model_id)
+        acl.aclmdlDestroyDesc(mdesc)
         acl.aclrtDestroyStream(stream)
         acl.aclrtResetDevice(device_id)
         acl.aclFinalize()

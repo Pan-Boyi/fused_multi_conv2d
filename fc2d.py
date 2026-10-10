@@ -198,6 +198,11 @@ def read_spec(path):
 def singleop_json(spec):
     """从 .bin 的 spec 造 singleop 描述。
 
+    **这个函数已经不是编译路径了。** filters 改成 DYNAMIC list 之后 singleop
+    表达不了两个实例，编 om 走的是 fc2d_onnx.py（--framework=5）。保留它是因为
+    下面那段「八个属性一个不少地全写上」的推理对板侧下发仍然成立，而且形状/dtype
+    的派生规则和 fc2d_onnx.tensor_plan() 逐行同源 —— 改一边要改另一边。
+
     **八个属性一个不少地全写上。** ACL 是按属性的**值**匹配 .om 的，多一个少一个
     都会匹配不上，报出来是「算子没找到」。上一版 fp16 和 int8 各写一份 json、各带
     一个子集，于是执行时多设一个属性就炸 —— 这里统一成全集，那类问题不存在了。
@@ -356,23 +361,67 @@ def do_om(c, paths, soc):
         die("%s 还没生成 —— 先跑 --steps case" % paths["bin"])
     spec = read_spec(paths["bin"])
     os.makedirs(paths["omdir"], exist_ok=True)
-    with open(paths["singleop"], "w") as f:
-        json.dump(singleop_json(spec), f, indent=2)
-        f.write("\n")
-    print("  singleop: %s" % paths["singleop"])
-    # atc 会在 --output 目录下生成 <something>.om。先清空，免得目录里留着上一次
-    # 形状的 .om —— aclopSetModelDir 会把目录里所有 .om 都装进去，旧的那个可能
-    # 反而先匹配上，跑出来的是上一个形状的结果。
+
+    # 走 onnx，不走 singleop。
+    #
+    # 原因不是偏好：filters 是 DYNAMIC list，要两个实例（conv1 的核 + conv2 的核），
+    # 而 `atc --singleop` 给 DYNAMIC 输入只实例化**一个**。两轮实验、2 个算子、
+    # 3 个 SoC、4 种 json 键写法都是同一个结论：1 个实例能过 FE，>=2 个过不去。
+    # atc 的另一条前端（--framework）走完整 GE 图流水线，能表达多实例；而
+    # --mode 只有 1/5/6 三个**输出**方向的转换（model->json、ge dump->json、
+    # 显示信息），没有 json->om 的入口，所以 onnx 是 atc 这条路上唯一的选择。
+    #
+    # 这一步额外要求本机装了 onnx + protobuf 的 python 包，见文件头的依赖说明。
+    # 预检：onnx 解析插件在不在。
+    #
+    # 这是这条路最容易踩、而报错最不指向原因的一步。缺插件时 atc 报的是
+    #     E10501: IR for Op ... with optype FusedConv2d is not registered
+    # 或者干脆说不认识这个节点 —— 两种都不会提「你的算子包里没有 framework/onnx」。
+    # 插件要进 vendor 包，ops-nn 侧需要 variables.cmake 里有
+    # ONNX_PLUGIN_LIB_INSTALL_DIR、且 gen_cust_symbol() 调了 gen_onnx_plugin_symbol()
+    # —— 这两处原来都缺。所以这里只警告不致命：包可能是别人编的，形态未必一样。
+    opp = os.environ.get("ASCEND_CUSTOM_OPP_PATH", "")
+    if not opp:
+        print("  [!] 没设 ASCEND_CUSTOM_OPP_PATH。FusedConv2d 不在 toolkit 的内置算子库里，"
+              "atc 大概会说找不到这个算子。")
+    else:
+        found = []
+        for root, _dirs, files in os.walk(opp):
+            if os.path.basename(root) == "onnx" and "framework" in root:
+                found += [f for f in files if f.startswith("liboponnx_plugin") and f.endswith(".so")]
+        if found:
+            print("  onnx 解析插件: %s" % ", ".join(sorted(found)))
+        else:
+            print("  [!] %s 下找不到 framework/onnx/liboponnx_plugin*.so —— "
+                  "atc 多半会报 E10501「IR for Op ... is not registered」。"
+                  "算子包要用带 onnx 插件的版本重编。" % opp)
+
+    import fc2d_onnx
+    plan, checker = fc2d_onnx.write_onnx(spec, paths["onnx"])
+    print("  onnx: %s（checker: %s）" % (paths["onnx"], checker))
+    # 先清空旧 .om，免得 atc 失败时目录里留着上一次形状的产物被当成这次的结果。
     for fn in os.listdir(paths["omdir"]):
         if fn.endswith(".om"):
             os.remove(os.path.join(paths["omdir"], fn))
-    cmd = ["atc", "--singleop=" + paths["singleop"], "--soc_version=" + soc,
-           "--output=" + paths["omdir"], "--log=error"]
+    # --input_format=ND 是**刻意**的，不要改成 NCHW：两个权重是 FRACTAL_Z 形状的
+    # 四维元组（比如 filter1 = [9,4,16,32]），当 NCHW 理解会让 GE 以为需要换轴。
+    # 全程 ND 是实测通过的那条（dump 出来 7 个 Data 的 layout 全是 ND，没有插转置）。
+    #
+    # --framework=5 下 --output 是**文件前缀**而不是目录，atc 自己补 .om。
+    out_prefix = os.path.join(paths["omdir"], c["name"])
+    cmd = ["atc", "--model=" + paths["onnx"], "--framework=5",
+           "--soc_version=" + soc, "--input_format=ND",
+           "--input_shape=" + fc2d_onnx.input_shape_arg(plan),
+           "--output=" + out_prefix, "--log=error"]
     print("  " + " ".join(cmd))
     rc = run(cmd)
     if rc != 0:
-        die("atc 返回 %d（%s）。常见原因：算子包没装、soc_version 不对、"
-            "或者这个形状被 tiling 拒了（看 ~/ascend/log/ 里的 OP_LOGE）" % (rc, c["name"]))
+        die("atc 返回 %d（%s）。常见原因：\n"
+            "    * 算子包没装、或 ASCEND_CUSTOM_OPP_PATH 没指到 <装到哪>/vendors/<name>_nn\n"
+            "    * 包里没有 onnx 解析插件 —— 查 vendors/<name>_nn/framework/onnx/liboponnx_plugin_*.so，\n"
+            "      没有的话 atc 会报 E10501「IR for Op ... is not registered」或者说不认识这个节点\n"
+            "    * soc_version 不对\n"
+            "    * 这个形状被 tiling 拒了（看 ~/ascend/log/ 里的 OP_LOGE）" % (rc, c["name"]))
     oms = [fn for fn in os.listdir(paths["omdir"]) if fn.endswith(".om")]
     if not oms:
         die("atc 说成功了但 %s 下没有 .om" % paths["omdir"])
@@ -505,6 +554,9 @@ def main():
             "bin": os.path.join(outdir, c["name"], "case.bin"),
             "omdir": os.path.join(outdir, c["name"], "om"),
             "singleop": os.path.join(outdir, c["name"], "singleop.json"),
+            # 编 om 的输入。singleop 那条已经不用了（DYNAMIC 表达不了多实例），
+            # 但键留着：路径字典是公开结构。
+            "onnx": os.path.join(outdir, c["name"], c["name"] + ".onnx"),
         }
         os.makedirs(os.path.join(outdir, c["name"]), exist_ok=True)
         step("%s  (%s)" % (c["name"], c["dtype"]))
