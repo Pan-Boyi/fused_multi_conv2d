@@ -677,6 +677,110 @@ def report_lsb(got, want, r, mismatches, dims, shift2):
         print("       => 偏差远超 1 个 ULP：这不是 round 的问题。")
 
 
+def report_error_map(got, want, dims):
+    """**错在哪里** —— 按输出行 / 通道 / 线性位移三个维度给分布。
+
+    原来的报告只说「有多少个不对」，不说「错在哪」。而这三张图各自指向不同的根因：
+
+      按行     dirty 的行成连续带 -> 分核或行带相关。kernel 按「行带 x 列段」分
+               chunk，一个核算坏了就表现成几条连续的输出行整段不对。
+      按通道   dirty 的通道成片或等间隔 -> per-channel 的东西取错了
+               （quant_scale 表、bias、或者权重的 Cout 维错位）。
+      线性位移 某个非零位移 k 的吻合率明显高于 k=0 -> 值算对了但**放错位置**，
+               而 k 直接告诉你错了多少个元素。
+
+    三张都平（到处错一点、没有结构）才是「算错了」而不是「放错了」，那时才该
+    去查定标和累加。
+    """
+    gv = got[0]
+    wv = want[0]
+    n = min(len(gv), len(wv))
+    if n == 0 or len(dims) < 4:
+        return
+    C, H, W = int(dims[1]), int(dims[2]), int(dims[3])
+    plane = H * W
+    if C * plane == 0 or C * plane > n:
+        return
+
+    bad_h = [0] * H
+    bad_c = [0] * C
+    tot_h = C * W
+    for i in range(C * plane):
+        if gv[i] != wv[i]:
+            bad_c[i // plane] += 1
+            bad_h[(i % plane) // W] += 1
+
+    print("\n[错误分布] 按输出行（共 %d 行，每行 %d 个元素）" % (H, tot_h))
+    runs = []
+    for hh in range(H):
+        state = "干净" if bad_h[hh] == 0 else ("全错" if bad_h[hh] == tot_h else "部分")
+        if runs and runs[-1][0] == state:
+            runs[-1][2] = hh
+        else:
+            runs.append([state, hh, hh])
+    for state, a, z in runs[:24]:
+        span = "h%d" % a if a == z else "h%d-%d" % (a, z)
+        worst = max(bad_h[a:z + 1])
+        print("    %-10s %-6s 最差一行 %d/%d (%.1f%%)" % (span, state, worst, tot_h,
+                                                        worst * 100.0 / tot_h))
+    if len(runs) > 24:
+        print("    ...（还有 %d 段）" % (len(runs) - 24))
+    if len(runs) == 1 and runs[0][0] != "干净":
+        print("    -> 所有行都受影响，不是分核/行带的问题")
+
+    nbadc = sum(1 for x in bad_c if x)
+    print("[错误分布] 按通道：%d/%d 个通道有错" % (nbadc, C))
+    if 0 < nbadc < C:
+        idx = [c for c in range(C) if bad_c[c]]
+        step = sorted(set(idx[i + 1] - idx[i] for i in range(len(idx) - 1))) if len(idx) > 1 else []
+        print("    出错的通道: %s%s" % (", ".join(str(c) for c in idx[:16]),
+                                       " ..." if len(idx) > 16 else ""))
+        if len(step) == 1:
+            print("    -> 等间隔 %d，像是 per-channel 的表按错的步长取了" % step[0])
+    elif nbadc == C:
+        print("    -> 每个通道都有错，不是 per-channel 的东西取错了")
+
+    # 线性位移：got[i] 和 want[i+k] 比。k=0 就是正常比对。
+    #
+    # **候选要连续扫，不能只挑几个"像样"的数。** 第一版只试了 0/±1/±2/±4/±8/±16/±W/
+    # ±2W/±plane，注入 +3 的位移时它一个都没命中，于是拿 -8 的 30.68% 对 k=0 的
+    # 30.51% —— 0.17% 的噪声差 —— 断言"位移 -8，值放错了"。**错的结论比没有结论更坏。**
+    # 所以现在两件事：连续扫 -64..64，并且要赢得够多才敢下结论。
+    lim = 64
+    cand = list(range(-lim, lim + 1))
+    for s in (W, 2 * W, 4 * W, plane):
+        cand += [s, -s, s + 1, -(s + 1)]
+    cand = sorted(set(cand))
+
+    def match_rate(k, stride):
+        hit = tot = 0
+        for i in range(0, C * plane, stride):
+            j = i + k
+            if 0 <= j < n:
+                tot += 1
+                if gv[i] == wv[j]:
+                    hit += 1
+        return (hit * 100.0 / tot) if tot else -1.0
+
+    coarse_stride = max(1, (C * plane) // 8000)
+    rough = sorted(((match_rate(k, coarse_stride), k) for k in cand), reverse=True)
+    fine_stride = max(1, (C * plane) // 60000)
+    refine = sorted(set([k for _, k in rough[:6]] + [0]))
+    rows = sorted(((match_rate(k, fine_stride), k) for k in refine), reverse=True)
+    base = dict((k, v) for v, k in rows).get(0, -1.0)
+    print("[错误分布] 线性位移探针（got[i] vs want[i+k]，扫 k=-%d..%d 及行/面步长）" % (lim, lim))
+    for rate, k in rows[:5]:
+        print("    k=%-7d 吻合 %.2f%%%s" % (k, rate, "   <- 正常比对" if k == 0 else ""))
+    best_rate, best_k = rows[0]
+    # 要赢得够多才算"位移"：噪声级的领先什么都不说明。
+    if best_k != 0 and best_rate >= max(base * 1.5, base + 15.0):
+        print("    -> **位移 %d 的吻合率 %.2f%% 显著高于正常比对的 %.2f%%**："
+              "值算对了但放错位置。" % (best_k, best_rate, base))
+    else:
+        print("    -> 没有显著胜出的位移（最好的 k=%d 只有 %.2f%%，正常比对 %.2f%%）——"
+              % (best_k, best_rate, base))
+        print("       不是整体错位，是算出来的值本身不对。")
+
 def report_vs_exact(got, exact, n):
     """对纯 fp32 参考。不设门槛，只报数。
 
@@ -1233,6 +1337,10 @@ def main():
             print("        判据就是逐位相等：golden 的乘累加是精确整数运算，出口按同一张表换算。")
     else:
         report_lsb(got, want, r, mismatches, y_dims, shift2)
+    # **四条 dtype 通路都要跑**：上面那几个分支是按出口定标分的，而「错在哪里」
+    # 和出口定标无关。原来它挂在 fp16 那条 else 里，int8 根本走不到。
+    if mismatches:
+        report_error_map(got, want, y_dims)
     report_ratio(got, want, r["n"])
     if info["outInt8"]:
         # int8 没有 y_exact，但抽样一样有用 —— 打整数就行。
