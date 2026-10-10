@@ -56,7 +56,8 @@
     "profile.msprof 是远端 msprof 的**绝对路径，写死，不搜 PATH**。远端那个 ssh 是",
     "非交互 shell，读不到 ~/.bashrc 里 source 的 set_env.sh —— 搜 PATH 会说「没有",
     "msprof」而其实装着；机器上有好几套 CANN 时还可能搜到不是这次要用的那一套。",
-    "指向 msprof 那个可执行文件本身。"
+    "指向 msprof 那个可执行文件本身。",
+    "  mt2_* / mt3_* 是**诊断用例**：现有用例里只有 base 家族每带有多个 conv2 M 子块，而那 7 条是同一形状的 dtype 变体，形状轴上只有 N=1。这四条换了形状再复现「每带 2/3 个 M 子块」，并且 *_resident 那两条 conv2 权重常驻 L0B（折 1 段），段环完全不参与 —— 用来把 q 循环和 L0B 段环分开。子块按行对齐（22->2x11、24->3x8、18->3x6），所以按行的错误分布能直接读出是第几个子块脏。"
   ],
   "soc_version": "MC62CM12AA",
   "local_cann_env": "/home/p84341448/Ascend-52/cann/set_env.sh",
@@ -555,6 +556,130 @@
         0,
         0,
         0
+      ],
+      "bias": true,
+      "relu": [
+        true,
+        true
+      ]
+    },
+    {
+      "name": "mt2_resident",
+      "dtype": "both",
+      "n": 1,
+      "ci": 32,
+      "hi": 176,
+      "wi": 48,
+      "cout1": 32,
+      "cout2": 32,
+      "kernel": [
+        3,
+        3,
+        3,
+        3
+      ],
+      "strides": [
+        1,
+        1
+      ],
+      "pads": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "bias": true,
+      "relu": [
+        true,
+        true
+      ]
+    },
+    {
+      "name": "mt2_folded",
+      "dtype": "both",
+      "n": 1,
+      "ci": 32,
+      "hi": 176,
+      "wi": 48,
+      "cout1": 128,
+      "cout2": 64,
+      "kernel": [
+        3,
+        3,
+        3,
+        3
+      ],
+      "strides": [
+        1,
+        1
+      ],
+      "pads": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "bias": true,
+      "relu": [
+        true,
+        true
+      ]
+    },
+    {
+      "name": "mt3_resident",
+      "dtype": "both",
+      "n": 1,
+      "ci": 32,
+      "hi": 192,
+      "wi": 96,
+      "cout1": 32,
+      "cout2": 32,
+      "kernel": [
+        3,
+        3,
+        3,
+        3
+      ],
+      "strides": [
+        1,
+        1
+      ],
+      "pads": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "bias": true,
+      "relu": [
+        true,
+        true
+      ]
+    },
+    {
+      "name": "mt3_folded",
+      "dtype": "both",
+      "n": 1,
+      "ci": 32,
+      "hi": 144,
+      "wi": 80,
+      "cout1": 64,
+      "cout2": 96,
+      "kernel": [
+        3,
+        3,
+        3,
+        3
+      ],
+      "strides": [
+        1,
+        1
+      ],
+      "pads": [
+        1,
+        1,
+        1,
+        1
       ],
       "bias": true,
       "relu": [
