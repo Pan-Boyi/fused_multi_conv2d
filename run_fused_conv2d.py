@@ -757,25 +757,6 @@ def main():
     dry_run = "--dry-run" in argv
     if dry_run:
         argv = [a for a in argv if a != "--dry-run"]
-    # --aclnn：走 aclnn 两段式下发，而不是 aclopExecuteV2 + .om。
-    # 为什么需要这条路，见 aclnn_launch.py 顶上的长注释。一句话：atc --singleop 的
-    # json **表达不了实例数 > 1 的 DYNAMIC 输入**（已实测），而把 filter/bias 做成
-    # list 是扩展到更多层卷积融合的前提。aclnn 侧有 aclCreateTensorList。
-    # 附带的好处：aclnn **不需要 .om**，kernel 直接从算子包找，
-    # 于是「属性值必须和 .om 完全一致否则报 100024」那一整类坑都不存在了。
-    use_aclnn = "--aclnn" in argv
-    if use_aclnn:
-        argv = [a for a in argv if a != "--aclnn"]
-    opapi_so = None
-    nnopbase_so = None
-    for _a in list(argv):
-        if _a.startswith("--opapi-so="):
-            opapi_so = _a.split("=", 1)[1]
-        elif _a.startswith("--nnopbase-so="):
-            # 板上环境没 source set_env.sh 时的手动兜底：直接把 libnnopbase.so
-            # 的绝对路径指过来，绕开所有自动探测。
-            nnopbase_so = _a.split("=", 1)[1]
-            argv.remove(_a)
     case_path, op_type, device_id, om_arg = "fused_conv2d_case.bin", "FusedConv2d", 0, None
     positional = []
     for a in argv:
@@ -919,7 +900,6 @@ def main():
     # 这两个来自 case 文件本身，和跑不跑硬件无关，所以必须在分叉之前拿到 ——
     # 之前它们在 ACL 那段里，dry-run 走不到，抽样处就 UnboundLocalError。
     y_dtype, y_dims, _ = tensors["y_expect"]
-    aclnn = None      # aclnn 下发器。只有 --aclnn 且非 dry-run 时才建；清理段按它判。
     if dry_run:
         # 用 golden 冒充设备输出，把 ACL 之后的整段（比对、诊断、抽样、判据）
         # 原样走一遍。目的不是验数值 —— 数值必然全对 —— 而是验**代码路径**：
@@ -928,12 +908,6 @@ def main():
         got = want
     else:
         check(acl.aclInit(None), "aclInit = %d")
-        # aclnn 不走离线模型：kernel 是 nnopbase 按 OpType 从**算子包**里找的，
-        # 和 .om 完全无关。给了 .om 也直接忽略，免得 aclopSetModelDir 把一堆
-        # 无关的 .om 都加载进来（它吃的是目录，会装下面所有 .om）。
-        if use_aclnn and (om_file is not None or om_dir is not None):
-            print("  [aclnn] 忽略传入的 .om —— aclnn 直接从算子包找 kernel，不用离线模型")
-            om_file = om_dir = None
         # 离线模型的注册。要在 aclopExecuteV2 之前，和 aclrtSetDevice 的先后无所谓。
         om_keep = []
         if om_file is not None:
@@ -969,11 +943,7 @@ def main():
         keep = []          # 挡住 GC：host 侧缓冲在 memcpy 之前不能被回收
         dev_ptrs, descs, bufs = [], [], []
 
-        # aclnn 要的是 device 地址（它自己用 aclCreateTensor 包），而 singleop 要的是
-        # desc + DataBuffer。两条路共用同一份 malloc + H2D，只在「怎么包」上分叉。
-        dev_by_name = {}
-
-        def make_operand(dtype, dims, data, name=None):
+        def make_operand(dtype, dims, data):
             dev = ctypes.c_void_p()
             check(acl.aclrtMalloc(ctypes.byref(dev), len(data), ACL_MEM_MALLOC_HUGE_FIRST),
                   "aclrtMalloc(%d) 失败, ret = " % len(data) + "%d")
@@ -991,8 +961,6 @@ def main():
             dev_ptrs.append(dev)
             descs.append(desc)
             bufs.append(buf)
-            if name is not None:
-                dev_by_name[name] = dev
 
         def make_optional_placeholder():
             # ACL 的执行期 optional-input 规则和 ATC singleop JSON 一致：槽位不能
@@ -1016,11 +984,11 @@ def main():
                 make_optional_placeholder()
             else:
                 dtype, dims, data = tensors[name]
-                make_operand(dtype, dims, data, name)
+                make_operand(dtype, dims, data)
 
         # 输出缓冲预填哨兵 127：kernel 一个字节都没写的话，读回来还是 127，
         # 这是"返回码 0 但什么都没算"唯一能被抓住的地方。
-        make_operand(y_dtype, y_dims, bytes([Y_SENTINEL_BYTE]) * (y_elems * yElemBytes), "y")
+        make_operand(y_dtype, y_dims, bytes([Y_SENTINEL_BYTE]) * (y_elems * yElemBytes))
 
         NIN = len(INPUT_SLOTS)
         in_desc = (ctypes.c_void_p * NIN)(*descs[:NIN])
@@ -1073,34 +1041,9 @@ def main():
                  info["kh"], info["kw"], kh2, kw2, info["s1"], info["s2"],
                  info["ph1"], info["pw1"], info["ph2"], info["pw2"]))
 
-        if use_aclnn:
-            # 算子侧一行代码都不用改：conv/fused_conv2d/op_host/CMakeLists.txt 本来就是
-            # ACLNNTYPE aclnn，opbuild 会从 OpDef 自动生成两段式接口
-            # （build/autogen/aclnn_fused_conv2d.{h,cpp}）。手写一份 op_api 只会和
-            # 生成的那份重名冲突（实测 ld 报 multiple definition）。
-            import aclnn_launch
-            try:
-                aclnn = aclnn_launch.AclnnLauncher(
-                    acl, nnopbase_so=nnopbase_so, opapi_so=opapi_so)
-            except aclnn_launch.AclnnUnavailable as e:
-                die("aclnn 路径起不来:\n        %s" % e)
-            print("  [aclnn] nnopbase: %s" % aclnn.nnopbase_path)
-            print("  [aclnn] 算子包:   %s" % aclnn.opapi_path)
-            a_in = {nm: aclnn.tensor(tensors[nm][0], tensors[nm][1], dev_by_name[nm])
-                    for nm in slots if nm is not None}
-            a_out = aclnn.tensor(y_dtype, y_dims, dev_by_name["y"])
-            a_attrs = aclnn.make_attrs(info, shift1, shift2)
-            print("  [aclnn] 传入 %d 个张量（缺席的可选输入传 nullptr，不占位）: %s"
-                  % (len(a_in), ", ".join(sorted(a_in))))
-
-            def launch():
-                # 每轮都重走第一段：executor 是一次性的，第二段调用后就失效。
-                rc, _ws = aclnn.run_once(a_in, a_attrs, a_out, stream)
-                return rc
-        else:
-            def launch():
-                return acl.aclopExecuteV2(op_type.encode(), NIN, in_desc, in_buf,
-                                          1, out_desc, out_buf, attr, stream)
+        def launch():
+            return acl.aclopExecuteV2(op_type.encode(), NIN, in_desc, in_buf,
+                                      1, out_desc, out_buf, attr, stream)
 
         # 总共下发 warmup + repeat 次；只有后 repeat 次计入统计。
         durs = []
@@ -1242,8 +1185,6 @@ def main():
                  % ("int8" if info["outInt8"] else "fp16", y_dims[1], y_dims[2], y_dims[3]))
 
     if not dry_run:
-        if aclnn is not None:
-            aclnn.close()
         acl.aclopDestroyAttr(attr)
         for i in range(NIN + 1):
             acl.aclDestroyDataBuffer(bufs[i])
