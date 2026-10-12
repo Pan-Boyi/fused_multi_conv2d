@@ -52,16 +52,29 @@ OPSET = 11
 # 槽位名沿用 case.bin 里的张量名（filter1/filter2 而不是 filters_0/filters_1），
 # 这样「case.bin 里的 blob 名」和「om 的模型输入名」是同一个名字，板侧按名字取
 # 下标就不需要任何映射表。
+# 节点输入列表的顺序。IR 是 x | filters(DYNAMIC) | bias(DYNAMIC) | quant(DYNAMIC)，
+# 三个 list 的实例都**按层**排，所以摊平之后就是下面这个顺序。
+#
+# 槽位名沿用 case.bin 里的张量名 —— onnx 的图输入名、om 的模型输入名、case.bin
+# 的张量名刻意三者同名，这样板侧按名字取下标不需要映射表。**IR 里的名字
+# （filters/bias/quant）和这些名字无关**，IR 的归属是靠位置定的。
+#
+# 和旧 IR 的差别只有一处：dequant_scale2 从 quant_scale1 **前面**挪到了后面。
+# 新约定是 quant 的 instance 0 恒为 conv1 的表、instance 1 恒为 conv2 的表，
+# 而 dq2 是 conv2 的那张。
 IR_SLOT_NAMES = [
     "x",
     "filter1",
     "filter2",
     "bias1",
     "bias2",
-    "dequant_scale2",
     "quant_scale1",
     "quant_scale2",
+    "dequant_scale2",
 ]
+# ge::DataType 的取值（graph/types.h）。out_dtype 属性直接发这个数。
+GE_DT_FLOAT16 = 1
+GE_DT_INT8 = 2
 
 DTYPE_FP16, DTYPE_INT8, DTYPE_S8F16, DTYPE_A16W8 = 0, 1, 2, 3
 
@@ -103,20 +116,26 @@ def tensor_plan(spec):
         "bias1": (bt, [spec["cout1"]]),
         "bias2": (bt, [spec["cout2"]]),
     }
-    # 三个 scale 按通路取舍。缺席的槽在 onnx 里是**空串输入**，不是占位张量 ——
-    # 这和 singleop 的 RESERVED/UNDEFINED 占位是两套不同的约定，别混。
+    # **三个 list 都恒长发满，哪些是真的由属性/dtype 说。**
+    # 本来想让「这一层没 bias」= list 短一截，但 **DYNAMIC 输入的实例数不能是 0**
+    # —— atc 报 EZ3002「the quantity of dynamic input[bias] should be larger than
+    # zero」。0 元素张量占位也走不通（E10011「Shape values must be positive
+    # integers」），list 中间留空串更走不通（死在 GE 的 Verify）。三条都是实测。
+    #
+    # 于是：bias 恒发两个张量，bias_mask 说哪些是真的；quant 恒发两个张量，
+    # 哪张表会被读由 dtype 组合决定。全 fp16 通路那两个 quant 是纯占位 ——
+    # case.bin 里没有它们，运行器按模型报的字节数现合成零缓冲。
+    has_bias = bool(spec["bias"])
+    # quant 的 instance 0 恒是 conv1 的表、instance 1 恒是 conv2 的表。
+    # instance 1 的**名字**按这条通路上的用途取：出 fp16 是反量化表、出 int8 是
+    # 重量化表。全 fp16 通路两张都不读，沿用 quant_scale1/quant_scale2 这两个名字。
+    slots["quant_scale1"] = ("uint64", [spec["cout1"]])
     if s8f16 or a16w8:
         slots["dequant_scale2"] = ("uint64", [spec["cout2"]])
-        slots["quant_scale1"] = ("uint64", [spec["cout1"]])
         slots["quant_scale2"] = (None, [])
-    elif mode == DTYPE_INT8:
-        slots["dequant_scale2"] = (None, [])
-        slots["quant_scale1"] = ("uint64", [spec["cout1"]])
-        slots["quant_scale2"] = ("uint64", [spec["cout2"]])
     else:
         slots["dequant_scale2"] = (None, [])
-        slots["quant_scale1"] = (None, [])
-        slots["quant_scale2"] = (None, [])
+        slots["quant_scale2"] = ("uint64", [spec["cout2"]])
 
     attrs = {
         "fixed_shift1": int(spec["shift1"]),
@@ -130,6 +149,14 @@ def tensor_plan(spec):
         "strides": [int(spec["s1"]), int(spec["s2"])],
         "pads": [int(spec["ph1"]), int(spec["pw1"]), int(spec["ph2"]), int(spec["pw2"])],
         "a16w8_shift1": 29,
+        # ---- bias/quant 合并成 DYNAMIC list 之后新增的两个 ----
+        # y 的 dtype。以前是算子从「dq2 传没传」推断的，三张定标表并进 quant 之后
+        # 那个判别消失了（x int8 出 int8 和 x int8 出 fp16 的输入侧完全同形），
+        # 所以改成显式声明。
+        "out_dtype": GE_DT_FLOAT16 if out_fp16 else GE_DT_INT8,
+        # 哪些层带 bias。bit i = conv_{i+1}。bias list **恒有一层一个实例**，
+        # 没被 mask 选中的那个张量算子不读（恒长的理由见上面）。
+        "bias_mask": 3 if has_bias else 0,
     }
     return {
         "slots": [(n,) + tuple(slots[n]) for n in IR_SLOT_NAMES],
@@ -148,8 +175,13 @@ def build_model(plan):
     node_inputs = []
     for name, dt, shape in plan["slots"]:
         if dt is None:
-            # ONNX 表达「缺席的可选输入」就是空串。
-            node_inputs.append("")
+            # **新 IR 里没有 OPTIONAL 输入了** —— x 是 REQUIRED，其余三个都是
+            # DYNAMIC list，「没有」是靠 list 短一截表达的，不是靠空串占位。
+            # 所以这里直接跳过，节点输入列表里不留空洞。
+            #
+            # 留洞这条路是实测走不通的：DYNAMIC list 内部给空串会死在 GE 自己的
+            # Verify 上（我们的 infershape 根本不会被调到）。0 元素张量也走不通
+            # （atc 的 --input_shape 直接拒，E10011）。
             continue
         graph_inputs.append(helper.make_tensor_value_info(name, ONNX_DT[dt], shape))
         node_inputs.append(name)

@@ -105,8 +105,11 @@ ORDER = ["x", "filter1", "bias1", "filter2", "bias2"]
 #     dequant_scale2=5, quant_scale1=6, quant_scale2=7
 # （fused_conv2d_def.cpp 的 Input() 调用顺序）。槽位名沿用 case.bin 里的张量名，
 # 这样和 onnx 图的输入名、om 的模型输入名是同一个名字，按名字取下标不需要映射表。
+# 和旧版的差别只有一处：dequant_scale2 从 quant_scale1 **前面**挪到了后面。
+# 新 IR 的 quant list 里 instance 0 恒是 conv1 的表、instance 1 恒是 conv2 的表，
+# 而 dq2 是 conv2 的那张。
 INPUT_SLOTS = ["x", "filter1", "filter2", "bias1", "bias2",
-               "dequant_scale2", "quant_scale1", "quant_scale2"]
+               "quant_scale1", "quant_scale2", "dequant_scale2"]
 ORDER_INT8 = ORDER + ["quant_scale1", "quant_scale2"]
 ORDER_S8F16 = ORDER + ["dequant_scale2", "quant_scale1"]
 ORDER_A16W8 = ORDER_S8F16
@@ -123,6 +126,26 @@ DTYPE_FP16 = 0
 DTYPE_INT8 = 1
 DTYPE_S8F16 = 2
 DTYPE_A16W8 = 3
+
+
+def model_input_slots(info):
+    """这条 dtype 通路 + bias 配置下，om **实际**要的输入，按 IR 顺序。
+
+    必须和 fc2d_onnx.tensor_plan 的槽位取舍逐项一致 —— 两边是同一个约定的两份
+    实现。为什么不 import：运行器要能单独跑在板子机上，do_push 只拷 case.bin /
+    .om / 这个文件三样过去，import 不到 fc2d_onnx。
+    （同样的理由让 SPEC_KEYS 也有两份抄本，见 _check_spec_keys_in_sync。）
+    """
+    # 三个 list 都恒长：bias 恒两个（bias_mask 说哪些是真的）、quant 恒两个
+    # （dtype 组合说哪张会被读）。**DYNAMIC 输入的实例数不能是 0**，所以「没有」
+    # 不能用「少给张量」表达 —— 详见 fc2d_onnx.tensor_plan 里那段。
+    slots = ["x", "filter1", "filter2", "bias1", "bias2", "quant_scale1"]
+    # instance 1 的名字按这条通路上的用途取。
+    if info["dtype_mode"] in (DTYPE_S8F16, DTYPE_A16W8):
+        slots.append("dequant_scale2")
+    else:
+        slots.append("quant_scale2")
+    return slots
 
 
 def runtime_input_slots(info):
@@ -1135,7 +1158,25 @@ def main():
         # （dump 出来是节点输入表里的一个空槽），所以 n_in 是 7 而不是 8，不需要
         # UNDEFINED 占位。单算子那套「槽位不能压缩、q1/q2 不能左移」的规则在这条
         # 路上不适用 —— 那条规则是 aclopExecuteV2 按 numInputs 匹配 .om 带来的。
-        present = [n for n in INPUT_SLOTS if n in tensors]
+        # **不能写成「case.bin 里有的都喂」。** case.bin 无条件带 bias1/bias2 的
+        # blob（gen_case 一直这么写），而 bias: false 的用例编出来的 om 里没有
+        # bias 输入 —— 按「有 blob 就喂」会比模型多两个，撞到下面那条
+        # 「模型报了 N 个输入」的 die。该喂哪些由**同一条规则**算出来。
+        present = model_input_slots(info)
+        # 全 fp16 通路的两个 quant 实例是**纯占位**：恒长要求图里必须有它们，
+        # 但 gen_case 在这条通路上不产定标表，所以 case.bin 里没有。按模型自己
+        # 报的字节数现合成零缓冲 —— 算子一次都不会去读（kernel 入口那里是
+        # if constexpr，编译期就剪掉了）。
+        #
+        # 只允许 quant 的两个槽缺；别的槽缺了是真问题，要出声。
+        placeholder_ok = {"quant_scale1", "quant_scale2", "dequant_scale2"}
+        missing = [n for n in present if n not in tensors]
+        unexpected = [n for n in missing if n not in placeholder_ok]
+        if unexpected:
+            die("这条通路要喂 %s，但 case.bin 里没有：%s" % (present, unexpected))
+        if missing:
+            print("  （%s 是恒长要求的占位输入，case.bin 里没有，按零缓冲喂）"
+                  % ", ".join(missing))
 
         # **优先按名字定位下标，不赌模型的输入顺序。** om 的模型输入名就是 onnx 图的
         # 输入名，而那又是 case.bin 里的张量名 —— fc2d_onnx.py 刻意让三者同名，
@@ -1176,16 +1217,30 @@ def main():
                 raw = name_by_idx(mdesc, i)
                 if raw:
                     mn = raw.decode("utf-8", "replace")
-            data = tensors[slot][2]
-            mark = "OK" if len(data) == nb else "** 模型要 %d，case.bin 给 %d **" % (nb, len(data))
-            if len(data) != nb:
-                bad = True
-            print("  [%d] 模型说 %-16s <- case.bin 的 %-16s %9d 字节  %s" % (i, mn, slot, nb, mark))
+            if slot in tensors:
+                data = tensors[slot][2]
+                mark = "OK" if len(data) == nb else "** 模型要 %d，case.bin 给 %d **" % (nb, len(data))
+                if len(data) != nb:
+                    bad = True
+                src = "case.bin 的 %-16s" % slot
+            else:
+                # 恒长占位：按模型报的字节数补零，所以字节数天然对得上。
+                mark = "OK（零占位）"
+                src = "零缓冲占位    %-6s" % ""
+            print("  [%d] 模型说 %-16s <- %s %9d 字节  %s" % (i, mn, src, nb, mark))
         if bad:
             die("输入字节数和模型要的对不上。顺序错了也会这样 —— 上面那张表就是模型要的顺序。")
 
-        for slot in feed:
-            dtype, dims, data = tensors[slot]
+        for i, slot in enumerate(feed):
+            if slot in tensors:
+                dtype, dims, data = tensors[slot]
+            else:
+                # 恒长占位。dtype/dims 只用于日志，真正下发的是字节数，所以直接
+                # 按模型报的大小补零。
+                nb = int(acl.aclmdlGetInputSizeByIndex(mdesc, i))
+                # 10 = uint64（DTYPE_NAME/DTYPE_SIZE 那张表里的编号）。dtype/dims
+                # 只进日志，真正下发的是字节数，所以按模型报的大小补零就够。
+                dtype, dims, data = 10, [nb // 8], bytes(nb)
             make_operand(dtype, dims, data)
 
         # 输出缓冲预填哨兵 127：kernel 一个字节都没写的话，读回来还是 127，
