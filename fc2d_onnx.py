@@ -33,6 +33,7 @@ except ImportError as e:   # noqa: F401
 # 通路吃的就是这个），不是真的当整数用。
 ONNX_DT = {
     "float16": TensorProto.FLOAT16,
+    "float32": TensorProto.FLOAT,
     "int8": TensorProto.INT8,
     "int32": TensorProto.INT32,
     "uint64": TensorProto.UINT64,
@@ -62,6 +63,10 @@ OPSET = 11
 # 和旧 IR 的差别只有一处：dequant_scale2 从 quant_scale1 **前面**挪到了后面。
 # 新约定是 quant 的 instance 0 恒为 conv1 的表、instance 1 恒为 conv2 的表，
 # 而 dq2 是 conv2 的那张。
+# 节点输入表的顺序 == IR 端口顺序：
+#   x | filters[0..1] | bias[0..1] | scale[0..1] | relu_weight[0..1]
+# 这里的名字只是 case.bin / 日志里用的人读名字，和 IR 的输入名无关 ——
+# om 的输入名来自 ONNX 图的 input 名字，不是 IR 名字。
 IR_SLOT_NAMES = [
     "x",
     "filter1",
@@ -71,12 +76,18 @@ IR_SLOT_NAMES = [
     "quant_scale1",
     "quant_scale2",
     "dequant_scale2",
+    "relu_weight1",
+    "relu_weight2",
 ]
-# ge::DataType 的取值（graph/types.h）。out_dtype 属性直接发这个数。
+# ge::DataType 的取值（graph/types.h）。dtype 属性直接发这个数。
 GE_DT_FLOAT16 = 1
 GE_DT_INT8 = 2
 
 DTYPE_FP16, DTYPE_INT8, DTYPE_S8F16, DTYPE_A16W8 = 0, 1, 2, 3
+
+# relu 属性的取值 = 硬件的 ReluMode 枚举（kernel_utils_mode.h:54）。
+# 2 = SCALAR_RELU / 3 = VECTOR_RELU 要用 relu_weight 那张斜率表，算子侧还没落地。
+RELU_NO, RELU_NORMAL, RELU_SCALAR, RELU_VECTOR = 0, 1, 2, 3
 
 
 def tensor_plan(spec):
@@ -136,6 +147,16 @@ def tensor_plan(spec):
     else:
         slots["dequant_scale2"] = (None, [])
         slots["quant_scale2"] = ("uint64", [spec["cout2"]])
+    # relu_weight 是第四个 list（照 ExtendConv2d 的 relu_weight0/1 声明的）。
+    # **这一版它恒不被读**：算子侧 tiling 把用到斜率的 relu 模式（2 = 标量斜率、
+    # 3 = 逐通道斜率）一律拒了。
+    #
+    # 但 list 恒长的要求照样成立，所以这两个槽**必须发真张量**，不能发 None ——
+    # dt 是 None 的槽会被 build_model 整个跳过（那是「两个名字抢 instance 1」那个
+    # 机制用的），跳过就只剩 7 个输入，而插件要求正好 9 个。
+    # case.bin 里没有这两个张量，运行器按模型报的字节数现合成零缓冲。
+    slots["relu_weight1"] = ("float32", [spec["cout1"]])
+    slots["relu_weight2"] = ("float32", [spec["cout2"]])
 
     attrs = {
         # **每层一项**。fixed_shift1/2 和 relu1/2 收成了两个列表。
@@ -143,22 +164,37 @@ def tensor_plan(spec):
         # 算子侧 gert::RuntimeAttrs 也没有 GetListBool —— 两头都只能走整数列表。
         # 长度必须正好等于层数，算子那边短列表会直接拒（不会补成缺省）。
         "fixed_shift": [int(spec["shift1"]), int(spec["shift2"])],
-        "relu": [1 if spec["relu1"] else 0, 1 if spec["relu2"] else 0],
+        # relu 的值是**硬件的 ReluMode 枚举**（kernel_utils_mode.h:54）：
+        #   0 = NO_RELU  1 = NORMAL_RELU  2 = SCALAR_RELU  3 = VECTOR_RELU
+        # 上一版它是 0/1 的开关；斜率表进原型之后扩成四态，而 0/1 的含义没变，
+        # 所以这里的生成逻辑不用动。2/3 算子侧目前会拒。
+        "relu": [RELU_NORMAL if spec["relu1"] else RELU_NO,
+                 RELU_NORMAL if spec["relu2"] else RELU_NO],
         # 两层同核时发长度 2，不同核时发长度 4 —— tiling 的 ReadKernelSize/ReadPads
         # 两种长度都认（fused_conv2d_tiling.cpp 的 ATTR_KERNEL_SIZE 那段注释）。
         "kernel_size": ([spec["kh"], spec["kw"]] if (kh2, kw2) == (spec["kh"], spec["kw"])
                         else [spec["kh"], spec["kw"], kh2, kw2]),
         "strides": [int(spec["s1"]), int(spec["s2"])],
         "pads": [int(spec["ph1"]), int(spec["pw1"]), int(spec["ph2"]), int(spec["pw2"])],
-        "a16w8_shift1": 29,
-        # ---- bias/quant 合并成 DYNAMIC list 之后新增的两个 ----
-        # y 的 dtype。以前是算子从「dq2 传没传」推断的，三张定标表并进 quant 之后
+        "a16w8_shift": 29,
+        # y 的 dtype。以前是算子从「dq2 传没传」推断的，三张定标表并进 scale 之后
         # 那个判别消失了（x int8 出 int8 和 x int8 出 fp16 的输入侧完全同形），
-        # 所以改成显式声明。
-        "out_dtype": GE_DT_FLOAT16 if out_fp16 else GE_DT_INT8,
-        # 哪些层带 bias。bit i = conv_{i+1}。bias list **恒有一层一个实例**，
-        # 没被 mask 选中的那个张量算子不读（恒长的理由见上面）。
-        "bias_mask": 3 if has_bias else 0,
+        # 所以改成显式声明。**房间惯例的名字是 dtype**，上一版叫 out_dtype。
+        "dtype": GE_DT_FLOAT16 if out_fp16 else GE_DT_INT8,
+        # 哪些层带 bias。**每层一项**（算子侧是 ListBool；ONNX 没有 BOOLS，所以
+        # 这里发 0/1 的整数列表，插件转成 vector<bool>）。上一版是整数位掩码。
+        # bias list 恒有一层一个实例，没被选中的那个张量算子不读。
+        "bias_mask": [1 if has_bias else 0, 1 if has_bias else 0],
+        # ---- 以下七个从 ExtendConv2d 继承，算子侧声明了但还不支持 ----
+        # 发 IR 缺省值。算子的 CheckReservedAttrs 会拒任何非缺省值，所以这里
+        # **必须**和 IR 缺省逐字一致，否则所有用例都编不过。
+        "dilations": [1, 1, 1, 1],
+        "groups": 1,
+        "data_format": "NCHW",
+        "offset_x": 0,
+        "round_mode": "rint",
+        "pad_mode": "SPECIFIC",
+        "enable_hf32": 0,
     }
     return {
         "slots": [(n,) + tuple(slots[n]) for n in IR_SLOT_NAMES],
@@ -177,11 +213,15 @@ def build_model(plan):
     node_inputs = []
     for name, dt, shape in plan["slots"]:
         if dt is None:
-            # **新 IR 里没有 OPTIONAL 输入了** —— x 是 REQUIRED，其余三个都是
-            # DYNAMIC list，「没有」是靠 list 短一截表达的，不是靠空串占位。
-            # 所以这里直接跳过，节点输入列表里不留空洞。
+            # dt 是 None 的槽直接跳过，节点输入列表里不留空洞。
             #
-            # 留洞这条路是实测走不通的：DYNAMIC list 内部给空串会死在 GE 自己的
+            # **这不是「这一层没有」的表达方式** —— 四个 list 都是恒长的。它只服务
+            # 一件事：`quant_scale2` 和 `dequant_scale2` 是**同一个 instance 1 的两个
+            # 名字**（出 int8 时是重量化表、出 fp16 时是反量化表），两者恒有且只有
+            # 一个非 None，于是 scale list 恒好是 2 个实例。名字分开只是为了 case.bin
+            # 和日志里能看出这一条通路用的是哪张表。
+            #
+            # 留洞那条路是实测走不通的：DYNAMIC list 内部给空串会死在 GE 自己的
             # Verify 上（我们的 infershape 根本不会被调到）。0 元素张量也走不通
             # （atc 的 --input_shape 直接拒，E10011）。
             continue

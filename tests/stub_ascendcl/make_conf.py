@@ -27,8 +27,9 @@ y_bytes = y_elems * (1 if info["outInt8"] else 2)
 def slot_bytes(name):
     """这个槽在 om 里是多少字节。
 
-    不在 case.bin 里的是恒长占位（只会是 quant 的那两个），按 uint64 一个通道一项
-    算 —— 和 fc2d_onnx.tensor_plan 给它们声明的形状一致。
+    不在 case.bin 里的是恒长占位，按 fc2d_onnx.tensor_plan 给它们声明的形状算：
+      * scale 的两个实例  uint64，一个通道一项 -> cout * 8
+      * relu_weight 的两个实例  float32 -> cout * 4
     """
     if name in tensors:
         return len(tensors[name][2])
@@ -36,6 +37,10 @@ def slot_bytes(name):
         return int(info["cout1"]) * 8
     if name in ("quant_scale2", "dequant_scale2"):
         return int(info["cout2"]) * 8
+    if name == "relu_weight1":
+        return int(info["cout1"]) * 4
+    if name == "relu_weight2":
+        return int(info["cout2"]) * 4
     raise SystemExit("不认识的槽 %s，而且 case.bin 里也没有" % name)
 
 
@@ -47,7 +52,7 @@ with io.open(os.path.join(outdir, "stub.conf"), "w") as f:
 with open(os.path.join(outdir, "golden.bin"), "wb") as f:
     f.write(tensors["y_expect"][2])
 
-print("模型输入表（%d 个 = x + 三个 DYNAMIC list x 每层一个实例）:" % len(present))
+print("模型输入表（%d 个 = x + 四个 DYNAMIC list x 每层一个实例）:" % len(present))
 for n in present:
     tag = "" if n in tensors else "   <- 恒长占位，case.bin 里没有"
     print("  %-16s %9d 字节%s" % (n, slot_bytes(n), tag))

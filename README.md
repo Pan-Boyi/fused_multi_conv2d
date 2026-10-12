@@ -11,7 +11,7 @@ conv1 用 `quant_scale1[Cout1]` 的 per-channel VREQ8 出 int8 mid，conv2 用
 
 `a16w8` 是混合通路：`x` 为 fp16，两张 filter 为 int8，conv1 通过
 `quant_scale1[Cout1]` 得到 int8 mid，conv2 再通过 `dequant_scale2[Cout2]` 输出 fp16。
-case generator 使用 fp16 可精确表示的小整数输入，并固定 `a16w8_shift1=29`，因此板侧
+case generator 使用 fp16 可精确表示的小整数输入，并固定 `a16w8_shift=29`，因此板侧
 结果可与精确整数 golden 逐位比对。
 
 两个 C++ 小工具（`gen_case` / `fc2d_geom`）**不进仓**，脚本用到时自己编 ——
@@ -179,7 +179,7 @@ per-channel `quant_scale` 表的位型或 bit46 不对，不是卷积本身算�
 conv2 通过 `dequant_scale2` 输出 fp16；golden 应逐位相等。
 
 **a16w8**：输入是 fp16、filter 是 int8。生成器把输入限制在 fp16 可精确表示的整数，
-并使用 `a16w8_shift1=29`，使 conv1 累加与整数参考一致；其余量化/反量化与 s8f16
+并使用 `a16w8_shift=29`，使 conv1 累加与整数参考一致；其余量化/反量化与 s8f16
 相同，因此同样执行逐位比对。
 
 ## 单独跑一条

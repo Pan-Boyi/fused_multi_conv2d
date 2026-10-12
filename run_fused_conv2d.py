@@ -105,11 +105,16 @@ ORDER = ["x", "filter1", "bias1", "filter2", "bias2"]
 #     dequant_scale2=5, quant_scale1=6, quant_scale2=7
 # （fused_conv2d_def.cpp 的 Input() 调用顺序）。槽位名沿用 case.bin 里的张量名，
 # 这样和 onnx 图的输入名、om 的模型输入名是同一个名字，按名字取下标不需要映射表。
-# 和旧版的差别只有一处：dequant_scale2 从 quant_scale1 **前面**挪到了后面。
-# 新 IR 的 quant list 里 instance 0 恒是 conv1 的表、instance 1 恒是 conv2 的表，
+# 和更早那版的差别只有一处：dequant_scale2 从 quant_scale1 **前面**挪到了后面。
+# scale list 里 instance 0 恒是 conv1 的表、instance 1 恒是 conv2 的表，
 # 而 dq2 是 conv2 的那张。
+#
+# **这一版多了第四个 list：relu_weight**（照 ExtendConv2d 的 relu_weight0/1
+# 声明的 ReLU 斜率表）。算子侧目前把用到斜率的 relu 模式一律拒了，所以这两个槽
+# 恒是占位；但 list 恒长的要求照样成立，所以 om 上它们是真的模型输入。
 INPUT_SLOTS = ["x", "filter1", "filter2", "bias1", "bias2",
-               "quant_scale1", "quant_scale2", "dequant_scale2"]
+               "quant_scale1", "quant_scale2", "dequant_scale2",
+               "relu_weight1", "relu_weight2"]
 ORDER_INT8 = ORDER + ["quant_scale1", "quant_scale2"]
 ORDER_S8F16 = ORDER + ["dequant_scale2", "quant_scale1"]
 ORDER_A16W8 = ORDER_S8F16
@@ -136,20 +141,36 @@ def model_input_slots(info):
     .om / 这个文件三样过去，import 不到 fc2d_onnx。
     （同样的理由让 SPEC_KEYS 也有两份抄本，见 _check_spec_keys_in_sync。）
     """
-    # 三个 list 都恒长：bias 恒两个（bias_mask 说哪些是真的）、quant 恒两个
-    # （dtype 组合说哪张会被读）。**DYNAMIC 输入的实例数不能是 0**，所以「没有」
-    # 不能用「少给张量」表达 —— 详见 fc2d_onnx.tensor_plan 里那段。
+    # 四个 list 都恒长：bias 恒两个（bias_mask 说哪些是真的）、scale 恒两个
+    # （dtype 组合说哪张会被读）、relu_weight 恒两个（算子目前一张都不读）。
+    # **DYNAMIC 输入的实例数不能是 0**，所以「没有」不能用「少给张量」表达 ——
+    # 详见 fc2d_onnx.tensor_plan 里那段。
     slots = ["x", "filter1", "filter2", "bias1", "bias2", "quant_scale1"]
     # instance 1 的名字按这条通路上的用途取。
     if info["dtype_mode"] in (DTYPE_S8F16, DTYPE_A16W8):
         slots.append("dequant_scale2")
     else:
         slots.append("quant_scale2")
+    # relu_weight 的两个实例：恒是占位，case.bin 里没有，按模型报的字节数补零。
+    slots += ["relu_weight1", "relu_weight2"]
     return slots
 
 
+# 恒长占位槽的 dtype 编号（DTYPE_NAME/DTYPE_SIZE 那张表里的编号）。
+# **只进日志**：真正下发的是字节数，按模型自己报的大小补零。但日志里报错 dtype
+# 会让人把「占位」当成「喂错了表」，所以还是按声明的类型写对。
+PLACEHOLDER_DTYPE = {
+    "quant_scale1": 10,    # uint64
+    "quant_scale2": 10,
+    "dequant_scale2": 10,
+    "relu_weight1": 0,     # float32
+    "relu_weight2": 0,
+}
+PLACEHOLDER_ELEM = {10: 8, 0: 4}
+
+
 def runtime_input_slots(info):
-    """返回 8 个 IR 槽；None 表示这条 dtype 通路不传这个 optional 输入。
+    """返回全部 IR 槽（现在是 10 个）；None 表示 case.bin 里没有这个张量。
 
     现在只用于**打印和完整性检查**。图 om 的下发不看它：缺席的 optional 在图里
     根本不是模型输入，实际喂数据按模型自己报的输入表来（见 main 里那段）。
@@ -1052,7 +1073,7 @@ def main():
               % (info["qs1"], "on" if info["relu"] else "off",
                  "on" if info["hasBias"] else "off"))
     elif info["isA16W8"]:
-        print("A16W8 定标: a16w8_shift1=%d（累加器定标 2^(%d-%d)=1），"
+        print("A16W8 定标: a16w8_shift=%d（累加器定标 2^(%d-%d)=1），"
               "conv1 quant_scale1=%.9g，conv2 使用 per-channel dequant_scale2"
               % (A16W8_SHIFT_LEN, A16W8_SHIFT_LEN, A16W8_SHIFT_LEN, info["qs1"]))
     else:
@@ -1157,22 +1178,25 @@ def main():
             descs.append(desc)
             bufs.append(buf)
         # ---- 按**模型自己报的**输入表喂数据 ----
-        # 和单算子 om 的本质差别：图 om 里缺席的 optional 输入**根本不是模型输入**
-        # （dump 出来是节点输入表里的一个空槽），所以 n_in 是 7 而不是 8，不需要
-        # UNDEFINED 占位。单算子那套「槽位不能压缩、q1/q2 不能左移」的规则在这条
-        # 路上不适用 —— 那条规则是 aclopExecuteV2 按 numInputs 匹配 .om 带来的。
+        # 和单算子 om 的本质差别：单算子那套「槽位不能压缩、q1/q2 不能左移」的规则
+        # 在这条路上不适用 —— 那条规则是 aclopExecuteV2 按 numInputs 匹配 .om 带来的。
+        # 图 om 的输入个数就是 onnx 图的输入个数，现在恒为 9
+        # （x + filters/bias/scale/relu_weight 四个 list 各 2 个实例）。
         # **不能写成「case.bin 里有的都喂」。** case.bin 无条件带 bias1/bias2 的
         # blob（gen_case 一直这么写），而 bias: false 的用例编出来的 om 里没有
         # bias 输入 —— 按「有 blob 就喂」会比模型多两个，撞到下面那条
         # 「模型报了 N 个输入」的 die。该喂哪些由**同一条规则**算出来。
         present = model_input_slots(info)
-        # 全 fp16 通路的两个 quant 实例是**纯占位**：恒长要求图里必须有它们，
-        # 但 gen_case 在这条通路上不产定标表，所以 case.bin 里没有。按模型自己
-        # 报的字节数现合成零缓冲 —— 算子一次都不会去读（kernel 入口那里是
-        # if constexpr，编译期就剪掉了）。
+        # 有两类**纯占位**输入，恒长要求图里必须有它们，但 gen_case 不产：
+        #   * 全 fp16 通路的两个 scale 实例 —— 这条通路不用定标表
+        #   * relu_weight 的两个实例 —— 斜率表在算子侧还没落地，恒不被读
+        # 按模型自己报的字节数现合成零缓冲。算子一次都不会去读它们（scale 那两个
+        # 是 kernel 入口的 if constexpr 在编译期剪掉的，relu_weight 是 host 侧
+        # tiling 把用到它的 relu 模式拒掉的）。
         #
-        # 只允许 quant 的两个槽缺；别的槽缺了是真问题，要出声。
-        placeholder_ok = {"quant_scale1", "quant_scale2", "dequant_scale2"}
+        # 只允许这几个槽缺；别的槽缺了是真问题，要出声。
+        placeholder_ok = {"quant_scale1", "quant_scale2", "dequant_scale2",
+                          "relu_weight1", "relu_weight2"}
         missing = [n for n in present if n not in tensors]
         unexpected = [n for n in missing if n not in placeholder_ok]
         if unexpected:
@@ -1241,9 +1265,9 @@ def main():
                 # 恒长占位。dtype/dims 只用于日志，真正下发的是字节数，所以直接
                 # 按模型报的大小补零。
                 nb = int(acl.aclmdlGetInputSizeByIndex(mdesc, i))
-                # 10 = uint64（DTYPE_NAME/DTYPE_SIZE 那张表里的编号）。dtype/dims
-                # 只进日志，真正下发的是字节数，所以按模型报的大小补零就够。
-                dtype, dims, data = 10, [nb // 8], bytes(nb)
+                dtype = PLACEHOLDER_DTYPE.get(slot, 10)
+                dims = [nb // PLACEHOLDER_ELEM.get(dtype, 8)]
+                data = bytes(nb)
             make_operand(dtype, dims, data)
 
         # 输出缓冲预填哨兵 127：kernel 一个字节都没写的话，读回来还是 127，
@@ -1268,9 +1292,11 @@ def main():
         check(acl.aclmdlAddDatasetBuffer(ds_out, bufs[NIN]), "aclmdlAddDatasetBuffer(out) = %d")
 
         # **属性不下发。** 图 om 的属性在编译期就烘进去了，aclmdlExecute 不吃属性。
-        # 定标属性现在叫 fixed_shift：一个 ListInt、每层一项、下标 0，而且是
-        # OPTIONAL（只有 fp16 定点通路读它）。必填的是 kernel_size / strides /
-        # pads / out_dtype / bias_mask 这五个，由编 om 那一步（fc2d_onnx.tensor_plan）给。
+        # 定标属性叫 fixed_shift：一个 ListInt、每层一项，OPTIONAL（只有 fp16 定点
+        # 通路读它）。必填的是 dtype / kernel_size / strides / pads / bias_mask 这
+        # 五个，由编 om 那一步（fc2d_onnx.tensor_plan）给。另有七个从 ExtendConv2d
+        # 继承、声明了但还不支持的属性（dilations / groups / data_format /
+        # offset_x / round_mode / pad_mode / enable_hf32），都发 IR 缺省值。
         # 于是「下发的属性集和编 .om 时那份对不上 -> MatchOpModel fail -> 报成 100024
         # 算子没找到」这一整类失败不存在了 —— 那是 aclopExecuteV2 按 op 类型 +
         # shape/dtype/format + **全部 attr 的值**一起匹配 .om 带来的。
@@ -1281,25 +1307,32 @@ def main():
         attr = None
         kh2 = info.get("kh2") or info["kh"]
         kw2 = info.get("kw2") or info["kw"]
-        # out_dtype 和 bias_mask 必须在这里打出来：它们是两个**静默改变行为**的属性
-        # —— out_dtype 给错会把整条通路从「int8 出口 VREQ8」换成「fp16 出口
-        # VDEQF16」而 om 照样编得过去；bias_mask 给错会静默多加或少加一次 bias。
+        # dtype 和 bias_mask 必须在这里打出来：它们是两个**静默改变行为**的属性
+        # —— dtype 给错会把整条通路从「int8 出口 VREQ8」换成「fp16 出口 VDEQF16」
+        # 而 om 照样编得过去；bias_mask 给错会静默多加或少加一次 bias。
         # 板上拿到错数时，这一行是唯一能核对「om 到底按什么编的」的地方。
         # 两个值的算法必须和 fc2d_onnx.tensor_plan 一致。
-        out_dtype_echo = 2 if info["outInt8"] else 1   # ge::DataType: fp16=1, int8=2
-        bias_mask_echo = 3 if info["bias"] else 0
-        # 二进制串**先格式化好再塞进 %s** —— % 运算符没有 %b 这个转换符，
-        # 写成 "0b%02b" 会在板上抛 ValueError: unsupported format character 'b'。
-        # （这个错是 tests/stub_ascendcl 的桩抓到的 —— 板侧下发那一段 --dry-run
-        #  和没有 NPU 的机器都盖不到，和当初 y_bytes 那个先用后赋同一类。）
-        bias_mask_bits = "0b{:02b}".format(bias_mask_echo)
-        print("算子属性（编译期已烘进 om，此处仅供核对）: fixed_shift=[%d,%d] relu=[%d,%d] "
-              "a16w8_shift1=29 kernel=%dx%d>%dx%d strides=%d/%d pads=%d,%d/%d,%d "
-              "out_dtype=%d bias_mask=%s"
-              % (shift1, shift2, 1 if info["relu1"] else 0, 1 if info["relu2"] else 0,
+        dtype_echo = 2 if info["outInt8"] else 1   # ge::DataType: fp16=1, int8=2
+        # bias_mask 现在是**每层一项的列表**（算子侧是 ListBool），不再是整数位掩码。
+        bias_mask_echo = [1, 1] if info["bias"] else [0, 0]
+        # 列表**先格式化好再塞进 %s** —— 直接把列表交给 % 会被当成多个参数展开。
+        # （上一版这里是 0b%02b，而 % 没有 %b 这个转换符，在板上抛
+        #  ValueError: unsupported format character b。那个错是
+        #  tests/stub_ascendcl 的桩抓到的 —— 板侧下发那一段 --dry-run 和没有 NPU
+        #  的机器都盖不到，和当初 y_bytes 那个先用后赋同一类。）
+        bias_mask_str = "[%d,%d]" % (bias_mask_echo[0], bias_mask_echo[1])
+        # relu 的值是硬件的 ReluMode：0=关 1=普通 2=标量斜率 3=逐通道斜率。
+        # 目前只会发 0/1 —— 2/3 要用 relu_weight 那张斜率表，算子侧会拒。
+        relu_str = "[%d,%d]" % (1 if info["relu1"] else 0, 1 if info["relu2"] else 0)
+        print("算子属性（编译期已烘进 om，此处仅供核对）: dtype=%d bias_mask=%s "
+              "fixed_shift=[%d,%d] relu=%s a16w8_shift=29 "
+              "kernel=%dx%d>%dx%d strides=%d/%d pads=%d,%d/%d,%d"
+              % (dtype_echo, bias_mask_str, shift1, shift2, relu_str,
                  info["kh"], info["kw"], kh2, kw2, info["s1"], info["s2"],
-                 info["ph1"], info["pw1"], info["ph2"], info["pw2"],
-                 out_dtype_echo, bias_mask_bits))
+                 info["ph1"], info["pw1"], info["ph2"], info["pw2"]))
+        print("            保留属性（声明了但算子还不支持，全发 IR 缺省）: "
+              "dilations=[1,1,1,1] groups=1 data_format=NCHW offset_x=0 "
+              "round_mode=rint pad_mode=SPECIFIC enable_hf32=false")
 
         def launch():
             # aclmdlExecute 是**同步**的：返回时 kernel 已经跑完，不需要
