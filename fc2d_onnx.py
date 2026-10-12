@@ -138,10 +138,12 @@ def tensor_plan(spec):
         slots["quant_scale2"] = ("uint64", [spec["cout2"]])
 
     attrs = {
-        "fixed_shift1": int(spec["shift1"]),
-        "fixed_shift2": int(spec["shift2"]),
-        "relu1": bool(spec["relu1"]),
-        "relu2": bool(spec["relu2"]),
+        # **每层一项**。fixed_shift1/2 和 relu1/2 收成了两个列表。
+        # relu 发整数而不是布尔：ONNX 的 AttributeProto 没有 BOOLS 这个类型，
+        # 算子侧 gert::RuntimeAttrs 也没有 GetListBool —— 两头都只能走整数列表。
+        # 长度必须正好等于层数，算子那边短列表会直接拒（不会补成缺省）。
+        "fixed_shift": [int(spec["shift1"]), int(spec["shift2"])],
+        "relu": [1 if spec["relu1"] else 0, 1 if spec["relu2"] else 0],
         # 两层同核时发长度 2，不同核时发长度 4 —— tiling 的 ReadKernelSize/ReadPads
         # 两种长度都认（fused_conv2d_tiling.cpp 的 ATTR_KERNEL_SIZE 那段注释）。
         "kernel_size": ([spec["kh"], spec["kw"]] if (kh2, kw2) == (spec["kh"], spec["kw"])
