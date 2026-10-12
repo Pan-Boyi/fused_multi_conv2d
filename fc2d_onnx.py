@@ -44,29 +44,22 @@ ONNX_DT = {
 IR_VERSION = 7
 OPSET = 11
 
-# 节点输入必须按**新的 IR 顺序**排：x, filters[0], filters[1], bias1, bias2,
-# dequant_scale2, quant_scale1, quant_scale2。
-#
-# 注意这和老的单算子 ABI 不同 —— 老的是 x, filter1, bias1, filter2, bias2, ...
-# （filter2 在 3 号位）。filters 改成 DYNAMIC list 之后两个核必须相邻，
-# filter2 从 3 号位挪到了 2 号位，后面三个 scale 的下标也跟着 +0 不变但 bias 往后挪。
-# 槽位名沿用 case.bin 里的张量名（filter1/filter2 而不是 filters_0/filters_1），
-# 这样「case.bin 里的 blob 名」和「om 的模型输入名」是同一个名字，板侧按名字取
-# 下标就不需要任何映射表。
-# 节点输入列表的顺序。IR 是 x | filters(DYNAMIC) | bias(DYNAMIC) | quant(DYNAMIC)，
-# 三个 list 的实例都**按层**排，所以摊平之后就是下面这个顺序。
-#
-# 槽位名沿用 case.bin 里的张量名 —— onnx 的图输入名、om 的模型输入名、case.bin
-# 的张量名刻意三者同名，这样板侧按名字取下标不需要映射表。**IR 里的名字
-# （filters/bias/quant）和这些名字无关**，IR 的归属是靠位置定的。
-#
-# 和旧 IR 的差别只有一处：dequant_scale2 从 quant_scale1 **前面**挪到了后面。
-# 新约定是 quant 的 instance 0 恒为 conv1 的表、instance 1 恒为 conv2 的表，
-# 而 dq2 是 conv2 的那张。
 # 节点输入表的顺序 == IR 端口顺序：
 #   x | filters[0..1] | bias[0..1] | scale[0..1] | relu_weight[0..1]
-# 这里的名字只是 case.bin / 日志里用的人读名字，和 IR 的输入名无关 ——
-# om 的输入名来自 ONNX 图的 input 名字，不是 IR 名字。
+# 四个 DYNAMIC list 的实例都**按层**排（instance i 属于 conv_{i+1}），摊平之后就是
+# 下面 IR_SLOT_NAMES 的顺序。
+#
+# **这里的名字和 IR 里的输入名无关。** IR 叫 filters/bias/scale/relu_weight，归属是
+# 靠位置定的；这里沿用 case.bin 里的张量名（filter1/filter2 而不是 filters_0/1），
+# 为的是让「case.bin 的 blob 名」「onnx 图的输入名」「om 的模型输入名」三者同名 ——
+# 板侧按名字取下标就不需要任何映射表。
+#
+# 两条历史包袱，留着是因为读老 case.bin 时还会碰到：
+#   * 更早的单算子 ABI 是 x, filter1, bias1, filter2, bias2, ...（filter2 在 3 号位）。
+#     filters 变成 DYNAMIC list 后两个核必须相邻，filter2 挪到了 2 号位。
+#   * 更早的 scale 槽序是 dequant_scale2, quant_scale1, quant_scale2，dq2 在 q1
+#     **前面**。现在 scale 的 instance 0 恒是 conv1 的表、instance 1 恒是 conv2 的，
+#     而 dq2 是 conv2 那张，所以它排到了后面。
 IR_SLOT_NAMES = [
     "x",
     "filter1",
