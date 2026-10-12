@@ -198,88 +198,6 @@ def read_spec(path):
     return d
 
 
-def singleop_json(spec):
-    """从 .bin 的 spec 造 singleop 描述。
-
-    **这个函数已经不是编译路径了。** filters 改成 DYNAMIC list 之后 singleop
-    表达不了两个实例，编 om 走的是 fc2d_onnx.py（--framework=5）。保留它是因为
-    下面那段「八个属性一个不少地全写上」的推理对板侧下发仍然成立，而且形状/dtype
-    的派生规则和 fc2d_onnx.tensor_plan() 逐行同源 —— 改一边要改另一边。
-
-    **八个属性一个不少地全写上。** ACL 是按属性的**值**匹配 .om 的，多一个少一个
-    都会匹配不上，报出来是「算子没找到」。上一版 fp16 和 int8 各写一份 json、各带
-    一个子集，于是执行时多设一个属性就炸 —— 这里统一成全集，那类问题不存在了。
-    """
-    mode = spec.get("dtype_mode", DTYPE_FP16 if spec["elem_bytes"] == 2 else DTYPE_INT8)
-    fp16 = mode == DTYPE_FP16
-    a16w8 = mode == DTYPE_A16W8
-    s8f16 = mode == DTYPE_S8F16
-    x_fp16 = fp16 or a16w8
-    filter_fp16 = fp16
-    outFp16 = fp16 or s8f16 or a16w8
-    xt = "float16" if x_fp16 else "int8"
-    wt = "float16" if filter_fp16 else "int8"
-    bt = "float16" if fp16 else "int32"
-    yt = "float16" if outFp16 else "int8"
-    weight_c0 = 16 if filter_fp16 else 32
-    mid_c0 = 16 if fp16 else 32
-    # 两层各按自己的核。老的 .bin 在 kh2/kw2 上是 0 —— 那时两层必然同核，
-    # 所以退回 kh/kw 就是对的。
-    kh2 = spec.get("kh2") or spec["kh"]
-    kw2 = spec.get("kw2") or spec["kw"]
-    fz1k = (spec["ci"] // weight_c0) * spec["kh"] * spec["kw"]
-    fz2k = (spec["cout1"] // mid_c0) * kh2 * kw2
-    inputs = [
-        {"format": "ND", "shape": [spec["n"], spec["ci"], spec["hi"], spec["wi"]], "type": xt},
-        {"format": "ND", "shape": [fz1k, (spec["cout1"] + 15) // 16, 16, weight_c0], "type": wt},
-        {"format": "ND", "shape": [spec["cout1"]], "type": bt},
-        # FRACTAL_Z 的 N 向上补齐到 16 —— cout2 可以是 2，整除会算出 0。
-        {"format": "ND", "shape": [fz2k, (spec["cout2"] + 15) // 16, 16, weight_c0], "type": wt},
-        {"format": "ND", "shape": [spec["cout2"]], "type": bt},
-    ]
-    # optional 输入必须按 IR 下标 5/6/7 对齐。中间缺席的槽不能直接省略：
-    # ATC single-op JSON 的约定是 RESERVED + UNDEFINED 占位。
-    missing = {"format": "RESERVED", "shape": [], "type": "UNDEFINED"}
-    if s8f16 or a16w8:
-        inputs.extend([
-            {"format": "ND", "shape": [spec["cout2"]], "type": "uint64"},  # dq2
-            {"format": "ND", "shape": [spec["cout1"]], "type": "uint64"},  # q1
-            dict(missing),                                                       # q2
-        ])
-    elif mode == DTYPE_INT8:
-        inputs.extend([
-            dict(missing),                                                       # dq2
-            {"format": "ND", "shape": [spec["cout1"]], "type": "uint64"},  # q1
-            {"format": "ND", "shape": [spec["cout2"]], "type": "uint64"},  # q2
-        ])
-    else:
-        inputs.extend([dict(missing), dict(missing), dict(missing)])
-    return [{
-        "op": "FusedConv2d",
-        "input_desc": inputs,
-        "output_desc": [
-            {"format": "ND",
-             "shape": [spec["n"], spec["cout2"], spec["ho2"], spec["wo2"]],
-             "type": yt}
-        ],
-        "attr": [
-            {"name": "fixed_shift1", "type": "int", "value": spec["shift1"]},
-            {"name": "fixed_shift2", "type": "int", "value": spec["shift2"]},
-            {"name": "relu1", "type": "bool", "value": bool(spec["relu1"])},
-            {"name": "relu2", "type": "bool", "value": bool(spec["relu2"])},
-            # 两层同核时发长度 2（和以前逐字相同的 .om 签名，老 .om 不会失配），
-            # 不同核时发长度 4。
-            {"name": "kernel_size", "type": "list_int",
-             "value": ([spec["kh"], spec["kw"]] if (kh2, kw2) == (spec["kh"], spec["kw"])
-                       else [spec["kh"], spec["kw"], kh2, kw2])},
-            {"name": "strides", "type": "list_int", "value": [spec["s1"], spec["s2"]]},
-            {"name": "pads", "type": "list_int",
-             "value": [spec["ph1"], spec["pw1"], spec["ph2"], spec["pw2"]]},
-            {"name": "a16w8_shift1", "type": "int", "value": 29},
-        ],
-    }]
-
-
 # ---------------------------------------------------------------- 两个 C++ 工具
 # 源码进仓，二进制不进（.gitignore 里就写着 gen_case / fc2d_geom）。所以
 # **每一次新克隆的第一次运行都会缺它们**，而且改过 fused_conv2d_shape.h 之后
@@ -589,9 +507,7 @@ def main():
         paths = {
             "bin": os.path.join(outdir, c["name"], "case.bin"),
             "omdir": os.path.join(outdir, c["name"], "om"),
-            "singleop": os.path.join(outdir, c["name"], "singleop.json"),
-            # 编 om 的输入。singleop 那条已经不用了（DYNAMIC 表达不了多实例），
-            # 但键留着：路径字典是公开结构。
+            # 编 om 的输入。
             "onnx": os.path.join(outdir, c["name"], c["name"] + ".onnx"),
         }
         os.makedirs(os.path.join(outdir, c["name"]), exist_ok=True)

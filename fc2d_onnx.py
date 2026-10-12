@@ -10,8 +10,8 @@
     `--mode` 只有 1/5/6 三个**输出**方向的转换，没有 json->om 的入口，
     所以 onnx 是 atc 这条路上唯一能表达多实例 DYNAMIC 的输入形态。
 
-**形状和 dtype 只从 case.bin 的 spec 派生**，和 singleop 那条路同一个源头
-（见 tensor_plan 的注释）。不要在这里引入第二套形状规则。
+**形状和 dtype 只从 case.bin 的 spec 派生**，而且 tensor_plan() 是唯一一处
+派生 —— 不要在别处引入第二套形状规则。
 """
 import os
 import sys
@@ -82,9 +82,9 @@ DTYPE_FP16, DTYPE_INT8, DTYPE_S8F16, DTYPE_A16W8 = 0, 1, 2, 3
 def tensor_plan(spec):
     """派生每个输入槽的 dtype/形状/有没有，外加八个属性和输出。
 
-    这里的算法和 fc2d.singleop_json() 逐行同源 —— 四条 dtype 通路、权重的
-    FRACTAL_Z 四元组、cout 向上补齐到 16、两层各按自己的核。改了一边一定要改
-    另一边；更好的做法是哪天把 singleop_json 也改成调这个函数。
+    四条 dtype 通路、权重的 FRACTAL_Z 四元组、cout 向上补齐到 16、两层各按
+    自己的核 —— 这些规则**只在这里**。上面那条废掉的 singleop 路曾经另有一份
+    逐行同源的副本，改形状得同时改两处；副本已经随那条路一起删了。
 
     返回 {"slots": [(名字, dtype 或 None, 形状)], "y": (dtype, 形状), "attrs": {...}}
     dtype 为 None 表示这个可选输入这条通路上**不传**。

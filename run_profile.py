@@ -85,7 +85,7 @@ import shutil
 import subprocess
 import sys
 
-import fc2d  # 形状归一化、gen_case 命令行、spec 解析、singleop.json 全部复用它
+import fc2d  # 形状归一化、gen_case 命令行、spec 解析全部复用它
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -704,9 +704,7 @@ def main():
         paths = {
             "bin": os.path.join(out_root, c["name"], "case.bin"),
             "omdir": os.path.join(out_root, c["name"], "om"),
-            "singleop": os.path.join(out_root, c["name"], "singleop.json"),
-            # 编 om 的输入。singleop 那条已经不用了（DYNAMIC 表达不了），
-            # 但键留着：路径字典是公开结构，去掉会影响别的调用方。
+            # 编 om 的输入。
             "onnx": os.path.join(out_root, c["name"], c["name"] + ".onnx"),
         }
         os.makedirs(os.path.join(out_root, c["name"]), exist_ok=True)
