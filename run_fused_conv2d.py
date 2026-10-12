@@ -1056,7 +1056,10 @@ def main():
               "conv1 quant_scale1=%.9g，conv2 使用 per-channel dequant_scale2"
               % (A16W8_SHIFT_LEN, A16W8_SHIFT_LEN, A16W8_SHIFT_LEN, info["qs1"]))
     else:
-        print("定点定标（来自 header，将作为算子属性下发）: fixed_shift1=%d fixed_shift2=%d"
+        # 只是打出来给人看。属性在编 om 那一步就烘进 om 了，板侧不下发
+        # （见下面 aclmdlAddDatasetBuffer 那段）。算子侧的名字是 fixed_shift，
+        # 一个 ListInt、每层一项。
+        print("定点定标（来自 header，编 om 时作为 fixed_shift=[%d, %d] 烘进 om）"
               % (shift1, shift2))
         print("            对应累加器定标 2^%d / 2^%d —— 属性越大定标越小，别搞反"
               % (FIX_SHIFT_LEN - shift1, FIX_SHIFT_LEN - shift2))
@@ -1264,9 +1267,10 @@ def main():
                   "aclmdlAddDatasetBuffer(in %d) = " % i + "%d")
         check(acl.aclmdlAddDatasetBuffer(ds_out, bufs[NIN]), "aclmdlAddDatasetBuffer(out) = %d")
 
-        # 两个定点定标是**必需属性**。顺序和 fused_conv2d_def.cpp 里 Attr() 的调用
-        # 顺序一致（fixed_shift1 在前），tiling 侧按 GetInt(0)/GetInt(1) 取。
-        # **属性不再下发。** 图 om 的属性在编译期就烘进去了，aclmdlExecute 不吃属性。
+        # **属性不下发。** 图 om 的属性在编译期就烘进去了，aclmdlExecute 不吃属性。
+        # 定标属性现在叫 fixed_shift：一个 ListInt、每层一项、下标 0，而且是
+        # OPTIONAL（只有 fp16 定点通路读它）。必填的是 kernel_size / strides /
+        # pads / out_dtype / bias_mask 这五个，由编 om 那一步（fc2d_onnx.tensor_plan）给。
         # 于是「下发的属性集和编 .om 时那份对不上 -> MatchOpModel fail -> 报成 100024
         # 算子没找到」这一整类失败不存在了 —— 那是 aclopExecuteV2 按 op 类型 +
         # shape/dtype/format + **全部 attr 的值**一起匹配 .om 带来的。
@@ -1277,11 +1281,25 @@ def main():
         attr = None
         kh2 = info.get("kh2") or info["kh"]
         kw2 = info.get("kw2") or info["kw"]
-        print("算子属性（编译期已烘进 om，此处仅供核对）: fixed_shift=%d/%d relu=%s/%s "
-              "a16w8_shift1=29 kernel=%dx%d>%dx%d strides=%d/%d pads=%d,%d/%d,%d"
-              % (shift1, shift2, bool(info["relu1"]), bool(info["relu2"]),
+        # out_dtype 和 bias_mask 必须在这里打出来：它们是两个**静默改变行为**的属性
+        # —— out_dtype 给错会把整条通路从「int8 出口 VREQ8」换成「fp16 出口
+        # VDEQF16」而 om 照样编得过去；bias_mask 给错会静默多加或少加一次 bias。
+        # 板上拿到错数时，这一行是唯一能核对「om 到底按什么编的」的地方。
+        # 两个值的算法必须和 fc2d_onnx.tensor_plan 一致。
+        out_dtype_echo = 2 if info["outInt8"] else 1   # ge::DataType: fp16=1, int8=2
+        bias_mask_echo = 3 if info["bias"] else 0
+        # 二进制串**先格式化好再塞进 %s** —— % 运算符没有 %b 这个转换符，
+        # 写成 "0b%02b" 会在板上抛 ValueError: unsupported format character 'b'。
+        # （这个错是 tests/stub_ascendcl 的桩抓到的 —— 板侧下发那一段 --dry-run
+        #  和没有 NPU 的机器都盖不到，和当初 y_bytes 那个先用后赋同一类。）
+        bias_mask_bits = "0b{:02b}".format(bias_mask_echo)
+        print("算子属性（编译期已烘进 om，此处仅供核对）: fixed_shift=[%d,%d] relu=[%d,%d] "
+              "a16w8_shift1=29 kernel=%dx%d>%dx%d strides=%d/%d pads=%d,%d/%d,%d "
+              "out_dtype=%d bias_mask=%s"
+              % (shift1, shift2, 1 if info["relu1"] else 0, 1 if info["relu2"] else 0,
                  info["kh"], info["kw"], kh2, kw2, info["s1"], info["s2"],
-                 info["ph1"], info["pw1"], info["ph2"], info["pw2"]))
+                 info["ph1"], info["pw1"], info["ph2"], info["pw2"],
+                 out_dtype_echo, bias_mask_bits))
 
         def launch():
             # aclmdlExecute 是**同步**的：返回时 kernel 已经跑完，不需要
