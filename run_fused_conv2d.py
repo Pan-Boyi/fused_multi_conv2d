@@ -167,15 +167,18 @@ def _file_sha256(path):
     return digest.hexdigest()
 
 
-def write_model_binding(case_path, om_path):
+def write_model_binding(case_path, om_path, expected_case_sha256=None):
     """Bind a constant-weight OM to the exact case used during compilation."""
     with open(case_path, "rb") as stream:
         header = stream.read(12)
     if len(header) != 12 or struct.unpack_from("<I", header, 8)[0] != 7:
         die("constant-weight OM binding requires case ABI 7; regenerate case and OM")
+    case_sha = _file_sha256(case_path)
+    if expected_case_sha256 is not None and case_sha != expected_case_sha256:
+        die("case SHA256 changed during compilation; regenerate case and OM")
     binding = {"schema_version": 1, "case_abi": 7, "weight_mode": "constant",
                "model_input_count": 7, "model_sha256": _file_sha256(om_path),
-               "case_sha256": _file_sha256(case_path)}
+               "case_sha256": expected_case_sha256 or case_sha}
     path = om_path + ".fc2d.json"
     with open(path + ".tmp", "w") as stream:
         json.dump(binding, stream, indent=2, sort_keys=True)

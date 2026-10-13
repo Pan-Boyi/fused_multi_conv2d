@@ -8,11 +8,15 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
+import shutil
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import run_fused_conv2d as runner
 import run_profile
+import fc2d
+import fc2d_onnx
 
 
 class ModelBinding(unittest.TestCase):
@@ -126,6 +130,26 @@ class ModelBinding(unittest.TestCase):
                                 env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('model has 9 inputs', result.stdout)
+
+
+    def test_case_changed_during_atc_is_not_bound_to_old_weights(self):
+        case = self.work / "compile_race.bin"
+        shutil.copyfile(self.case, case)
+        paths = {"bin": str(case), "onnx": str(self.work / "compile_race.onnx"),
+                 "omdir": str(self.work / "compile_race_om")}
+        plan = fc2d_onnx.tensor_plan(fc2d.read_spec(str(case)))
+
+        def mutate_during_atc(command):
+            prefix = next(arg.split("=", 1)[1] for arg in command if arg.startswith("--output="))
+            Path(prefix + ".om").write_bytes(b"compiled old weights")
+            case.write_bytes(case.read_bytes() + b"new case during compilation")
+            return 0
+
+        with mock.patch.object(fc2d_onnx, "write_onnx", return_value=(plan, "mock")), \
+                mock.patch.object(fc2d, "run", side_effect=mutate_during_atc), \
+                contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+            fc2d.do_om({"name": "compile_race"}, paths, "MC62CM12AA")
+        self.assertFalse((Path(paths["omdir"]) / "compile_race.om.fc2d.json").exists())
 
 
 if __name__ == '__main__':

@@ -280,7 +280,9 @@ def do_om(c, paths, soc):
             "    合法的名字就是 $ASCEND_HOME_PATH/compiler/data/platform_config 下每个 .ini 的文件名")
     if not os.path.isfile(paths["bin"]):
         die("%s 还没生成 —— 先跑 --steps case" % paths["bin"])
-    spec = read_spec(paths["bin"])
+    import run_fused_conv2d as runner
+    frozen_case_sha256 = runner._file_sha256(paths["bin"])
+    read_spec(paths["bin"])
     os.makedirs(paths["omdir"], exist_ok=True)
 
     # 走 onnx，不走 singleop。
@@ -351,6 +353,8 @@ def do_om(c, paths, soc):
 
     import fc2d_onnx
     plan, checker = fc2d_onnx.write_onnx(paths["bin"], paths["onnx"])
+    if runner._file_sha256(paths["bin"]) != frozen_case_sha256:
+        die("case SHA256 changed while generating ONNX; regenerate case and OM")
     print("  onnx: %s（checker: %s）" % (paths["onnx"], checker))
     # 先清空旧 .om，免得 atc 失败时目录里留着上一次形状的产物被当成这次的结果。
     for fn in os.listdir(paths["omdir"]):
@@ -377,8 +381,8 @@ def do_om(c, paths, soc):
     oms = [fn for fn in os.listdir(paths["omdir"]) if fn.endswith(".om")]
     if len(oms) != 1:
         die("atc must generate exactly one fresh OM, found %d" % len(oms))
-    import run_fused_conv2d as runner
-    binding = runner.write_model_binding(paths["bin"], os.path.join(paths["omdir"], oms[0]))
+    binding = runner.write_model_binding(paths["bin"], os.path.join(paths["omdir"], oms[0]),
+                                         expected_case_sha256=frozen_case_sha256)
     print("  case/OM binding: %s" % binding)
     print("  产出: %s" % ", ".join(oms))
 
