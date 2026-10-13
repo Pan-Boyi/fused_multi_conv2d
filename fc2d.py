@@ -43,8 +43,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # gen_case.cpp 里 SpecIdx 的顺序。**两边必须一致**，改那边就得改这边。
 # 末尾的 kh2 / kw2 是 conv2 的核，**只能往后加**：老的 .bin 在这两个位置上是 0，
-# 而那时两层必然同核，所以退回 kh / kw 就是对的 —— 老文件不用重新生成，
-# CASE_VERSION 也不动。gen_case 现在写进去的是**解析后**的值，不是 0。
+# 而那时两层必然同核，所以退回 kh / kw 就是对的 —— 相同核可按此回退；
+# ABI 7 stores filters as logical NCHW, so version 6 packed cases must be regenerated.
 # 注意这张表是被 _check_spec_keys_in_sync() 正则逐字比对的，**列表里不能写注释**。
 SPEC_KEYS = [
     "n", "ci", "hi", "wi", "cout1", "cout2", "kh", "kw", "s1", "s2",
@@ -55,7 +55,7 @@ SPEC_KEYS = [
 SPEC_N = 32
 HDR_FMT = "<8sIIQQQ" + "%di" % SPEC_N + "II"
 HDR_LEN = struct.calcsize(HDR_FMT)
-CASE_VERSION = 6
+CASE_VERSION = 7
 
 DTYPE_FP16 = 0
 DTYPE_INT8 = 1
@@ -356,14 +356,13 @@ def do_om(c, paths, soc):
     for fn in os.listdir(paths["omdir"]):
         if fn.endswith(".om"):
             os.remove(os.path.join(paths["omdir"], fn))
-    # --input_format=ND 是**刻意**的，不要改成 NCHW：两个权重是 FRACTAL_Z 形状的
-    # 四维元组（比如 filter1 = [9,4,16,32]），当 NCHW 理解会让 GE 以为需要换轴。
-    # 全程 ND 是实测通过的那条（dump 出来 7 个 Data 的 layout 全是 ND，没有插转置）。
-    #
+    # Graph inputs are logical NCHW, including both filters. The registered op
+    # consumes FRACTAL_Z weights; GE inserts the required conversion once. ABI 7
+    # case.bin supplies NCHW bytes, never the old prepacked weight buffers.
     # --framework=5 下 --output 是**文件前缀**而不是目录，atc 自己补 .om。
     out_prefix = os.path.join(paths["omdir"], c["name"])
     cmd = ["atc", "--model=" + paths["onnx"], "--framework=5",
-           "--soc_version=" + soc, "--input_format=ND",
+           "--soc_version=" + soc, "--input_format=NCHW",
            "--input_shape=" + fc2d_onnx.input_shape_arg(plan),
            "--output=" + out_prefix, "--log=error"]
     print("  " + " ".join(cmd))

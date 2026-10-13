@@ -68,13 +68,13 @@ Y_SENTINEL_U16 = 0x7F7F   # fp16 输出的哨兵（两字节）
 Y_SENTINEL_I8 = 0x7F      # int8 输出的哨兵（一字节，正好是 int8 的 127）
 Y_ELEM_BYTES = 2          # fp16 那条；int8 那条用 1，见 decode_y()
 
-# case 文件的头（version 6）。**形状全在 spec 里**，脚本不再写死任何一个维度 ——
+# case 文件的头（version 7）。**形状全在 spec 里**，脚本不再写死任何一个维度 ——
 # gen_case 写它，fc2d.py 从它生成 .onnx（再 atc 编成 om），本脚本从它取输入数据，
 # 三处同源。属性不再下发 —— 图 om 的属性是编译期烘进去的。
-CASE_VERSION = 6
+CASE_VERSION = 7
 # 末尾的 kh2 / kw2 是 conv2 的核，**只能往后加**：老的 .bin 在这两个位置上是 0，
-# 而那时两层必然同核，所以退回 kh / kw 就是对的 —— 老文件不用重新生成，
-# CASE_VERSION 也不动。gen_case 现在写进去的是**解析后**的值，不是 0。
+# 而那时两层必然同核，所以退回 kh / kw 就是对的 —— 相同核可按此回退；
+# ABI 7 stores filters as logical NCHW, so version 6 packed cases must be regenerated.
 # 注意这张表是被 _check_spec_keys_in_sync() 正则逐字比对的，**列表里不能写注释**。
 SPEC_KEYS = [
     "n", "ci", "hi", "wi", "cout1", "cout2", "kh", "kw", "s1", "s2",
@@ -270,6 +270,18 @@ def load_case(path):
         if name not in tensors:
             die("case 文件里缺张量 %s" % name)
 
+    # ABI 7 graph weights must retain exact logical shape; packed FZ buffers
+    # with an accidentally rewritten header cannot masquerade as NCHW inputs.
+    logical_filters = {
+        "filter1": [spec["cout1"], spec["ci"], spec["kh"], spec["kw"]],
+        "filter2": [spec["cout2"], spec["cout1"], spec.get("kh2") or spec["kh"],
+                    spec.get("kw2") or spec["kw"]],
+    }
+    for name, expected in logical_filters.items():
+        if tensors[name][1] != expected:
+            die("ABI 7 requires logical NCHW %s=%s, got %s; regenerate the case file"
+                % (name, expected, tensors[name][1]))
+
     shift1, shift2 = spec["shift1"], spec["shift2"]
     if isFp16 and not (0 <= shift1 <= FIX_SHIFT_LEN and 0 <= shift2 <= FIX_SHIFT_LEN):
         die("header 里的定点定标 %d / %d 超出 [0,%d]" % (shift1, shift2, FIX_SHIFT_LEN))
@@ -334,7 +346,7 @@ def load_acl():
         # "Don't know how to convert parameter 3"。
         ("aclopSetAttrFloat", [c_vp, ctypes.c_char_p, ctypes.c_float], ctypes.c_int),
         ("aclopSetAttrBool", [c_vp, ctypes.c_char_p, ctypes.c_uint8], ctypes.c_int),
-        # 卷积超参（kernel_size / strides / pads）是 list_int。不注册签名的话
+        # 卷积超参（strides / pads）是 list_int。不注册签名的话
         # ctypes 会按 int 传指针，报 "Don't know how to convert parameter 4"。
         ("aclopSetAttrListInt", [c_vp, ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int64)],
          ctypes.c_int),
@@ -1295,8 +1307,8 @@ def main():
         # **属性不下发。** 图 om 的属性在编译期就烘进去了，aclmdlExecute 不吃属性。
         # 定标 fixed_shift 是私有 ListInt，每层一项；a16w8_shift 是独立私有 Int。
         # ONNX 插件将内部定标配置写入 GE PrivateAttr；kernel 数值语义保持不变。
-        # 必填的是 dtype / kernel_size / strides / pads / bias_mask 这
-        # 五个，由编 om 那一步（fc2d_onnx.tensor_plan）给。另有七个从 ExtendConv2d
+        # 必填的是 dtype / bias_mask；strides / pads 缺省表示步长1、无补边。
+        # 它们由编 om 那一步（fc2d_onnx.tensor_plan）给。另有七个从 ExtendConv2d
         # 继承、声明了但还不支持的属性（dilations / groups / data_format /
         # offset_x / round_mode / pad_mode / enable_hf32），都发 IR 缺省值。
         # 于是「下发的属性集和编 .om 时那份对不上 -> MatchOpModel fail -> 报成 100024

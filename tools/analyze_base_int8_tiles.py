@@ -13,8 +13,8 @@ def read_reference(path):
     if len(raw) < 176:
         raise ValueError('case file is shorter than its header')
     magic, version, count, _, _, elements = struct.unpack_from('<8sIIQQQ', raw)
-    if magic != b'FC2DCASE' or version != 6:
-        raise ValueError('expected FC2DCASE version 6')
+    if magic != b'FC2DCASE' or version not in (6, 7):
+        raise ValueError('expected FC2DCASE version 6 or 7')
     spec = struct.unpack_from('<32i', raw, 40)
     expected = (1, 32, 288, 112, 64, 96, 3, 3, 1, 2, 1, 1, 1, 1)
     if spec[:14] != expected or spec[14:18] != (1, 0, 1, 1):

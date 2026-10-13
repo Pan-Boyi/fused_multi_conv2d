@@ -86,7 +86,7 @@ RELU_NO, RELU_NORMAL, RELU_SCALAR, RELU_VECTOR = 0, 1, 2, 3
 def tensor_plan(spec):
     """派生每个输入槽的 dtype/形状/有没有，外加八个属性和输出。
 
-    四条 dtype 通路、权重的 FRACTAL_Z 四元组、cout 向上补齐到 16、两层各按
+    四条 dtype 通路、权重的逻辑 NCHW 四元组、真实 Cout、两层各按
     自己的核 —— 这些规则**只在这里**。上面那条废掉的 singleop 路曾经另有一份
     逐行同源的副本，改形状得同时改两处；副本已经随那条路一起删了。
 
@@ -104,19 +104,14 @@ def tensor_plan(spec):
     wt = "float16" if filter_fp16 else "int8"
     bt = "float16" if fp16 else "int32"
     yt = "float16" if out_fp16 else "int8"
-    weight_c0 = 16 if filter_fp16 else 32
-    mid_c0 = 16 if fp16 else 32
-    # 老的 .bin 在 kh2/kw2 上是 0 —— 那时两层必然同核，退回 kh/kw 就是对的。
     kh2 = spec.get("kh2") or spec["kh"]
     kw2 = spec.get("kw2") or spec["kw"]
-    fz1k = (spec["ci"] // weight_c0) * spec["kh"] * spec["kw"]
-    fz2k = (spec["cout1"] // mid_c0) * kh2 * kw2
-
-    # FRACTAL_Z 的 N 向上补齐到 16 —— cout2 可以是 2，整除会算出 0。
+    # Logical graph inputs retain exact Kh/Kw and unpadded Cout. GE transforms
+    # them to the FRACTAL_Z storage required by the operator registration.
     slots = {
         "x": (xt, [spec["n"], spec["ci"], spec["hi"], spec["wi"]]),
-        "filter1": (wt, [fz1k, (spec["cout1"] + 15) // 16, 16, weight_c0]),
-        "filter2": (wt, [fz2k, (spec["cout2"] + 15) // 16, 16, weight_c0]),
+        "filter1": (wt, [spec["cout1"], spec["ci"], spec["kh"], spec["kw"]]),
+        "filter2": (wt, [spec["cout2"], spec["cout1"], kh2, kw2]),
         "bias1": (bt, [spec["cout1"]]),
         "bias2": (bt, [spec["cout2"]]),
     }
@@ -165,10 +160,6 @@ def tensor_plan(spec):
         # 所以这里的生成逻辑不用动。2/3 算子侧目前会拒。
         "relu": [RELU_NORMAL if spec["relu1"] else RELU_NO,
                  RELU_NORMAL if spec["relu2"] else RELU_NO],
-        # 两层同核时发长度 2，不同核时发长度 4 —— tiling 的 ReadKernelSize/ReadPads
-        # 两种长度都认（fused_conv2d_tiling.cpp 的 ATTR_KERNEL_SIZE 那段注释）。
-        "kernel_size": ([spec["kh"], spec["kw"]] if (kh2, kw2) == (spec["kh"], spec["kw"])
-                        else [spec["kh"], spec["kw"], kh2, kw2]),
         "strides": [int(spec["s1"]), int(spec["s2"])],
         "pads": [int(spec["ph1"]), int(spec["pw1"]), int(spec["ph2"]), int(spec["pw2"])],
         # Independent private 29-bit shift for A16W8 conv1.

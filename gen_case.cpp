@@ -11,10 +11,10 @@
  * fc2d.py 从 cases.json 里读一条就展开成上面这样一行，所以**改 json 就能换形状**。
  *
  * ---------------------------------------------------------------------------
- * 文件格式（version = 6，和 run_fused_conv2d.py 配套）
+ * 文件格式（version = 7，和 run_fused_conv2d.py 配套）
  * ---------------------------------------------------------------------------
  *   magic "FC2DCASE" (8B)
- *   version u32 = 6
+ *   version u32 = 7
  *   ntensors u32
  *   nonzero  u64   golden 里非零输出的个数
  *   sat      u64   落格时撞到边界的个数（fp16 是 int32 饱和，int8 是 ±127）
@@ -54,7 +54,7 @@ constexpr uint32_t ACL_DT_INT8 = 2;
 constexpr uint32_t ACL_DT_INT32 = 3;
 constexpr uint32_t ACL_DT_UINT64 = 10;
 
-constexpr uint32_t CASE_VERSION = 6;
+constexpr uint32_t CASE_VERSION = 7;
 constexpr int SPEC_N = 32; // spec 数组的长度，留了余量
 
 enum DTypeMode {
@@ -96,7 +96,7 @@ enum SpecIdx {
     // 精确区分 fp16 / int8 / s8f16 / a16w8。elemBytes 只描述 x，不足以表达混合通路。
     SPEC_DTYPE_MODE,
     // **只能往后加。** 旧的 .bin 在这两个位置上是 0，而 0 正好就是「conv2 沿用
-    // conv1 的核」，所以老文件不用重新生成，CASE_VERSION 也不用动。
+    // conv1 的核」。ABI 7 的 filter 数据改为逻辑 NCHW，旧文件必须重新生成。
     SPEC_KH2,
     SPEC_KW2,
     SPEC_COUNT
@@ -293,16 +293,12 @@ int main(int argc, char** argv)
     }
     Writer w{f};
 
-    const int64_t fz1k = (int64_t)(c.ci / weightC0) * c.kh1 * c.kw1;
-    // FRACTAL_Z 的 N 方向**向上补齐到 16**。cout1 必然是 C0 的整数倍所以除得尽，
-    // 但 cout2 不一定（可以是 2），写成整除会算出 0 —— filter2 的 shape 直接错。
-    const int64_t fz1n = (c.cout1 + 15) / 16;
-    const int64_t fz2k = (int64_t)(c.cout1 / weightC0) * c.Kh2() * c.Kw2();
-    const int64_t fz2n = (c.cout2 + 15) / 16;
     const std::vector<int64_t> xDims = {c.n, c.ci, c.hi, c.wi};
     const std::vector<int64_t> yDims = {c.n, c.cout2, c.Ho2(), c.Wo2()};
-    const std::vector<int64_t> f1Dims = {fz1k, fz1n, 16, (int64_t)weightC0};
-    const std::vector<int64_t> f2Dims = {fz2k, fz2n, 16, (int64_t)weightC0};
+    // Graph inputs carry true logical shapes and unpacked NCHW data. GE applies
+    // NCHW -> FRACTAL_Z at the FusedConv2d filter inputs during graph compilation.
+    const std::vector<int64_t> f1Dims = {c.cout1, c.ci, c.kh1, c.kw1};
+    const std::vector<int64_t> f2Dims = {c.cout2, c.cout1, c.Kh2(), c.Kw2()};
 
     if (isA16W8) {
         // ---- fp16 fmap + int8 filters / mid + fp16 output -----------------
@@ -339,9 +335,9 @@ int main(int argc, char** argv)
         w.U32(oneBits);
 
         w.Tensor("x", ACL_DT_FLOAT16, xDims, xF16.data(), xF16.size() * 2);
-        w.Tensor("filter1", ACL_DT_INT8, f1Dims, g.w1Dev.data(), g.w1Dev.size());
+        w.Tensor("filter1", ACL_DT_INT8, f1Dims, g.w1Nchw.data(), g.w1Nchw.size());
         w.Tensor("bias1", ACL_DT_INT32, {(int64_t)c.cout1}, g.b1.data(), g.b1.size() * 4);
-        w.Tensor("filter2", ACL_DT_INT8, f2Dims, g.w2Dev.data(), g.w2Dev.size());
+        w.Tensor("filter2", ACL_DT_INT8, f2Dims, g.w2Nchw.data(), g.w2Nchw.size());
         w.Tensor("bias2", ACL_DT_INT32, {(int64_t)c.cout2}, g.b2.data(), g.b2.size() * 4);
         w.Tensor("dequant_scale2", ACL_DT_UINT64, {(int64_t)c.cout2}, g.deq.data(), g.deq.size() * 8);
         w.Tensor("quant_scale1", ACL_DT_UINT64, {(int64_t)c.cout1}, q1.data(), q1.size() * 8);
@@ -379,9 +375,9 @@ int main(int argc, char** argv)
         w.U32(oneBits);
 
         w.Tensor("x", ACL_DT_INT8, xDims, g.xNchw.data(), g.xNchw.size());
-        w.Tensor("filter1", ACL_DT_INT8, f1Dims, g.w1Dev.data(), g.w1Dev.size());
+        w.Tensor("filter1", ACL_DT_INT8, f1Dims, g.w1Nchw.data(), g.w1Nchw.size());
         w.Tensor("bias1", ACL_DT_INT32, {(int64_t)c.cout1}, g.b1.data(), g.b1.size() * 4);
-        w.Tensor("filter2", ACL_DT_INT8, f2Dims, g.w2Dev.data(), g.w2Dev.size());
+        w.Tensor("filter2", ACL_DT_INT8, f2Dims, g.w2Nchw.data(), g.w2Nchw.size());
         w.Tensor("bias2", ACL_DT_INT32, {(int64_t)c.cout2}, g.b2.data(), g.b2.size() * 4);
         w.Tensor("dequant_scale2", ACL_DT_UINT64, {(int64_t)c.cout2}, g.deq.data(), g.deq.size() * 8);
         w.Tensor("quant_scale1", ACL_DT_UINT64, {(int64_t)c.cout1}, q1.data(), q1.size() * 8);
@@ -455,9 +451,9 @@ int main(int argc, char** argv)
         w.U32(oneBits);
 
         w.Tensor("x", ACL_DT_FLOAT16, xDims, g.xNchw.data(), g.xNchw.size() * 2);
-        w.Tensor("filter1", ACL_DT_FLOAT16, f1Dims, g.w1Dev.data(), g.w1Dev.size() * 2);
+        w.Tensor("filter1", ACL_DT_FLOAT16, f1Dims, g.w1Nchw.data(), g.w1Nchw.size() * 2);
         w.Tensor("bias1", ACL_DT_FLOAT16, {(int64_t)c.cout1}, g.b1.data(), g.b1.size() * 2);
-        w.Tensor("filter2", ACL_DT_FLOAT16, f2Dims, g.w2Dev.data(), g.w2Dev.size() * 2);
+        w.Tensor("filter2", ACL_DT_FLOAT16, f2Dims, g.w2Nchw.data(), g.w2Nchw.size() * 2);
         w.Tensor("bias2", ACL_DT_FLOAT16, {(int64_t)c.cout2}, g.b2.data(), g.b2.size() * 2);
         w.Tensor("y_expect", ACL_DT_FLOAT16, yDims, g.yExpect.data(), g.yExpect.size() * 2);
         w.Tensor("y_exact", ACL_DT_FLOAT16, yDims, g.yExact.data(), g.yExact.size() * 2);
@@ -492,9 +488,9 @@ int main(int argc, char** argv)
         w.U32(qs2);
 
         w.Tensor("x", ACL_DT_INT8, xDims, g.xNchw.data(), g.xNchw.size());
-        w.Tensor("filter1", ACL_DT_INT8, f1Dims, g.w1Dev.data(), g.w1Dev.size());
+        w.Tensor("filter1", ACL_DT_INT8, f1Dims, g.w1Nchw.data(), g.w1Nchw.size());
         w.Tensor("bias1", ACL_DT_INT32, {(int64_t)c.cout1}, g.b1.data(), g.b1.size() * 4);
-        w.Tensor("filter2", ACL_DT_INT8, f2Dims, g.w2Dev.data(), g.w2Dev.size());
+        w.Tensor("filter2", ACL_DT_INT8, f2Dims, g.w2Nchw.data(), g.w2Nchw.size());
         w.Tensor("bias2", ACL_DT_INT32, {(int64_t)c.cout2}, g.b2.data(), g.b2.size() * 4);
         w.Tensor("quant_scale1", ACL_DT_UINT64, {(int64_t)c.cout1}, q1.data(), q1.size() * 8);
         w.Tensor("quant_scale2", ACL_DT_UINT64, {(int64_t)c.cout2}, q2.data(), q2.size() * 8);

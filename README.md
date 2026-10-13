@@ -267,3 +267,21 @@ bash tests/stub_ascendcl/run_stub_test.sh base_int8  # 只跑指定的
 桩的 `aclmdlExecute` 把 `case.bin` 里的 `y_expect` 拷进输出缓冲，所以比对、诊断、
 抽样那几段也会真的跑一遍。**它不验数值正确性** —— 那只能靠板子；它验的是
 「这段代码会不会崩、分支走得对不对、字节数核对管不管用」。
+
+## Filter contract and case ABI 7
+
+FusedConv2d graph inputs now carry logical NCHW filter shapes and data:
+filter1=[Cout1,Cin,Kh1,Kw1], filter2=[Cout2,Cout1,Kh2,Kw2].
+The operator declares FRACTAL_Z weight storage, so GE inserts the required
+NCHW-to-FRACTAL_Z conversion during ATC graph compilation. Do not feed the old
+prepacked weight bytes to this graph. Kernel dimensions and the true output
+channel count are inferred from filter origin metadata; kernel_size is removed.
+
+Regenerate version 6 case files with the matching gen_case (ABI 7), then rebuild
+the ONNX and OM using the new operator package. Both case readers reject older
+versions. The runner still checks every input byte count against the loaded OM;
+for filter2 with Cout2=2 it now supplies exactly 2 logical channels, even though
+internal FRACTAL_Z storage pads to a 16-channel block. ATC uses
+--input_format=NCHW; bias/scale/relu_weight remain one-dimensional ND inputs.
+New graph weight conversions can affect runtime performance and must be measured
+using a freshly compiled OM.
