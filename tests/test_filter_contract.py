@@ -55,11 +55,18 @@ class FilterContract(unittest.TestCase):
                     self.assertEqual(tensors[name][1], dims)
                     self.assertEqual(len(tensors[name][2]), width * dims[0] * dims[1] * dims[2] * dims[3])
                 self.assertEqual(tensors["filter1"][2], tensors["w1_nchw"][2])
-                model = fc2d_onnx.build_model(plan)
+                model = fc2d_onnx.build_model(plan, tensors)
+                self.assertEqual(len(model.graph.input), 7)
+                self.assertEqual(len(model.graph.node[0].input), 9)
+                initializers = {t.name: t for t in model.graph.initializer}
+                self.assertEqual(set(initializers), {"filter1", "filter2"})
+                self.assertEqual(list(initializers["filter2"].dims), [2, 64, 3, 1])
+                self.assertEqual(initializers["filter2"].raw_data, tensors["filter2"][2])
                 shapes = {value.name: [d.dim_value for d in value.type.tensor_type.shape.dim]
                           for value in model.graph.input}
-                self.assertEqual(shapes["filter2"], [2, 64, 3, 1])
-                self.assertIn("filter2:2,64,3,1", fc2d_onnx.input_shape_arg(plan))
+                self.assertNotIn("filter2", shapes)
+                self.assertNotIn("filter2:", fc2d_onnx.input_shape_arg(plan))
+                self.assertNotIn("filter1", runner.model_input_slots(spec))
                 self.assertEqual(plan["y"][1], [1, 2, 10, 15])
 
     def test_old_packed_case_abi_is_rejected_before_model_compilation_or_execution(self):

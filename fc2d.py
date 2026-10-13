@@ -350,15 +350,14 @@ def do_om(c, paths, soc):
         print("      vendor 装法要确认 ASCEND_CUSTOM_OPP_PATH 指到 <装到哪>/vendors/<name>_nn。")
 
     import fc2d_onnx
-    plan, checker = fc2d_onnx.write_onnx(spec, paths["onnx"])
+    plan, checker = fc2d_onnx.write_onnx(paths["bin"], paths["onnx"])
     print("  onnx: %s（checker: %s）" % (paths["onnx"], checker))
     # 先清空旧 .om，免得 atc 失败时目录里留着上一次形状的产物被当成这次的结果。
     for fn in os.listdir(paths["omdir"]):
         if fn.endswith(".om"):
             os.remove(os.path.join(paths["omdir"], fn))
-    # Graph inputs are logical NCHW, including both filters. The registered op
-    # consumes FRACTAL_Z weights; GE inserts the required conversion once. ABI 7
-    # case.bin supplies NCHW bytes, never the old prepacked weight buffers.
+    # ABI 7 retains logical weights in case.bin. ONNX stores them as constants;
+    # GE folds them to FRACTAL_Z, so the compiled graph has seven runtime inputs.
     # --framework=5 下 --output 是**文件前缀**而不是目录，atc 自己补 .om。
     out_prefix = os.path.join(paths["omdir"], c["name"])
     cmd = ["atc", "--model=" + paths["onnx"], "--framework=5",
@@ -376,8 +375,11 @@ def do_om(c, paths, soc):
             "    * soc_version 不对\n"
             "    * 这个形状被 tiling 拒了（看 ~/ascend/log/ 里的 OP_LOGE）" % (rc, c["name"]))
     oms = [fn for fn in os.listdir(paths["omdir"]) if fn.endswith(".om")]
-    if not oms:
-        die("atc 说成功了但 %s 下没有 .om" % paths["omdir"])
+    if len(oms) != 1:
+        die("atc must generate exactly one fresh OM, found %d" % len(oms))
+    import run_fused_conv2d as runner
+    binding = runner.write_model_binding(paths["bin"], os.path.join(paths["omdir"], oms[0]))
+    print("  case/OM binding: %s" % binding)
     print("  产出: %s" % ", ".join(oms))
 
 

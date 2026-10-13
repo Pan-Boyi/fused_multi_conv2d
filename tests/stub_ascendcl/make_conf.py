@@ -5,9 +5,9 @@
 —— 桩要是自己另算一套，就会把运行器里那段「模型要的字节数 vs case.bin 给的字节
 数」核对测成假通过。
 
-恒长之后这两者**不再等价**：全 fp16 通路的 om 有 7 个输入（三个 DYNAMIC list 各
-两个实例），而 case.bin 里只有 5 个张量 —— gen_case 在那条通路上不产定标表，那两
-个 quant 实例是纯占位。按 case.bin 算会得到 5，桩就会说「模型报了 5 个输入」。
+Constant-weight graphs have seven runtime inputs. Filters are retained in case.bin
+for reference generation but are compiled into OM, so the stub models only x,
+bias/scale/relu_weight and their placeholders.
 """
 import io
 import os

@@ -42,6 +42,8 @@ om，旧的反而先匹配上」。
 """
 
 import ctypes
+import hashlib
+import json
 import os
 import statistics
 import struct
@@ -138,14 +140,15 @@ def model_input_slots(info):
 
     必须和 fc2d_onnx.tensor_plan 的槽位取舍逐项一致 —— 两边是同一个约定的两份
     实现。为什么不 import：运行器要能单独跑在板子机上，do_push 只拷 case.bin /
-    .om / 这个文件三样过去，import 不到 fc2d_onnx。
+    .om / .fc2d.json / 这个文件过去，import 不到 fc2d_onnx。
     （同样的理由让 SPEC_KEYS 也有两份抄本，见 _check_spec_keys_in_sync。）
     """
     # 四个 list 都恒长：bias 恒两个（bias_mask 说哪些是真的）、scale 恒两个
     # （dtype 组合说哪张会被读）、relu_weight 恒两个（算子目前一张都不读）。
     # **DYNAMIC 输入的实例数不能是 0**，所以「没有」不能用「少给张量」表达 ——
     # 详见 fc2d_onnx.tensor_plan 里那段。
-    slots = ["x", "filter1", "filter2", "bias1", "bias2", "quant_scale1"]
+    # Both filter instances are constants inside the graph.
+    slots = ["x", "bias1", "bias2", "quant_scale1"]
     # instance 1 的名字按这条通路上的用途取。
     if info["dtype_mode"] in (DTYPE_S8F16, DTYPE_A16W8):
         slots.append("dequant_scale2")
@@ -154,6 +157,49 @@ def model_input_slots(info):
     # relu_weight 的两个实例：恒是占位，case.bin 里没有，按模型报的字节数补零。
     slots += ["relu_weight1", "relu_weight2"]
     return slots
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_model_binding(case_path, om_path):
+    """Bind a constant-weight OM to the exact case used during compilation."""
+    with open(case_path, "rb") as stream:
+        header = stream.read(12)
+    if len(header) != 12 or struct.unpack_from("<I", header, 8)[0] != 7:
+        die("constant-weight OM binding requires case ABI 7; regenerate case and OM")
+    binding = {"schema_version": 1, "case_abi": 7, "weight_mode": "constant",
+               "model_input_count": 7, "model_sha256": _file_sha256(om_path),
+               "case_sha256": _file_sha256(case_path)}
+    path = om_path + ".fc2d.json"
+    with open(path + ".tmp", "w") as stream:
+        json.dump(binding, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+    os.replace(path + ".tmp", path)
+    return path
+
+
+def validate_model_binding(case_path, om_path):
+    """Validate before loading ACL: weights and attributes are fixed in OM."""
+    path = om_path + ".fc2d.json"
+    try:
+        with open(path) as stream:
+            binding = json.load(stream)
+    except (OSError, ValueError) as exc:
+        die("missing or invalid case/OM binding %s: %s; regenerate case and OM" % (path, exc))
+    contract = {"schema_version": 1, "case_abi": 7, "weight_mode": "constant", "model_input_count": 7}
+    if not isinstance(binding, dict) or any(binding.get(k) != v for k, v in contract.items()):
+        die("unsupported binding; regenerate the seven-input constant-weight OM")
+    if binding.get("model_sha256") != _file_sha256(om_path):
+        die("OM SHA256 differs from its binding; regenerate case and OM")
+    if binding.get("case_sha256") != _file_sha256(case_path):
+        die("case SHA256 differs from the compiled OM binding; weights/attributes changed, regenerate OM")
+    return binding
 
 
 # 恒长占位槽的 dtype 编号（DTYPE_NAME/DTYPE_SIZE 那张表里的编号）。
@@ -1041,8 +1087,9 @@ def main():
                     "        生成，再拷过来（run_profile.py 会自动拷）" % om_dir)
             print("  离线模型目录: %s，共 %d 个 .om: %s"
                   % (om_dir, len(oms), ", ".join(sorted(oms))))
-            if len(oms) > 1:
-                print("     (目录形式会把这些全部加载。只想用其中一个就直接传那个文件)")
+            if len(oms) != 1:
+                die("OM directory must contain exactly one model")
+            om_file = os.path.join(om_dir, oms[0])
         else:
             die("%s 既不是文件也不是目录" % om_arg)
 
@@ -1100,6 +1147,12 @@ def main():
     print("golden: nonzero=%d/%d sat=%d" % (gold_nonzero, y_elems, sat))
     if gold_nonzero == 0:
         die("golden 全是 0 —— 先别管设备")
+
+    if om_file is not None:
+        validate_model_binding(case_path, om_file)
+        print("  case/OM SHA256 binding verified (constant filters, 7 graph inputs)")
+    elif not dry_run:
+        die("provide a freshly compiled constant-weight OM and its .fc2d.json binding")
 
     # dry-run 连库都不加载 —— 它的目的就是在没有 CANN 的机器上验代码路径。
     acl = None if dry_run else load_acl()
@@ -1166,6 +1219,8 @@ def main():
         n_in = int(acl.aclmdlGetNumInputs(mdesc))
         n_out = int(acl.aclmdlGetNumOutputs(mdesc))
         print("  aclmdlLoadFromFile OK: model_id=%d, %d 个输入, %d 个输出" % (model_id, n_in, n_out))
+        if n_in != 7:
+            die("model has %d inputs; require the seven-input constant-weight graph, regenerate OM" % n_in)
         if n_out != 1:
             die("这个模型报了 %d 个输出，FusedConv2d 只有一个 y" % n_out)
 
@@ -1193,8 +1248,8 @@ def main():
         # ---- 按**模型自己报的**输入表喂数据 ----
         # 和单算子 om 的本质差别：单算子那套「槽位不能压缩、q1/q2 不能左移」的规则
         # 在这条路上不适用 —— 那条规则是 aclopExecuteV2 按 numInputs 匹配 .om 带来的。
-        # 图 om 的输入个数就是 onnx 图的输入个数，现在恒为 9
-        # （x + filters/bias/scale/relu_weight 四个 list 各 2 个实例）。
+        # Graph inputs are x and two instances of bias/scale/relu_weight.
+        # Both filter instances are constants inside the OM.
         # **不能写成「case.bin 里有的都喂」。** case.bin 无条件带 bias1/bias2 的
         # blob（gen_case 一直这么写），而 bias: false 的用例编出来的 om 里没有
         # bias 输入 —— 按「有 blob 就喂」会比模型多两个，撞到下面那条

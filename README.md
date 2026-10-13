@@ -30,7 +30,7 @@ python3 fc2d.py cases.json --steps check,case,om --soc <soc_version>
 python3 fc2d.py cases.json --steps run
 ```
 
-产物都在 `out/<name>/`：`case.bin`（输入 + golden）、`singleop.json`、`om/*.om`。
+产物都在 `out/<name>/`：`case.bin`（输入 + golden）、`.onnx`、`om/*.om`、`om/*.om.fc2d.json`。
 
 ## 上板 + profiling：run_profile.py
 
@@ -51,7 +51,7 @@ python3 run_profile.py profile.json
 | `check` | 本地 | 形状预检 |
 | `case` | 本地 | 生成 `case.bin` |
 | `om` | 本地 | 写 `singleop.json`,跑 `atc --singleop` |
-| `push` | 本地 -> 远端 | 每条 case 一个干净目录,拷 `case.bin`、`.om`、`run_fused_conv2d.py` |
+| `push` | 本地 -> 远端 | 每条 case 一个干净目录,拷 `case.bin`、`.om`、`.om.fc2d.json`、`run_fused_conv2d.py` |
 | `prof` | 远端 | `$MSPROF python3 run_fused_conv2d.py ...`,并找出**本次**新生成的 `PROF_*`。`$MSPROF` 是 `profile.msprof` 给死的绝对路径(缺省 `/var/msprof`),**不搜 PATH** —— 远端那个 ssh 是非交互 shell,读不到 `~/.bashrc` 里 source 的 `set_env.sh`,搜 PATH 会说「没有 msprof」而其实装着。指向 msprof 那个可执行文件本身。 |
 | `pull` | 远端 -> 本地 | 把那个 `PROF_*` 拉回 `prof_out/<json 名>/<case 名>/` |
 | `export` | 本地 | `TbeWorkTestSuit` 的 `msprof.py export summary` |
@@ -270,18 +270,25 @@ bash tests/stub_ascendcl/run_stub_test.sh base_int8  # 只跑指定的
 
 ## Filter contract and case ABI 7
 
-FusedConv2d graph inputs now carry logical NCHW filter shapes and data:
+Case ABI 7 retains true logical NCHW filter tensors:
 filter1=[Cout1,Cin,Kh1,Kw1], filter2=[Cout2,Cout1,Kh2,Kw2].
-The operator declares FRACTAL_Z weight storage, so GE inserts the required
-NCHW-to-FRACTAL_Z conversion during ATC graph compilation. Do not feed the old
-prepacked weight bytes to this graph. Kernel dimensions and the true output
-channel count are inferred from filter origin metadata; kernel_size is removed.
+The ONNX builder embeds both tensors as initializers. GE folds them to FRACTAL_Z
+at compilation and preserves their origin shape/format; kernel dimensions and
+true Cout2 are inferred from that metadata. kernel_size is removed.
 
-Regenerate version 6 case files with the matching gen_case (ABI 7), then rebuild
-the ONNX and OM using the new operator package. Both case readers reject older
-versions. The runner still checks every input byte count against the loaded OM;
-for filter2 with Cout2=2 it now supplies exactly 2 logical channels, even though
-internal FRACTAL_Z storage pads to a 16-channel block. ATC uses
---input_format=NCHW; bias/scale/relu_weight remain one-dimensional ND inputs.
-New graph weight conversions can affect runtime performance and must be measured
-using a freshly compiled OM.
+The operator retains nine input ports. Its compiled graph has seven runtime
+inputs: x and two instances each of bias, scale and relu_weight. Both filters
+are fixed in the OM. This path avoids the unavailable runtime NCHW-to-FRACTAL_Z
+TransData engine in the locally validated MC62 SDK. ATC uses input_format=NCHW;
+bias/scale/relu_weight remain one-dimensional ND inputs.
+
+Regenerate ABI 6 cases with the matching gen_case (ABI 7) and rebuild ONNX/OM
+with the new operator package. Both case readers reject old versions. Cout2=2
+stays two logical output channels while internal FRACTAL_Z weights pad to 16.
+Measure performance again using freshly compiled models.
+
+The OM step writes `<model.om>.fc2d.json` with SHA256 hashes of the OM and complete
+case.bin. The runner checks both hashes before loading ACL and rejects old
+nine-input models. Copy case.bin, the OM, binding file and runner together;
+run_profile.py uploads all four. Changing weights, attributes, geometry or any
+case data requires a new case/ONNX/OM/binding.

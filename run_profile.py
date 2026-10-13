@@ -434,6 +434,10 @@ def remote_script(rt, case_name, om_name, use_msprof, msprof):
 
 # ---------------------------------------------------------------- 各步骤
 def do_push(rt, c, paths, om_file):
+    # Reject stale model/case combinations before any remote mutation.
+    import run_fused_conv2d as runner
+    runner.validate_model_binding(paths["bin"], om_file)
+    binding_file = om_file + ".fc2d.json"
     # 下面要 rm -rf 这个目录。远端路径是 json 给的，先把明显危险的挡掉 ——
     # remote.dir 空着的话 wd 会变成 "/<case 名>"，那条 rm 就打到根目录下面去了。
     if not rt.dir.startswith("/") or rt.dir.rstrip("/").count("/") < 1:
@@ -448,13 +452,15 @@ def do_push(rt, c, paths, om_file):
     # 每条 case 一个干净目录。**不复用**：aclopSetModelDir 会把目录下所有 .om 都
     # 装进去，留着上一个形状的那个，它可能反而先匹配上，跑出来的是上个形状的结果，
     # 而且不报错。
-    for f in (paths["bin"], om_file, os.path.join(HERE, "run_fused_conv2d.py")):
+    for f in (paths["bin"], om_file, binding_file, os.path.join(HERE, "run_fused_conv2d.py")):
         if not os.path.isfile(f):
             raise RuntimeError("本地缺文件 %s" % f)
     if rt.scp_to(paths["bin"], "%s/case.bin" % wd) != 0:
         raise RuntimeError("拷 case.bin 失败")
     if rt.scp_to(om_file, "%s/%s" % (wd, os.path.basename(om_file))) != 0:
         raise RuntimeError("拷 .om 失败")
+    if rt.scp_to(binding_file, "%s/%s" % (wd, os.path.basename(binding_file))) != 0:
+        raise RuntimeError("拷 .fc2d.json binding 失败")
     # run_fused_conv2d.py 每次都拷。case.bin 的格式和它是配套的，远端留着一份旧的
     # 会报「case 文件版本 N，本脚本认 M」，而那时人往往已经在查算子了。
     if rt.scp_to(os.path.join(HERE, "run_fused_conv2d.py"), "%s/run_fused_conv2d.py" % wd) != 0:

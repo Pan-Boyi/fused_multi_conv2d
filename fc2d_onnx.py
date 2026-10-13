@@ -190,14 +190,11 @@ def tensor_plan(spec):
     }
 
 
-def build_model(plan):
-    """按 plan 建图。
-
-    所有张量都是**图输入**，不是 initializer —— 板上的数据来自 case.bin，
-    权重烘进 om 里就喂不进去了。
-    """
+def build_model(plan, filter_tensors):
+    """Build a constant-weight graph; GE folds logical filters to FRACTAL_Z."""
     graph_inputs = []
     node_inputs = []
+    initializers = []
     for name, dt, shape in plan["slots"]:
         if dt is None:
             # dt 是 None 的槽直接跳过，节点输入列表里不留空洞。
@@ -212,8 +209,20 @@ def build_model(plan):
             # Verify 上（我们的 infershape 根本不会被调到）。0 元素张量也走不通
             # （atc 的 --input_shape 直接拒，E10011）。
             continue
-        graph_inputs.append(helper.make_tensor_value_info(name, ONNX_DT[dt], shape))
         node_inputs.append(name)
+        if name in ("filter1", "filter2"):
+            if name not in filter_tensors:
+                raise ValueError("missing logical filter tensor " + name)
+            _, dims, raw = filter_tensors[name]
+            width = 2 if dt == "float16" else 1
+            count = 1
+            for dim in shape:
+                count *= dim
+            if list(dims) != shape or len(raw) != count * width:
+                raise ValueError("logical filter shape/bytes differ from plan: " + name)
+            initializers.append(helper.make_tensor(name, ONNX_DT[dt], shape, raw, raw=True))
+        else:
+            graph_inputs.append(helper.make_tensor_value_info(name, ONNX_DT[dt], shape))
 
     yt, yshape = plan["y"]
     graph_outputs = [helper.make_tensor_value_info("y", ONNX_DT[yt], yshape)]
@@ -222,7 +231,7 @@ def build_model(plan):
     # ai.onnx::<9..22>::FusedConv2d，所以 opset 换个数也还对得上。
     node = helper.make_node("FusedConv2d", node_inputs, ["y"],
                             name="fused_conv2d", domain="", **plan["attrs"])
-    graph = helper.make_graph([node], "fused_conv2d", graph_inputs, graph_outputs)
+    graph = helper.make_graph([node], "fused_conv2d", graph_inputs, graph_outputs, initializer=initializers)
     model = helper.make_model(graph, producer_name="fc2d_onnx.py",
                               opset_imports=[helper.make_opsetid("", OPSET)])
     model.ir_version = IR_VERSION
@@ -232,13 +241,17 @@ def build_model(plan):
 def input_shape_arg(plan):
     """拼 atc 的 --input_shape。只含真正存在的输入。"""
     return ";".join("%s:%s" % (n, ",".join(str(d) for d in shape))
-                    for n, dt, shape in plan["slots"] if dt is not None)
+                    for n, dt, shape in plan["slots"] if dt is not None and n not in ("filter1", "filter2"))
 
 
-def write_onnx(spec, path):
-    """造图并存盘，返回 plan。"""
+def write_onnx(case_path, path):
+    """Read spec and weights from the same case, save its graph, return the plan."""
+    import fc2d
+    spec = fc2d.read_spec(case_path)
     plan = tensor_plan(spec)
-    model = build_model(plan)
+    import run_fused_conv2d as runner
+    tensors, *_ = runner.load_case(case_path)
+    model = build_model(plan, tensors)
     # **onnx.checker 预期不过**：FusedConv2d 不是标准 ONNX 算子，标准类型推导
     # 认不出它。atc 的解析器直接读 protobuf、不跑 ONNX 的类型推导，照样能编 ——
     # 这一条被删掉的 onnx_block/build_block.py 已经实测过（那边是 Conv 吃 int8
@@ -259,10 +272,8 @@ def main(argv):
     if len(argv) < 2:
         print("用法: fc2d_onnx.py <case.bin> [out.onnx]")
         return 2
-    import fc2d
-    spec = fc2d.read_spec(argv[0])
     out = argv[1] if len(argv) > 1 else "fused_conv2d.onnx"
-    plan, checker = write_onnx(spec, out)
+    plan, checker = write_onnx(argv[0], out)
     print("写出 %s" % out)
     print("  onnx.checker: %s" % checker)
     for n, dt, shape in plan["slots"]:
