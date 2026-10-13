@@ -168,6 +168,8 @@ def tensor_plan(spec):
         "round_mode": "rint",
         "pad_mode": "SPECIFIC",
         "enable_hf32": 0,
+        # relu 发整数而不是布尔：ONNX 的 AttributeProto 没有 BOOLS 这个类型，
+        # 算子侧 gert::RuntimeAttrs 也没有 GetListBool —— 两头都只能走整数列表。
         # relu 的值是**硬件的 ReluMode 枚举**（kernel_utils_mode.h:54）：
         #   0 = NO_RELU  1 = NORMAL_RELU  2 = SCALAR_RELU  3 = VECTOR_RELU
         # 上一版它是 0/1 的开关；斜率表进原型之后扩成四态，而 0/1 的含义没变，
@@ -177,8 +179,6 @@ def tensor_plan(spec):
         # Internal calibration metadata: the ONNX plugin writes these into GE
         # PrivateAttr, outside the public OpDef/proto/binary attribute list.
         # Preserve both layer shifts; they are not inferred from tensor shapes.
-        # relu 发整数而不是布尔：ONNX 的 AttributeProto 没有 BOOLS 这个类型，
-        # 算子侧 gert::RuntimeAttrs 也没有 GetListBool —— 两头都只能走整数列表。
         # 长度必须正好等于层数，算子那边短列表会直接拒（不会补成缺省）。
         "fixed_shift": [int(spec["shift1"]), int(spec["shift2"])],
         # Independent private 29-bit shift for A16W8 conv1.
