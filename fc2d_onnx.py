@@ -152,7 +152,9 @@ def tensor_plan(spec):
     slots["relu_weight2"] = ("float32", [spec["cout2"]])
 
     attrs = {
-        # **每层一项**。fixed_shift1/2 和 relu1/2 收成了两个列表。
+        # Internal calibration metadata: the ONNX plugin writes these into GE
+        # PrivateAttr, outside the public OpDef/proto/binary attribute list.
+        # Preserve both layer shifts; they are not inferred from tensor shapes.
         # relu 发整数而不是布尔：ONNX 的 AttributeProto 没有 BOOLS 这个类型，
         # 算子侧 gert::RuntimeAttrs 也没有 GetListBool —— 两头都只能走整数列表。
         # 长度必须正好等于层数，算子那边短列表会直接拒（不会补成缺省）。
@@ -169,6 +171,7 @@ def tensor_plan(spec):
                         else [spec["kh"], spec["kw"], kh2, kw2]),
         "strides": [int(spec["s1"]), int(spec["s2"])],
         "pads": [int(spec["ph1"]), int(spec["pw1"]), int(spec["ph2"]), int(spec["pw2"])],
+        # Independent private 29-bit shift for A16W8 conv1.
         "a16w8_shift": 29,
         # y 的 dtype。以前是算子从「dq2 传没传」推断的，三张定标表并进 scale 之后
         # 那个判别消失了（x int8 出 int8 和 x int8 出 fp16 的输入侧完全同形），

@@ -1081,7 +1081,7 @@ def main():
         # 只是打出来给人看。属性在编 om 那一步就烘进 om 了，板侧不下发
         # （见下面 aclmdlAddDatasetBuffer 那段）。算子侧的名字是 fixed_shift，
         # 一个 ListInt、每层一项。
-        print("定点定标（来自 header，编 om 时作为 fixed_shift=[%d, %d] 烘进 om）"
+        print("定点定标（来自 header，编 om 时作为 private fixed_shift=[%d, %d] 烘进 om）"
               % (shift1, shift2))
         print("            对应累加器定标 2^%d / 2^%d —— 属性越大定标越小，别搞反"
               % (FIX_SHIFT_LEN - shift1, FIX_SHIFT_LEN - shift2))
@@ -1293,8 +1293,9 @@ def main():
         check(acl.aclmdlAddDatasetBuffer(ds_out, bufs[NIN]), "aclmdlAddDatasetBuffer(out) = %d")
 
         # **属性不下发。** 图 om 的属性在编译期就烘进去了，aclmdlExecute 不吃属性。
-        # 定标属性叫 fixed_shift：一个 ListInt、每层一项，OPTIONAL（只有 fp16 定点
-        # 通路读它）。必填的是 dtype / kernel_size / strides / pads / bias_mask 这
+        # 定标 fixed_shift 是私有 ListInt，每层一项；a16w8_shift 是独立私有 Int。
+        # ONNX 插件将内部定标配置写入 GE PrivateAttr；kernel 数值语义保持不变。
+        # 必填的是 dtype / kernel_size / strides / pads / bias_mask 这
         # 五个，由编 om 那一步（fc2d_onnx.tensor_plan）给。另有七个从 ExtendConv2d
         # 继承、声明了但还不支持的属性（dilations / groups / data_format /
         # offset_x / round_mode / pad_mode / enable_hf32），都发 IR 缺省值。
@@ -1326,7 +1327,7 @@ def main():
         # 目前只会发 0/1 —— 2/3 要用 relu_weight 那张斜率表，算子侧会拒。
         relu_str = "[%d,%d]" % (1 if info["relu1"] else 0, 1 if info["relu2"] else 0)
         print("算子属性（编译期已烘进 om，此处仅供核对）: dtype=%d bias_mask=%s "
-              "fixed_shift=[%d,%d] relu=%s a16w8_shift=29 "
+              "private fixed_shift=[%d,%d] relu=%s private a16w8_shift=29 "
               "kernel=%dx%d>%dx%d strides=%d/%d pads=%d,%d/%d,%d"
               % (dtype_echo, bias_mask_str, shift1, shift2, relu_str,
                  info["kh"], info["kw"], kh2, kw2, info["s1"], info["s2"],
