@@ -85,7 +85,9 @@
       "hi": 288,
       "wi": 112,
       "cout1": 64,
-      "cout2": 96
+      "cout2": 96,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "base_bias",
@@ -95,7 +97,9 @@
       "wi": 112,
       "cout1": 64,
       "cout2": 96,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "base_norelu",
@@ -108,7 +112,9 @@
       "relu": [
         false,
         false
-      ]
+      ],
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "hw112",
@@ -117,7 +123,9 @@
       "hi": 112,
       "wi": 112,
       "cout1": 32,
-      "cout2": 32
+      "cout2": 32,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "s1_1",
@@ -130,7 +138,8 @@
       "strides": [
         1,
         1
-      ]
+      ],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "k1x1",
@@ -170,7 +179,8 @@
         2,
         2
       ],
-      "bias": true
+      "bias": true,
+      "strides": [1, 2]
     },
     {
       "name": "k1x3",
@@ -204,7 +214,9 @@
       "wi": 32,
       "cout1": 128,
       "cout2": 32,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "batch2",
@@ -215,7 +227,9 @@
       "wi": 32,
       "cout1": 32,
       "cout2": 32,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "base_s8f16",
@@ -224,7 +238,9 @@
       "hi": 288,
       "wi": 112,
       "cout1": 64,
-      "cout2": 96
+      "cout2": 96,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "wide_cmid_s8f16",
@@ -234,7 +250,9 @@
       "wi": 32,
       "cout1": 128,
       "cout2": 32,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "wide1790",

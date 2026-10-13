@@ -36,12 +36,9 @@ FusedConv2d 上板执行 + profiling 的总驱动 —— **全部配置来自一
 ================================================================================
 为什么形状必须从**同一处**派生
 ================================================================================
-一个形状要三样东西严丝合缝：
-    case.bin 里的输入和 golden
-    .om（ACL 按 op 类型 + 每个张量的 shape/dtype/format + **全部属性的值** 匹配）
-    执行时下发的输入和属性
-任何一处不一致，板上报的都是 100024 / MatchOpModel fail，翻译过来是「算子没找到」
-—— 那条信息完全不指向真正的原因。这条链上折过好几次。
+case.bin 保存逻辑输入、参考输出和属性 spec；ONNX 从 spec 派生，并把两张 filter
+编译成常量。OM 只有 7 个运行输入，公开和私有属性在编译期写入模型。
+.om.fc2d.json 用完整 case 与 OM 的 SHA256 绑定这组产物，执行前必须通过核对。
 
 所以这里的派生链是单向的、没有分叉的：
 
@@ -79,6 +76,9 @@ FusedConv2d 上板执行 + profiling 的总驱动 —— **全部配置来自一
 import argparse
 import csv
 import json
+import hashlib
+import re
+import uuid
 import os
 import shlex
 import shutil
@@ -293,10 +293,12 @@ class Remote(object):
         sys.stdout.flush()
         if stdin_script is not None:
             p = subprocess.run(argv, input=stdin_script.encode(), env=self._env(),
-                               stdout=subprocess.PIPE if capture else None, check=False)
+                               stdout=subprocess.PIPE if capture else None,
+                               stderr=subprocess.STDOUT if capture else None, check=False)
             return p.returncode, (p.stdout.decode(errors="replace") if capture else "")
         p = subprocess.run(argv, env=self._env(),
-                           stdout=subprocess.PIPE if capture else None, check=False)
+                           stdout=subprocess.PIPE if capture else None,
+                           stderr=subprocess.STDOUT if capture else None, check=False)
         return p.returncode, (p.stdout.decode(errors="replace") if capture else "")
 
     def scp_to(self, local, remote_path, recursive=False):
@@ -360,76 +362,107 @@ def preflight(rt):
 
 
 # ---------------------------------------------------------------- 远端脚本
-def remote_script(rt, case_name, om_name, use_msprof, msprof):
-    """生成在远端跑的那段 bash。
+def remote_script(rt, case_name, om_name, use_msprof, msprof, expected_binding):
+    """Verify this bundle, record the runner RC separately, and return a JSON result.
 
-    它自己做三件本地做不了的事：
-      1. 检查 msprof / case / om 在不在，不在就明确说哪个不在。msprof 用的是
-         profile.msprof 给死的绝对路径，**不搜 PATH**
-      2. 执行前后各记一次 PROF_* 目录，用差集找出**本次**新生成的那个 ——
-         目录名里带时间戳，靠"最新"去猜在并发或重跑时会拿错
-      3. 只往 stdout 打一行 PROF 目录名，别的全走 stderr，这样调用方能直接读
+    The profiler may return zero even when its child fails. The application wrapper
+    records the actual runner RC; PROF data remains available for failure diagnosis.
     """
     wd = "%s/%s" % (rt.dir.rstrip("/"), case_name)
-    lines = [
-        "set -o pipefail",
-        "cd %s || { echo '[REMOTE ERROR] 进不去 %s' >&2; exit 1; }" % (shlex.quote(wd), wd),
-    ]
-    if rt.cann_env:
-        lines += [
-            "if [ -f %s ]; then source %s >/dev/null 2>&1; "
-            "else echo '[REMOTE ERROR] 找不到 %s' >&2; exit 1; fi"
-            % (shlex.quote(rt.cann_env), shlex.quote(rt.cann_env), rt.cann_env),
-        ]
-    lines += [
-        "for f in case.bin run_fused_conv2d.py %s; do" % shlex.quote(om_name),
-        "  [ -f \"$f\" ] || { echo \"[REMOTE ERROR] 缺文件 $f\" >&2; exit 1; }",
-        "done",
-    ]
-    if use_msprof:
-        q = shlex.quote(msprof)
-        lines += [
-            # 路径是配置给死的，不搜 PATH，也不猜。只确认它真的能执行 ——
-            # 这一条不是搜索，是为了让「路径写错了」当场说清楚，而不是变成
-            # 一句 command not found 混在 msprof 自己的输出里。
-            "MSPROF=%s" % q,
-            "[ -x \"$MSPROF\" ] || { echo \"[REMOTE ERROR] $MSPROF 不存在或不可执行\" >&2; "
-            "echo '  这个路径来自 profile.json 的 profile.msprof，改那里' >&2; exit 127; }",
-            "echo \"[REMOTE] msprof = $MSPROF\" >&2",
-            "BEFORE=$(mktemp); AFTER=$(mktemp)",
-            "trap 'rm -f \"$BEFORE\" \"$AFTER\"' EXIT",
-            "find . -maxdepth 1 -mindepth 1 -type d -name 'PROF_*' -printf '%f\\n' | sort > \"$BEFORE\"",
-        ]
-    lines += [
-        "export REPEAT=%d" % rt.repeat,
-        "export WARMUP=%d" % rt.warmup,
-        "echo '[REMOTE] 开始执行' >&2",
-    ]
-    exec_cmd = "python3 run_fused_conv2d.py case.bin FusedConv2d %d %s" % (
+    command = "python3 run_fused_conv2d.py case.bin FusedConv2d %d %s" % (
         rt.device, shlex.quote(om_name))
-    if use_msprof:
-        exec_cmd = "\"$MSPROF\" " + exec_cmd
+    lines = ["set -o pipefail", "cd %s || exit 1" % shlex.quote(wd)]
+    if rt.cann_env:
+        lines += ["[ -f %s ] || exit 1; source %s >/dev/null 2>&1" %
+                  (shlex.quote(rt.cann_env), shlex.quote(rt.cann_env))]
     lines += [
-        "%s >&2" % exec_cmd,
-        "RC=$?",
-        "echo \"[REMOTE] 执行返回码 $RC\" >&2",
+        "python3 - %s %s <<'FC2D_VERIFY'" %
+        (shlex.quote(om_name), shlex.quote(json.dumps(expected_binding))),
+        "import json, sys",
+        "import run_fused_conv2d as runner",
+        "actual = runner.validate_model_binding('case.bin', sys.argv[1])",
+        "if actual != json.loads(sys.argv[2]):",
+        "    raise SystemExit('remote case/OM differs from the selected local binding')",
+        "FC2D_VERIFY",
+        "[ $? -eq 0 ] || exit 1",
+        "APP=$(mktemp); DEVICE_RC=$(mktemp); BEFORE=$(mktemp)",
+        "trap 'rm -f \"$APP\" \"$DEVICE_RC\" \"$BEFORE\"' EXIT",
+        "export FC2D_DEVICE_RC=\"$DEVICE_RC\"",
+        "cat > \"$APP\" <<'FC2D_APP'",
+        "#!/bin/bash", command, "RC=$?",
+        "printf '%s\\n' \"$RC\" > \"$FC2D_DEVICE_RC\"", "exit $RC", "FC2D_APP",
+        "python3 -c \"import json,os; json.dump([n for n in os.listdir('.') if n.startswith('PROF_') and os.path.isdir(n)],open(os.environ['FC2D_BEFORE'],'w'))\"",
+        "export REPEAT=%d WARMUP=%d" % (rt.repeat, rt.warmup),
     ]
+    # The snapshot helper uses an environment variable to avoid shell-path quoting.
+    lines.insert(-2, "export FC2D_BEFORE=\"$BEFORE\"")
     if use_msprof:
-        lines += [
-            "find . -maxdepth 1 -mindepth 1 -type d -name 'PROF_*' -printf '%f\\n' | sort > \"$AFTER\"",
-            "NEW=$(comm -13 \"$BEFORE\" \"$AFTER\")",
-            "CNT=$(printf '%s\\n' \"$NEW\" | sed '/^[[:space:]]*$/d' | wc -l)",
-            "if [ \"$CNT\" -eq 0 ]; then echo '[REMOTE ERROR] 没有生成新的 PROF_* 目录' >&2; exit 2; fi",
-            "if [ \"$CNT\" -gt 1 ]; then echo '[REMOTE ERROR] 一次生成了多个 PROF_*:' >&2; "
-            "printf '%s\\n' \"$NEW\" >&2; exit 3; fi",
-            # kernel 就算跑挂了，只要 PROF 出来了就继续导 —— 挂掉时的流水图往往
-            # 正是要看的东西。
-            "if [ \"$RC\" -ne 0 ]; then echo \"[REMOTE 警告] 执行返回 $RC，但 PROF 已生成，继续\" >&2; fi",
-            "printf '%s\\n' \"$NEW\"",
-        ]
+        lines += ["MSPROF=%s" % shlex.quote(msprof),
+                  "[ -x \"$MSPROF\" ] || { echo 'msprof missing or not executable' >&2; exit 127; }",
+                  '"$MSPROF" bash "$APP" >&2', "PROFILER_RC=$?"]
     else:
-        lines += ["exit $RC"]
+        lines += ['bash "$APP" >&2', "PROFILER_RC=0"]
+    lines += [
+        "python3 - \"$DEVICE_RC\" \"$BEFORE\" \"$PROFILER_RC\" %d <<'FC2D_RESULT'" % use_msprof,
+        "import json, os, sys",
+        "raw = open(sys.argv[1]).read().strip()",
+        "device_rc = int(raw) if raw else 127",
+        "before = set(json.load(open(sys.argv[2])))",
+        "new = sorted(n for n in os.listdir('.') if n.startswith('PROF_') and os.path.isdir(n) and n not in before)",
+        "profiling = bool(int(sys.argv[4])); profiler_rc = int(sys.argv[3])",
+        "prof = new[0] if profiling and len(new) == 1 else None",
+        "collection_rc = (0 if len(new) == 1 else 2) if profiling else 0",
+        "result = dict(device_rc=device_rc, profiler_rc=profiler_rc, collection_rc=collection_rc, prof=prof)",
+        "print('FC2D_RESULT=' + json.dumps(result, sort_keys=True))",
+        "sys.exit(1 if device_rc or profiler_rc or collection_rc else 0)",
+        "FC2D_RESULT",
+        "exit $?",
+    ]
     return "\n".join(lines) + "\n"
+
+
+def select_model(paths):
+    directory = paths["omdir"]
+    models = sorted(os.path.join(directory, f) for f in os.listdir(directory)
+                    if f.endswith(".om")) if os.path.isdir(directory) else []
+    if len(models) != 1:
+        raise RuntimeError("%s must contain exactly one OM (found %d); run --steps om" %
+                           (directory, len(models)))
+    return models[0]
+
+
+def profile_state_path(paths):
+    return os.path.join(os.path.dirname(paths["bin"]), "profile_state.json")
+
+
+def save_profile_state(paths, state):
+    path = profile_state_path(paths)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w") as stream:
+        json.dump(state, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+    os.replace(path + ".tmp", path)
+
+
+def remote_identity(rt):
+    return hashlib.sha256((rt.target + "\n" + rt.dir).encode()).hexdigest()
+
+
+def load_profile_state(paths, om_file, rt=None):
+    import run_fused_conv2d as runner
+    binding = runner.validate_model_binding(paths["bin"], om_file)
+    try:
+        with open(profile_state_path(paths)) as stream:
+            state = json.load(stream)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("No valid profile_state.json; run --steps prof first") from exc
+    if state.get("schema_version") != 1 or state.get("binding") != binding:
+        raise RuntimeError("Profiling state belongs to a different case/OM; run --steps prof again")
+    if rt is not None and state.get("remote_identity") != remote_identity(rt):
+        raise RuntimeError("Profiling state belongs to a different remote workspace")
+    if not re.fullmatch(r"PROF_[A-Za-z0-9_.-]+", state.get("prof") or ""):
+        raise RuntimeError("Profiling state has no unambiguous PROF directory")
+    return state
 
 
 # ---------------------------------------------------------------- 各步骤
@@ -442,6 +475,9 @@ def do_push(rt, c, paths, om_file):
     # remote.dir 空着的话 wd 会变成 "/<case 名>"，那条 rm 就打到根目录下面去了。
     if not rt.dir.startswith("/") or rt.dir.rstrip("/").count("/") < 1:
         raise RuntimeError("remote.dir 必须是一个绝对路径且不能是根目录附近，当前是 %r" % rt.dir)
+    for f in (paths["bin"], om_file, binding_file, os.path.join(HERE, "run_fused_conv2d.py")):
+        if not os.path.isfile(f):
+            raise RuntimeError("本地缺文件 %s" % f)
     wd = "%s/%s" % (rt.dir.rstrip("/"), c["name"])
     rc, _ = rt.ssh("rm -rf %s && mkdir -p %s" % (shlex.quote(wd), shlex.quote(wd)))
     if rc != 0:
@@ -449,12 +485,7 @@ def do_push(rt, c, paths, om_file):
             "远端建目录失败（rc=%d）%s" % (rc,
             "—— 255 是 ssh 自己没连上（认证失败/主机不可达），不是 mkdir 失败" if rc == 255
             else "—— ssh 进去了，是远端 mkdir 没成功：%s 下有写权限吗？" % rt.dir))
-    # 每条 case 一个干净目录。**不复用**：aclopSetModelDir 会把目录下所有 .om 都
-    # 装进去，留着上一个形状的那个，它可能反而先匹配上，跑出来的是上个形状的结果，
-    # 而且不报错。
-    for f in (paths["bin"], om_file, binding_file, os.path.join(HERE, "run_fused_conv2d.py")):
-        if not os.path.isfile(f):
-            raise RuntimeError("本地缺文件 %s" % f)
+    # Upload exactly one bound model and the matching standalone runner.
     if rt.scp_to(paths["bin"], "%s/case.bin" % wd) != 0:
         raise RuntimeError("拷 case.bin 失败")
     if rt.scp_to(om_file, "%s/%s" % (wd, os.path.basename(om_file))) != 0:
@@ -468,24 +499,45 @@ def do_push(rt, c, paths, om_file):
     print("[OK] 已拷到 %s:%s" % (rt.target, wd))
 
 
-def do_prof(rt, c, om_file, use_msprof, msprof, show_script=False):
-    script = remote_script(rt, c["name"], os.path.basename(om_file), use_msprof, msprof)
+def do_prof(rt, c, paths, om_file, use_msprof, msprof, show_script=False):
+    import run_fused_conv2d as runner
+    binding = runner.validate_model_binding(paths["bin"], om_file)
+    script = remote_script(rt, c["name"], os.path.basename(om_file), use_msprof, msprof, binding)
     if show_script:
-        print("---- 远端将执行 ----")
-        print(script)
-        print("--------------------")
+        print("---- 远端将执行 ----\n%s--------------------" % script)
+    log_path = os.path.join(os.path.dirname(paths["bin"]), "execution_%s.log" % uuid.uuid4().hex)
+    state = dict(schema_version=1, binding=binding, remote_identity=remote_identity(rt),
+                 prof=None, device_rc=None, profiler_rc=None, collection_rc=None,
+                 execution_log=log_path, local_prof=None)
+    save_profile_state(paths, state)  # A failed new run must not leave an old PROF usable.
     rc, out = rt.ssh("bash -s", stdin_script=script, capture=True)
-    if not use_msprof:
-        if rc != 0:
-            raise RuntimeError("远端执行返回 %d" % rc)
-        return None
-    if rc != 0:
-        raise RuntimeError("远端 profiling 返回 %d" % rc)
-    prof = out.strip().replace("\r", "")
-    if not prof.startswith("PROF_"):
-        raise RuntimeError("没能确定新生成的 PROF 目录，远端 stdout 是 %r" % out[:200])
-    print("[OK] 新 PROF 目录: %s" % prof)
-    return prof
+    with open(log_path, "w") as stream:
+        stream.write(out)
+    print(out, end="" if out.endswith("\n") else "\n")
+    state["ssh_rc"] = rc
+    results = [line[len("FC2D_RESULT="):] for line in out.splitlines()
+               if line.startswith("FC2D_RESULT=")]
+    if len(results) != 1:
+        save_profile_state(paths, state)
+        raise RuntimeError("Remote execution returned %d without a result; log: %s" % (rc, log_path))
+    result = json.loads(results[0])
+    if set(result) != {"device_rc", "profiler_rc", "collection_rc", "prof"} or any(
+            type(result[key]) is not int or result[key] < 0
+            for key in ("device_rc", "profiler_rc", "collection_rc")):
+        save_profile_state(paths, state)
+        raise RuntimeError("Invalid remote execution result; log: %s" % log_path)
+    if result["prof"] is not None and not re.fullmatch(r"PROF_[A-Za-z0-9_.-]+", result["prof"]):
+        raise RuntimeError("Invalid PROF directory in remote result")
+    state.update(result)
+    save_profile_state(paths, state)
+    print("[RESULT] Execution log: %s; device RC=%d, profiler RC=%d" %
+          (log_path, state["device_rc"], state["profiler_rc"]))
+    return state
+
+
+def execution_failed(state):
+    return any(state.get(key) != 0 for key in
+               ("device_rc", "profiler_rc", "collection_rc", "ssh_rc"))
 
 
 def do_pull(rt, c, prof, prof_root):
@@ -675,7 +727,8 @@ def main():
     stem = os.path.splitext(os.path.basename(args.cases or args.config))[0]
     out_root = doc.get("outdir") or os.path.join(cfg_dir, "out", stem)
     prof_root = doc.get("profdir") or os.path.join(cfg_dir, "prof_out", stem)
-    rt = Remote(remote_cfg)
+    needs_remote = bool({"push", "prof", "pull"} & set(steps))
+    rt = Remote(remote_cfg) if needs_remote else None
 
     print("配置   : %s" % args.config)
     print("步骤   : %s" % " -> ".join(steps))
@@ -683,7 +736,8 @@ def main():
     if use_msprof:
         print("PROF   : %s" % prof_root)
     print("soc    : %s" % (soc or "(未给，出 om 时会报错)"))
-    print("远端   : %s" % rt.describe())
+    if rt is not None:
+        print("远端   : %s" % rt.describe())
     print("共 %d 条:" % len(cases))
     for c in cases:
         ph1, pw1, ph2, pw2 = c["pads"]
@@ -723,35 +777,36 @@ def main():
             if "om" in steps:
                 fc2d.do_om(c, paths, soc)
 
-            om_file = None
-            if {"push", "prof"} & set(steps):
-                oms = [os.path.join(paths["omdir"], f)
-                       for f in os.listdir(paths["omdir"])] if os.path.isdir(paths["omdir"]) else []
-                oms = [f for f in oms if f.endswith(".om")]
-                if not oms:
-                    raise RuntimeError("%s 下没有 .om —— 先跑 --steps om" % paths["omdir"])
-                if len(oms) > 1:
-                    # do_om 每次都会先清空目录，所以这里出现多个只可能是人手动放的。
-                    raise RuntimeError("%s 下有 %d 个 .om，说不清该用哪个: %s"
-                                       % (paths["omdir"], len(oms), [os.path.basename(f) for f in oms]))
-                om_file = oms[0]
-                print("[OK] .om = %s" % os.path.basename(om_file))
-
+            om_file = select_model(paths) if {"push", "prof", "pull", "export", "parse"} & set(steps) else None
             if "push" in steps:
                 do_push(rt, c, paths, om_file)
-            prof = None
+            state = None
             if "prof" in steps:
-                prof = do_prof(rt, c, om_file, use_msprof, prof_cfg["msprof"],
-                               args.print_remote_script)
-            if "pull" in steps and prof:
-                local_prof = do_pull(rt, c, prof, prof_root)
+                state = do_prof(rt, c, paths, om_file, use_msprof, prof_cfg["msprof"],
+                                args.print_remote_script)
+            if {"pull", "export", "parse"} & set(steps):
+                state = load_profile_state(paths, om_file, rt if "pull" in steps else None)
+            if "pull" in steps:
+                state["local_prof"] = do_pull(rt, c, state["prof"], prof_root)
+                save_profile_state(paths, state)
+            if {"export", "parse"} & set(steps):
+                local_prof = state.get("local_prof")
+                if not local_prof or not os.path.isdir(local_prof):
+                    raise RuntimeError("PROF not downloaded; run --steps pull first")
                 if "export" in steps:
                     do_export(local_prof, prof_cfg["tbe_work_test_suit"])
                 if "parse" in steps:
-                    stats[c["name"]] = parse_summary(find_op_summary(local_prof), prof_cfg["columns"])
-        except SystemExit:
-            raise
-        except Exception as e:  # noqa: BLE001 - 驱动脚本，要把哪条失败了说清楚
+                    parsed = parse_summary(find_op_summary(local_prof), prof_cfg["columns"])
+                    state["summary"] = parsed
+                    save_profile_state(paths, state)
+                    # Failed runs may be inspected, but never enter performance comparisons.
+                    if not execution_failed(state):
+                        stats[c["name"]] = parsed
+            if state is not None and execution_failed(state):
+                raise RuntimeError("Execution failed (device RC=%s, profiler RC=%s, collection RC=%s, ssh RC=%s); log: %s" %
+                                   (state["device_rc"], state["profiler_rc"], state["collection_rc"],
+                                    state["ssh_rc"], state["execution_log"]))
+        except (Exception, SystemExit) as e:  # Keep per-case validation failures within --keep-going
             print("\n[X] %s 失败: %s" % (c["name"], e))
             failed.append(c["name"])
             if not args.keep_going:

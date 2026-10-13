@@ -166,13 +166,16 @@ int main(int argc, char** argv)
                      "        [--s1 N] [--s2 N]\n"
                      "        [--ph1 N] [--pw1 N] [--ph2 N] [--pw2 N]\n"
                      "        [--bias 0|1] [--relu1 0|1] [--relu2 0|1] [--shift1 N] [--shift2 N]\n"
-                     "缺省就是这个算子最早那组固定形状（32->64->96, 288x112, 3x3, s1/2, pad1）。\n",
+                     "缺省形状为 32->64->96, 288x112, 3x3；strides=1/1, pads=0。\n",
                      argv[0]);
         return 2;
     }
     const char* out = argv[1];
 
     Case c;
+    // Match the public operator defaults without changing the shared reference case.
+    c.stride1 = c.stride2 = 1;
+    c.padH1 = c.padW1 = c.padH2 = c.padW2 = 0;
     // 四条通路。A16W8 的 x 是 fp16，两张 filter 和 fused mid 是 int8，y 是 fp16。
     const std::string dtype = ArgStr(argc, argv, "--dtype", "fp16");
     bool outFp16 = false;

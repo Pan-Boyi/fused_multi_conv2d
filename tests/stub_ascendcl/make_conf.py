@@ -52,7 +52,7 @@ with io.open(os.path.join(outdir, "stub.conf"), "w") as f:
 with open(os.path.join(outdir, "golden.bin"), "wb") as f:
     f.write(tensors["y_expect"][2])
 
-print("模型输入表（%d 个 = x + 四个 DYNAMIC list x 每层一个实例）:" % len(present))
+print("模型输入表（%d 个 = x + 三个 DYNAMIC list x 每层一个实例）:" % len(present))
 for n in present:
     tag = "" if n in tensors else "   <- 恒长占位，case.bin 里没有"
     print("  %-16s %9d 字节%s" % (n, slot_bytes(n), tag))

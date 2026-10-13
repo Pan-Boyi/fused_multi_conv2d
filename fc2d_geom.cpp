@@ -47,11 +47,11 @@ int main(int argc, char** argv)
     p.kh2 = ArgInt(argc, argv, "--kh2", 0);
     p.kw2 = ArgInt(argc, argv, "--kw2", 0);
     p.stride1 = ArgInt(argc, argv, "--s1", 1);
-    p.stride2 = ArgInt(argc, argv, "--s2", 2);
-    p.padH1 = ArgInt(argc, argv, "--ph1", 1);
-    p.padW1 = ArgInt(argc, argv, "--pw1", 1);
-    p.padH2 = ArgInt(argc, argv, "--ph2", 1);
-    p.padW2 = ArgInt(argc, argv, "--pw2", 1);
+    p.stride2 = ArgInt(argc, argv, "--s2", 1);
+    p.padH1 = ArgInt(argc, argv, "--ph1", 0);
+    p.padW1 = ArgInt(argc, argv, "--pw1", 0);
+    p.padH2 = ArgInt(argc, argv, "--ph2", 0);
+    p.padW2 = ArgInt(argc, argv, "--pw2", 0);
     // s8f16 = int8 进 / fp16 出：入口和 int8 一样（elemBytes = 1），但 L1 末尾
     // 多一段 per-channel 反量化表，所以几何要按带表的算。
     const char* dt = ArgStr(argc, argv, "--dtype", "fp16");

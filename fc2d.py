@@ -64,7 +64,7 @@ DTYPE_A16W8 = 3
 
 
 # run_fused_conv2d.py 里有**同一份** SPEC_KEYS 的抄本。它必须能单独跑在板子机上
-# （do_push 只拷 case.bin / .om / run_fused_conv2d.py 三个文件过去），所以没法
+# （do_push 只拷 case.bin / .om / .om.fc2d.json / run_fused_conv2d.py 四个文件过去），所以没法
 # import 这边的定义。两份一旦长歪，读到的就是相邻字段的值 —— 不报错，只是全错。
 # 加了 out_fp16 那次就是这么被绊了一下：这边加了、那边没加，表现是「golden 输出
 # 1548288 字节，按 774144 个 fp16 元素应为 774144」，跟字段清单看不出关系。
@@ -109,8 +109,8 @@ DEFAULTS = {
     "n": 1, "ci": 32, "hi": 288, "wi": 112,
     "cout1": 64, "cout2": 96,
     "kernel": [3, 3],
-    "strides": [1, 2],
-    "pads": [1, 1, 1, 1],
+    "strides": [1, 1],
+    "pads": [0, 0, 0, 0],
     "bias": False,
     "relu": [True, True],
     "fixed_shift": [42, 42],

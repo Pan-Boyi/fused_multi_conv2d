@@ -123,11 +123,11 @@ class ModelBinding(unittest.TestCase):
         conf = stub / 'stub.conf'
         with conf.open('a') as stream:
             stream.write('filter1 6144\nfilter2 384\n')
-        env = dict(os.environ, LD_LIBRARY_PATH=str(stub), FC2D_STUB_CONF=str(conf),
+        env = dict(os.environ, LD_LIBRARY_PATH=str(stub), DYLD_LIBRARY_PATH=str(stub), FC2D_STUB_CONF=str(conf),
                    FC2D_STUB_GOLDEN=str(stub / 'golden.bin'), REPEAT='1', WARMUP='0')
         result = subprocess.run([sys.executable, str(ROOT / 'run_fused_conv2d.py'),
                                  str(self.case), 'FusedConv2d', '0', str(model)],
-                                env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                                env=env, cwd=str(stub), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('model has 9 inputs', result.stdout)
 
@@ -146,9 +146,12 @@ class ModelBinding(unittest.TestCase):
             return 0
 
         with mock.patch.object(fc2d_onnx, "write_onnx", return_value=(plan, "mock")), \
-                mock.patch.object(fc2d, "run", side_effect=mutate_during_atc), \
-                contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+                mock.patch.object(fc2d, "run", side_effect=mutate_during_atc) as atc_run, \
+                mock.patch.object(fc2d.shutil, "which", return_value="/mock/atc"), \
+                contextlib.redirect_stdout(io.StringIO()) as output, self.assertRaises(SystemExit):
             fc2d.do_om({"name": "compile_race"}, paths, "MC62CM12AA")
+        atc_run.assert_called_once()
+        self.assertIn("case SHA256 changed during compilation", output.getvalue())
         self.assertFalse((Path(paths["omdir"]) / "compile_race.om.fc2d.json").exists())
 
 

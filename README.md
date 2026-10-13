@@ -30,7 +30,7 @@ python3 fc2d.py cases.json --steps check,case,om --soc <soc_version>
 python3 fc2d.py cases.json --steps run
 ```
 
-产物都在 `out/<name>/`：`case.bin`（输入 + golden）、`.onnx`、`om/*.om`、`om/*.om.fc2d.json`。
+产物默认在 `out/<json 名>/<case 名>/`：`case.bin`（输入 + golden）、`.onnx`、`om/*.om`、`om/*.om.fc2d.json`。
 
 ## 上板 + profiling：run_profile.py
 
@@ -50,9 +50,9 @@ python3 run_profile.py profile.json
 | :-- | :-- | :-- |
 | `check` | 本地 | 形状预检 |
 | `case` | 本地 | 生成 `case.bin` |
-| `om` | 本地 | 写 `singleop.json`,跑 `atc --singleop` |
+| `om` | 本地 | 从 ABI 7 case 生成含常量 filters 的 ONNX，跑 `atc --framework=5`，写 OM/case SHA256 binding |
 | `push` | 本地 -> 远端 | 每条 case 一个干净目录,拷 `case.bin`、`.om`、`.om.fc2d.json`、`run_fused_conv2d.py` |
-| `prof` | 远端 | `$MSPROF python3 run_fused_conv2d.py ...`,并找出**本次**新生成的 `PROF_*`。`$MSPROF` 是 `profile.msprof` 给死的绝对路径(缺省 `/var/msprof`),**不搜 PATH** —— 远端那个 ssh 是非交互 shell,读不到 `~/.bashrc` 里 source 的 `set_env.sh`,搜 PATH 会说「没有 msprof」而其实装着。指向 msprof 那个可执行文件本身。 |
+| `prof` | 远端 | `$MSPROF bash <runner wrapper>`，分别记录 runner 与 profiler 返回码，并找出**本次**新生成的 `PROF_*`。`$MSPROF` 是 `profile.msprof` 给死的绝对路径(缺省 `/var/msprof`),**不搜 PATH** —— 远端那个 ssh 是非交互 shell,读不到 `~/.bashrc` 里 source 的 `set_env.sh`,搜 PATH 会说「没有 msprof」而其实装着。指向 msprof 那个可执行文件本身。 |
 | `pull` | 远端 -> 本地 | 把那个 `PROF_*` 拉回 `prof_out/<json 名>/<case 名>/` |
 | `export` | 本地 | `TbeWorkTestSuit` 的 `msprof.py export summary` |
 | `parse` | 本地 | 解析 `op_summary_*.csv`,每条打明细,最后打一张横向对比表 |
@@ -61,15 +61,16 @@ python3 run_profile.py profile.json
 
 - **`run_fused_conv2d.py` 每次都重新拷过去。** 它和 `case.bin` 的格式是配套的,
   远端留着一份旧的会报「case 文件版本 N,本脚本认 M」,而那时人往往已经在查算子了。
-- **运行时始终传完整的 8 个 IR 输入槽。** 没有使用的 optional input 用
-  `ACL_DT_UNDEFINED / ACL_FORMAT_UNDEFINED` 描述符和空 DataBuffer 占位；不能直接
-  从数组中删除，否则 `aclopExecuteV2` 会因为输入数量/位置不同而报 100024。
-- **每条 case 在远端有自己的干净目录,不复用。** `aclopSetModelDir` 会把目录下所有
-  `.om` 都装进去,留着上一个形状的那个,它可能反而先匹配上,跑出来的是上个形状的
-  结果,而且不报错。
+- **图模型有 7 个运行输入。** 顺序为 x、bias1、bias2、scale1、scale2、
+  relu_weight1、relu_weight2。scale2 按 dtype 使用 quant_scale2 或 dequant_scale2；
+  未使用的辅助值补零。两个 filters 固定在 OM 内，算子节点仍有 9 个输入实例。
+- **上传和执行前都校验完整 case/OM SHA256。** prof-only 也会核对远端产物是否
+  等于本地选中的 binding；旧模型或修改过的 case 必须重新编译 OM。
+- **每条 case 在远端使用独立目录。** 上传 case、唯一 OM、sidecar 和配套 runner。
 - **新 `PROF_*` 靠执行前后的差集找,不靠"取最新"。** 目录名里带时间戳,并发或重跑
   时"最新"会拿错。一次冒出多个也会直接报错而不是随便挑一个。
-- **kernel 跑挂了照样导 PROF。** 挂掉时的流水图往往正是要看的东西。
+- **执行失败仍可拉回、导出和解析 PROF，但命令返回失败。** runner RC 与 msprof RC
+  独立保存；失败数据不进入性能对比。没有新的 PROF 或一次生成多个 PROF 也算失败。
 - **`REPEAT` 次会得到多行,汇总表取最小值。** host 侧抖动和别的进程抢核只会让某几次
   变慢,不会让它变快,所以最小值是对"这个 kernel 本身有多快"掺杂噪声最少的估计。
   行数和均值也一并给出,好判断抖动有多大。
@@ -101,31 +102,36 @@ python3 run_profile.py profile.json
 
 ## 为什么是一个 json 而不是三处
 
-一个形状要三样东西严丝合缝：
+case.bin 保存逻辑输入、golden 和属性 spec。ONNX 从这份 spec 读取公开属性与
+私有定标值，两张逻辑 NCHW filter 作为常量进入编译，GE 在编译期转成 FRACTAL_Z。
+模型只接收 7 个运行输入，属性已经写入 OM。运行器在加载 ACL 前校验
+`<model.om>.fc2d.json`，以完整 case 与 OM 的 SHA256 防止错配。
 
-| | 谁产生 |
-| :-- | :-- |
-| `case.bin` 里的输入和 golden | `gen_case` |
-| `.om`（ACL 按 **op 类型 + 每个张量的 shape/dtype/format + 全部属性的值** 匹配） | `atc --singleop` |
-| 执行时下发的输入和属性 | `run_fused_conv2d.py` |
-
-三者只要有一处不一致，板上报的是 `100024` / `MatchOpModel fail`，翻译过来是
-**「算子没找到」** —— 那条信息完全不指向真正的原因。这条链上折过好几次：
-改了 golden 忘了改 json、int8 分支之后又多设了一个属性、om 目录里留着上一个形状的
-`.om`……
-
-所以现在三者**都从同一处派生**：
-
-```
-cases.json 里的一条
-   -> gen_case 的命令行
-   -> case.bin 头部的 spec（32 个 int，形状 + 属性的唯一真相）
-   -> singleop.json（fc2d.py 从 spec 读，不从 json 读）
-   -> 执行时下发的输入和属性（run_fused_conv2d.py 从 case.bin 读）
+```text
+case 配置 -> gen_case -> ABI 7 case.bin -> ONNX -> ATC -> OM + binding
+                                                        -> 上传 -> runner
 ```
 
-中间没有第二份形状。另外属性是**八个一个不少地全设**，两边都一样 —— 不再有
-「这条通路设这几个、那条通路设那几个」的子集，那正是最容易出错的地方。
+修改 case 的形状、dtype、weights、golden 或属性后都要重新生成 ONNX/OM/binding。
+历史 cases.json 与 profile.json 的旧 stride/pad 已显式填写，保持原有板测几何；
+新增 case 省略时使用 strides=[1,1]、pads=[0,0,0,0]。
+
+## 恢复 profiling 阶段
+
+每次 `prof` 在本地 case 目录保存 `execution_<uuid>.log` 和 `profile_state.json`，
+包含合并的 stdout/stderr、runner RC、profiler RC、SSH RC、PROF 名和 case/OM binding。
+`pull/export/parse` 可分别执行，会读取该状态并重新核对当前 case/OM：
+
+```bash
+python3 run_profile.py profile.json --only base_int8 --steps push,prof
+python3 run_profile.py profile.json --only base_int8 --steps pull
+python3 run_profile.py profile.json --only base_int8 --steps export
+python3 run_profile.py profile.json --only base_int8 --steps parse
+```
+
+`pull` 使用已记录的远端目录，`export/parse` 使用已下载的本地 PROF；缺少前置状态、
+PROF 或 binding 不匹配时明确失败。`export/parse` 不连接远端。重新执行 `prof` 会
+创建新日志并替换状态，之前的日志仍保留。失败运行的分析也保持非零返回码。
 
 ## cases.json 怎么写
 
@@ -142,13 +148,13 @@ cases.json 里的一条
 
 | 字段 | 缺省 | 说明 |
 | :-- | :-- | :-- |
-| `name` | `caseNN` | 产物落在 `out/<name>/` |
+| `name` | `caseNN` | 产物落在 `out/<json 名>/<name>/` |
 | `dtype` | `fp16` | `fp16` / `int8` / `s8f16` / `a16w8` / `both`（`both` 展开成 `<name>_fp16` 和 `<name>_int8`）|
 | `n` `ci` `hi` `wi` | 1 / 32 / 288 / 112 | 输入形状 NCHW |
 | `cout1` `cout2` | 64 / 96 | 两层的输出通道 |
 | `kernel` | `[3, 3]` | `[kh, kw]`（两层同核）或 `[kh1, kw1, kh2, kw2]`（两层各一个核，比如 `[1,1,3,3]` 是 1x1 接 3x3） |
-| `strides` | `[1, 2]` | `[stride1, stride2]`，两层各一个 |
-| `pads` | `[1, 1]` | `[p1, p2]`（H/W 同值）或 `[padH1, padW1, padH2, padW2]`。非方核必须用长度 4 的那种 |
+| `strides` | `[1, 1]` | `[stride1, stride2]`，两层各一个 |
+| `pads` | `[0, 0, 0, 0]` | `[p1, p2]`（H/W 同值）或 `[padH1, padW1, padH2, padW2]`。非方核必须用长度 4 的那种 |
 | `bias` | `false` | 带不带 bias（两层一起）|
 | `relu` | `[true, true]` | `[relu1, relu2]` |
 | `fixed_shift` | `[42, 42]` | 私有定标配置，只有 fp16 通路用，见下 |
@@ -213,7 +219,7 @@ python3 run_fused_conv2d.py out/base_fp16/case.bin FusedConv2d 0 out/base_fp16/o
 | `fc2d_geom.cpp` | 编成 `fc2d_geom`，形状预检 |
 | `fused_conv2d_shape.h` | 算子共用几何头的**副本**，被 `fc2d_geom.cpp` include |
 | `run_fused_conv2d.py` | 在板子上执行的那一端，由 `run_profile.py` 自动拷过去 |
-| `cases.json` | 可选。28 个形状 x 两条通路的功能清单。它只有形状、没有 remote 段，所以要这样接进来：<br>`python3 run_profile.py profile.json --cases cases.json --no-msprof` |
+| `cases.json` | 可选。历史功能算例清单，使用显式 stride/pad。它只有形状、没有 remote 段，所以要这样接进来：<br>`python3 run_profile.py profile.json --cases cases.json --no-msprof` |
 
 两个 C++ 工具是**编出来的，不进仓**（`.gitignore` 里就是 `gen_case` / `fc2d_geom`）。
 不用手动编：`fc2d.py` 在用到它们之前会检查 —— 缺了就编，源码或同目录任何一个 `.h`
@@ -250,7 +256,9 @@ python3 fc2d.py --sync-shape-header <ops-nn>/conv/fused_conv2d/op_kernel/fused_c
 
 ```bash
 bash tests/stub_ascendcl/run_stub_test.sh            # out/ 下所有有 om 的 case
-bash tests/stub_ascendcl/run_stub_test.sh base_int8  # 只跑指定的
+bash tests/stub_ascendcl/run_stub_test.sh --out-root out/profile base_int8
+# 同名 case 出现在多份配置时，用完整目录消除歧义
+bash tests/stub_ascendcl/run_stub_test.sh --case-dir out/profile/base_int8
 ```
 
 每条 case 跑**两种定位方式**：
@@ -267,6 +275,25 @@ bash tests/stub_ascendcl/run_stub_test.sh base_int8  # 只跑指定的
 桩的 `aclmdlExecute` 把 `case.bin` 里的 `y_expect` 拷进输出缓冲，所以比对、诊断、
 抽样那几段也会真的跑一遍。**它不验数值正确性** —— 那只能靠板子；它验的是
 「这段代码会不会崩、分支走得对不对、字节数核对管不管用」。
+
+`--out-root` 支持 `out/<case>/` 和 `out/<config>/<case>/`。每个完整 case 目录
+必须有 case.bin、唯一 om/*.om 和有效 sidecar；缺失、同名歧义或 runner 非零退出都
+算失败，PASS 文本不能覆盖失败返回码。测试子进程单独设置桩库路径，产品加载逻辑不变。
+
+本地回归入口：
+
+```bash
+python3 -m unittest discover -s tests -v
+python3 fc2d.py contract_cases.json --steps check,case
+# A 上使用当前 OPP 和真实 ATC 编译后再验下发链
+python3 fc2d.py contract_cases.json --steps om --soc <soc_version>
+bash tests/stub_ascendcl/run_stub_test.sh --out-root out/contract_cases
+```
+
+`contract_cases.json` 覆盖四 dtype、缺省几何、短 pads、两层不同非方核、真实 Cout2=2、
+私有 shift 与独立 bias/relu。测试中的 synthetic ATC/OM 只验证框架控制流；ACL 桩复制
+golden 到输出，不代表设备计算正确或性能结果。真实精度和 profiling 按
+HARDWARE_VALIDATION_WORKFLOW.md 在服务器 A/B 执行。
 
 ## Filter contract and case ABI 7
 

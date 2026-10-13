@@ -84,7 +84,7 @@ RELU_NO, RELU_NORMAL, RELU_SCALAR, RELU_VECTOR = 0, 1, 2, 3
 
 
 def tensor_plan(spec):
-    """派生每个输入槽的 dtype/形状/有没有，外加八个属性和输出。
+    """派生算子输入实例、输出、十二个公开属性和两个私有定标值。
 
     四条 dtype 通路、权重的逻辑 NCHW 四元组、真实 Cout、两层各按
     自己的核 —— 这些规则**只在这里**。上面那条废掉的 singleop 路曾经另有一份

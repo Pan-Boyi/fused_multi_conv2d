@@ -1,7 +1,7 @@
 {
   "_说明": [
     "这是上板验证的唯一形状清单。改这个文件就能换形状，别的地方不用动 ——",
-    "gen_case 的命令行、singleop.json、执行时下发的属性全部从这里派生。",
+    "gen_case 的命令行、ONNX、OM 和 SHA256 binding 全部从同一份 case spec 派生。",
     "",
     "  python3 fc2d.py cases.json --steps case,om --soc <soc_version>   # 有 CANN 的机器",
     "  python3 fc2d.py cases.json --steps run                           # 有 5102 的机器",
@@ -14,8 +14,8 @@
     "  cout1 cout2   两层的输出通道",
     "  kernel        [kh, kw]（两层同核）或 [kh1, kw1, kh2, kw2]（两层分开给，",
     "                比如 1x1 接 3x3）",
-    "  strides       [stride1, stride2]，两层各一个",
-    "  pads          [p1, p2]（H/W 同值）或 [padH1, padW1, padH2, padW2]",
+    "  strides       [stride1, stride2]，两层各一个；缺省 [1,1]",
+    "  pads          [p1, p2]（H/W 同值）或 [padH1, padW1, padH2, padW2]；缺省全零",
     "  bias          带不带 bias（两层一起）",
     "  relu          [relu1, relu2]",
     "  fixed_shift   [S1, S2]，只有 fp16 通路用。累加器 = 真值 * 2^(58-S)，",
@@ -36,7 +36,9 @@
       "hi": 288,
       "wi": 112,
       "cout1": 64,
-      "cout2": 96
+      "cout2": 96,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "base_bias",
@@ -46,7 +48,9 @@
       "wi": 112,
       "cout1": 64,
       "cout2": 96,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "k1x1",
@@ -102,7 +106,8 @@
       "strides": [
         1,
         1
-      ]
+      ],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "s2_2",
@@ -116,7 +121,8 @@
         2,
         2
       ],
-      "bias": true
+      "bias": true,
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "s2_1",
@@ -130,7 +136,8 @@
         2,
         1
       ],
-      "bias": true
+      "bias": true,
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "k2x2_nopad",
@@ -169,7 +176,8 @@
         2,
         2
       ],
-      "bias": true
+      "bias": true,
+      "strides": [1, 2]
     },
     {
       "name": "k7x7",
@@ -186,7 +194,8 @@
       "pads": [
         3,
         3
-      ]
+      ],
+      "strides": [1, 2]
     },
     {
       "name": "k1x3",
@@ -254,7 +263,8 @@
         1,
         2
       ],
-      "bias": true
+      "bias": true,
+      "strides": [1, 2]
     },
     {
       "name": "pad_asym",
@@ -270,7 +280,8 @@
         0,
         1
       ],
-      "bias": true
+      "bias": true,
+      "strides": [1, 2]
     },
     {
       "name": "wide_cin",
@@ -280,7 +291,9 @@
       "wi": 32,
       "cout1": 32,
       "cout2": 16,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "wide_cmid",
@@ -290,7 +303,9 @@
       "wi": 32,
       "cout1": 128,
       "cout2": 32,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "wide_cout",
@@ -299,7 +314,9 @@
       "hi": 32,
       "wi": 32,
       "cout1": 32,
-      "cout2": 128
+      "cout2": 128,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "cin96",
@@ -309,7 +326,9 @@
       "wi": 32,
       "cout1": 32,
       "cout2": 32,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "cmid96",
@@ -319,7 +338,9 @@
       "wi": 32,
       "cout1": 96,
       "cout2": 32,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "cout48",
@@ -329,7 +350,9 @@
       "wi": 32,
       "cout1": 64,
       "cout2": 48,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "hw_48x16",
@@ -339,7 +362,9 @@
       "wi": 16,
       "cout1": 32,
       "cout2": 32,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "hw_16x48",
@@ -352,7 +377,9 @@
       "relu": [
         true,
         false
-      ]
+      ],
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "hw_64x16",
@@ -362,7 +389,9 @@
       "wi": 16,
       "cout1": 32,
       "cout2": 16,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "hw_40x24",
@@ -371,7 +400,9 @@
       "hi": 40,
       "wi": 24,
       "cout1": 32,
-      "cout2": 16
+      "cout2": 16,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "hw_112x112",
@@ -380,7 +411,9 @@
       "hi": 112,
       "wi": 112,
       "cout1": 32,
-      "cout2": 32
+      "cout2": 32,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "batch2",
@@ -391,7 +424,9 @@
       "wi": 32,
       "cout1": 32,
       "cout2": 32,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "batch2_s11",
@@ -405,7 +440,8 @@
       "strides": [
         1,
         1
-      ]
+      ],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "norelu",
@@ -419,7 +455,9 @@
         false,
         false
       ],
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "base_s8f16",
@@ -428,7 +466,9 @@
       "hi": 288,
       "wi": 112,
       "cout1": 64,
-      "cout2": 96
+      "cout2": 96,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "base_bias_s8f16",
@@ -438,7 +478,9 @@
       "wi": 112,
       "cout1": 64,
       "cout2": 96,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "k1x1_s8f16",
@@ -494,7 +536,8 @@
       "strides": [
         1,
         1
-      ]
+      ],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "s2_2_s8f16",
@@ -508,7 +551,8 @@
         2,
         2
       ],
-      "bias": true
+      "bias": true,
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "s2_1_s8f16",
@@ -522,7 +566,8 @@
         2,
         1
       ],
-      "bias": true
+      "bias": true,
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "k2x2_nopad_s8f16",
@@ -561,7 +606,8 @@
         2,
         2
       ],
-      "bias": true
+      "bias": true,
+      "strides": [1, 2]
     },
     {
       "name": "k7x7_s8f16",
@@ -578,7 +624,8 @@
       "pads": [
         3,
         3
-      ]
+      ],
+      "strides": [1, 2]
     },
     {
       "name": "k1x3_s8f16",
@@ -646,7 +693,8 @@
         1,
         2
       ],
-      "bias": true
+      "bias": true,
+      "strides": [1, 2]
     },
     {
       "name": "pad_asym_s8f16",
@@ -662,7 +710,8 @@
         0,
         1
       ],
-      "bias": true
+      "bias": true,
+      "strides": [1, 2]
     },
     {
       "name": "wide_cin_s8f16",
@@ -672,7 +721,9 @@
       "wi": 32,
       "cout1": 32,
       "cout2": 16,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "wide_cmid_s8f16",
@@ -682,7 +733,9 @@
       "wi": 32,
       "cout1": 128,
       "cout2": 32,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "wide_cout_s8f16",
@@ -691,7 +744,9 @@
       "hi": 32,
       "wi": 32,
       "cout1": 32,
-      "cout2": 128
+      "cout2": 128,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "cin96_s8f16",
@@ -701,7 +756,9 @@
       "wi": 32,
       "cout1": 32,
       "cout2": 32,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "cmid96_s8f16",
@@ -711,7 +768,9 @@
       "wi": 32,
       "cout1": 96,
       "cout2": 32,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "cout48_s8f16",
@@ -721,7 +780,9 @@
       "wi": 32,
       "cout1": 64,
       "cout2": 48,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "hw_48x16_s8f16",
@@ -731,7 +792,9 @@
       "wi": 16,
       "cout1": 32,
       "cout2": 32,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "hw_16x48_s8f16",
@@ -744,7 +807,9 @@
       "relu": [
         true,
         false
-      ]
+      ],
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "hw_64x16_s8f16",
@@ -754,7 +819,9 @@
       "wi": 16,
       "cout1": 32,
       "cout2": 16,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "hw_40x24_s8f16",
@@ -763,7 +830,9 @@
       "hi": 40,
       "wi": 24,
       "cout1": 32,
-      "cout2": 16
+      "cout2": 16,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "hw_112x112_s8f16",
@@ -772,7 +841,9 @@
       "hi": 112,
       "wi": 112,
       "cout1": 32,
-      "cout2": 32
+      "cout2": 32,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "batch2_s8f16",
@@ -783,7 +854,9 @@
       "wi": 32,
       "cout1": 32,
       "cout2": 32,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "batch2_s11_s8f16",
@@ -797,7 +870,8 @@
       "strides": [
         1,
         1
-      ]
+      ],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "norelu_s8f16",
@@ -811,7 +885,9 @@
         false,
         false
       ],
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "base_a16w8",
@@ -820,7 +896,9 @@
       "hi": 288,
       "wi": 112,
       "cout1": 64,
-      "cout2": 96
+      "cout2": 96,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "base_bias_a16w8",
@@ -830,7 +908,9 @@
       "wi": 112,
       "cout1": 64,
       "cout2": 96,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "k1x1_a16w8",
@@ -886,7 +966,8 @@
       "strides": [
         1,
         1
-      ]
+      ],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "s2_2_a16w8",
@@ -900,7 +981,8 @@
         2,
         2
       ],
-      "bias": true
+      "bias": true,
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "s2_1_a16w8",
@@ -914,7 +996,8 @@
         2,
         1
       ],
-      "bias": true
+      "bias": true,
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "k2x2_nopad_a16w8",
@@ -953,7 +1036,8 @@
         2,
         2
       ],
-      "bias": true
+      "bias": true,
+      "strides": [1, 2]
     },
     {
       "name": "k7x7_a16w8",
@@ -970,7 +1054,8 @@
       "pads": [
         3,
         3
-      ]
+      ],
+      "strides": [1, 2]
     },
     {
       "name": "k1x3_a16w8",
@@ -1038,7 +1123,8 @@
         1,
         2
       ],
-      "bias": true
+      "bias": true,
+      "strides": [1, 2]
     },
     {
       "name": "pad_asym_a16w8",
@@ -1054,7 +1140,8 @@
         0,
         1
       ],
-      "bias": true
+      "bias": true,
+      "strides": [1, 2]
     },
     {
       "name": "wide_cin_a16w8",
@@ -1064,7 +1151,9 @@
       "wi": 32,
       "cout1": 32,
       "cout2": 16,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "wide_cmid_a16w8",
@@ -1074,7 +1163,9 @@
       "wi": 32,
       "cout1": 128,
       "cout2": 32,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "wide_cout_a16w8",
@@ -1083,7 +1174,9 @@
       "hi": 32,
       "wi": 32,
       "cout1": 32,
-      "cout2": 128
+      "cout2": 128,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "cin96_a16w8",
@@ -1093,7 +1186,9 @@
       "wi": 32,
       "cout1": 32,
       "cout2": 32,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "cmid96_a16w8",
@@ -1103,7 +1198,9 @@
       "wi": 32,
       "cout1": 96,
       "cout2": 32,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "cout48_a16w8",
@@ -1113,7 +1210,9 @@
       "wi": 32,
       "cout1": 64,
       "cout2": 48,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "hw_48x16_a16w8",
@@ -1123,7 +1222,9 @@
       "wi": 16,
       "cout1": 32,
       "cout2": 32,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "hw_16x48_a16w8",
@@ -1136,7 +1237,9 @@
       "relu": [
         true,
         false
-      ]
+      ],
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "hw_64x16_a16w8",
@@ -1146,7 +1249,9 @@
       "wi": 16,
       "cout1": 32,
       "cout2": 16,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "hw_40x24_a16w8",
@@ -1155,7 +1260,9 @@
       "hi": 40,
       "wi": 24,
       "cout1": 32,
-      "cout2": 16
+      "cout2": 16,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "hw_112x112_a16w8",
@@ -1164,7 +1271,9 @@
       "hi": 112,
       "wi": 112,
       "cout1": 32,
-      "cout2": 32
+      "cout2": 32,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "batch2_a16w8",
@@ -1175,7 +1284,9 @@
       "wi": 32,
       "cout1": 32,
       "cout2": 32,
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "batch2_s11_a16w8",
@@ -1189,7 +1300,8 @@
       "strides": [
         1,
         1
-      ]
+      ],
+      "pads": [1, 1, 1, 1]
     },
     {
       "name": "norelu_a16w8",
@@ -1203,7 +1315,9 @@
         false,
         false
       ],
-      "bias": true
+      "bias": true,
+      "strides": [1, 2],
+      "pads": [1, 1, 1, 1]
     }
   ]
 }

@@ -90,30 +90,9 @@ HDR_LEN = struct.calcsize(HDR_FMT)
 REC_FMT = "<16sII4qQ"           # name, dtype, ndim, dims[4], nbytes
 REC_LEN = struct.calcsize(REC_FMT)
 
-# 算子的完整 IR ABI 顺序。q1/q2/dq2 在 OpDef 中是 optional；单算子 API（aclopExecuteV2）
-# **不允许把未使用的槽位从数组中删掉**：必须在原位置传
-#   ACL_DT_UNDEFINED / ACL_FORMAT_UNDEFINED 的 desc + nullptr/0 的 DataBuffer。
-# info["order"] 仍只列当前 dtype 真正有数据的输入，用于 case 完整性检查；执行时
-# 始终遍历 INPUT_SLOTS，缺的槽由 optional placeholder 补齐。
-# ORDER / ORDER_* 是**存在性清单**：这条 dtype 通路下 case.bin 里必须有哪些 blob。
-# 它们的内部顺序不参与下发，所以保持原样。
+# Case existence lists include constant filters for reference generation. They do
+# not define graph runtime order; model_input_slots supplies that seven-input order.
 ORDER = ["x", "filter1", "bias1", "filter2", "bias2"]
-# INPUT_SLOTS 是**IR 顺序**，和上面那个是两件事，所以显式写出、不再从 ORDER 派生。
-#
-# **这个顺序变过。** 老的单算子 ABI 是 x, filter1, bias1, filter2, bias2, ...；
-# filters 改成 DYNAMIC list 之后，它的两个实例必须相邻，于是 filter2 从 3 号位
-# 挪到了 2 号位，bias1/bias2 各往后一格。IR 顺序现在是
-#     x=0, filters[0]=1, filters[1]=2, bias1=3, bias2=4,
-#     dequant_scale2=5, quant_scale1=6, quant_scale2=7
-# （fused_conv2d_def.cpp 的 Input() 调用顺序）。槽位名沿用 case.bin 里的张量名，
-# 这样和 onnx 图的输入名、om 的模型输入名是同一个名字，按名字取下标不需要映射表。
-# 和更早那版的差别只有一处：dequant_scale2 从 quant_scale1 **前面**挪到了后面。
-# scale list 里 instance 0 恒是 conv1 的表、instance 1 恒是 conv2 的表，
-# 而 dq2 是 conv2 的那张。
-#
-# **这一版多了第四个 list：relu_weight**（照 ExtendConv2d 的 relu_weight0/1
-# 声明的 ReLU 斜率表）。算子侧目前把用到斜率的 relu 模式一律拒了，所以这两个槽
-# 恒是占位；但 list 恒长的要求照样成立，所以 om 上它们是真的模型输入。
 INPUT_SLOTS = ["x", "filter1", "filter2", "bias1", "bias2",
                "quant_scale1", "quant_scale2", "dequant_scale2",
                "relu_weight1", "relu_weight2"]
@@ -143,7 +122,7 @@ def model_input_slots(info):
     .om / .fc2d.json / 这个文件过去，import 不到 fc2d_onnx。
     （同样的理由让 SPEC_KEYS 也有两份抄本，见 _check_spec_keys_in_sync。）
     """
-    # 四个 list 都恒长：bias 恒两个（bias_mask 说哪些是真的）、scale 恒两个
+    # 三个运行时 list 都恒长：bias 恒两个（bias_mask 说哪些是真的）、scale 恒两个
     # （dtype 组合说哪张会被读）、relu_weight 恒两个（算子目前一张都不读）。
     # **DYNAMIC 输入的实例数不能是 0**，所以「没有」不能用「少给张量」表达 ——
     # 详见 fc2d_onnx.tensor_plan 里那段。
@@ -219,16 +198,11 @@ PLACEHOLDER_ELEM = {10: 8, 0: 4}
 
 
 def runtime_input_slots(info):
-    """返回全部 IR 槽（现在是 10 个）；None 表示 case.bin 里没有这个张量。
-
-    现在只用于**打印和完整性检查**。图 om 的下发不看它：缺席的 optional 在图里
-    根本不是模型输入，实际喂数据按模型自己报的输入表来（见 main 里那段）。
-    """
-    actual = set(info["order"])
-    unknown = actual - set(INPUT_SLOTS)
+    """Validate case tensor names and return the seven graph runtime inputs."""
+    unknown = set(info["order"]) - set(INPUT_SLOTS)
     if unknown:
-        die("case 里有不属于 FusedConv2d IR 的输入: %s" % sorted(unknown))
-    return [name if name in actual else None for name in INPUT_SLOTS]
+        die("case 里有不属于 FusedConv2d 的输入: %s" % sorted(unknown))
+    return model_input_slots(info)
 
 
 # ACL 把失败的细节（AI Core 异常、哪条 task、PC）攒在一个进程级的字符串里，
@@ -1120,11 +1094,9 @@ def main():
         dtype, dims, data = tensors[name]
         print("  %-9s %-6s %-16s %9d 字节" % (name, DTYPE_NAME[dtype], dims, len(data)))
     slots = runtime_input_slots(info)
-    # 这是**IR 的** 8 个槽，不是模型的输入表。图 om 里缺席的 optional 不是模型
-    # 输入，所以模型报的输入个数会少于 8；实际喂数据按模型自己报的那张表走。
-    print("IR 输入槽（8 个；标 optional 的在图 om 里不是模型输入）:")
+    print("模型运行输入（7 个；两张 filter 是 OM 常量，算子有 9 个输入实例）:")
     for i, name in enumerate(slots):
-        print("  %d: %s" % (i, name if name is not None else "<这条通路不传>"))
+        print("  %d: %s%s" % (i, name, "" if name in tensors else " <零占位>"))
     if info["outInt8"]:
         print("量化系数（header 调试元数据；实际以 per-channel uint64 张量下发）: "
               "quant_scale1=%.9g quant_scale2=%.9g  relu=%s  bias=%s"
@@ -1253,10 +1225,8 @@ def main():
         # 在这条路上不适用 —— 那条规则是 aclopExecuteV2 按 numInputs 匹配 .om 带来的。
         # Graph inputs are x and two instances of bias/scale/relu_weight.
         # Both filter instances are constants inside the OM.
-        # **不能写成「case.bin 里有的都喂」。** case.bin 无条件带 bias1/bias2 的
-        # blob（gen_case 一直这么写），而 bias: false 的用例编出来的 om 里没有
-        # bias 输入 —— 按「有 blob 就喂」会比模型多两个，撞到下面那条
-        # 「模型报了 N 个输入」的 die。该喂哪些由**同一条规则**算出来。
+        # The graph always exposes seven inputs. bias_mask disables the unused
+        # bias values, and scale/relu_weight placeholders preserve both list instances.
         present = model_input_slots(info)
         # 有两类**纯占位**输入，恒长要求图里必须有它们，但 gen_case 不产：
         #   * 全 fp16 通路的两个 scale 实例 —— 这条通路不用定标表
