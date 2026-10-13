@@ -292,3 +292,10 @@ case.bin. The runner checks both hashes before loading ACL and rejects old
 nine-input models. Copy case.bin, the OM, binding file and runner together;
 run_profile.py uploads all four. Changing weights, attributes, geometry or any
 case data requires a new case/ONNX/OM/binding.
+
+
+The public attribute order is `dtype, bias_mask, strides, pads, dilations,
+groups, data_format, offset_x, round_mode, pad_mode, enable_hf32, relu`.
+Required attributes come first. Private calibration `fixed_shift` and
+`a16w8_shift` follow the twelve public attributes internally. Rebuild the
+operator package and regenerate case/ONNX/OM/binding after this order change.

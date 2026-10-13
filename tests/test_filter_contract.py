@@ -47,6 +47,7 @@ class FilterContract(unittest.TestCase):
                 tensors, *unused = runner.load_case(str(path))
                 plan = fc2d_onnx.tensor_plan(spec)
                 self.assertNotIn("kernel_size", plan["attrs"])
+                self.assertEqual(list(plan["attrs"]), ['dtype', 'bias_mask', 'strides', 'pads', 'dilations', 'groups', 'data_format', 'offset_x', 'round_mode', 'pad_mode', 'enable_hf32', 'relu', 'fixed_shift', 'a16w8_shift'])
                 slots = {name: (dt, shape) for name, dt, shape in plan["slots"]}
                 width = 2 if mode == "fp16" else 1
                 for name, dims in (("filter1", [64, 32, 1, 3]),
