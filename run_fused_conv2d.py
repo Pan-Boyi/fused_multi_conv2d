@@ -431,13 +431,11 @@ def decode_f16(buf):
 
 
 def report_ratio(got, want, n):
-    """got / want 的比值分布。这是判「定标错了」还是「算错了」的直接证据。
+    """got / want 的比值分布，只提供乘性偏差线索。
 
-    定点链里每一环的误差都是**乘性**的：任何一级的 shift 猜错，输出就整体差一个
-    2 的整数次幂。所以只要两边都非零，看 log2(got/want)：
-      集中在某个整数 k  -> 定标差 2^k，改 shift 就行，卷积本身是对的；
-      散开 / 大量反号   -> 不是定标问题（溢出饱和、或者真算错了）。
-    饱和的点要摘出去单独看 —— 它们的比值只反映饱和值，不反映定标。
+    分布包含已经正确的元素；局部块出错时，正确部分就能制造 2^0 主峰。
+    主峰不能证明卷积正确，也不能单独确定定标改法。int8 的缩放走 per-channel
+    scale 表，不使用 fixed_shift；需结合逐位误差及空间分布判断。
     """
     import math
     hist, sign_flip, sat_like, both_nz = {}, 0, 0, 0
@@ -462,7 +460,10 @@ def report_ratio(got, want, n):
     for k, c in top:
         print("         2^%-4d %9d  (%.4f%%)" % (k, c, c * 100.0 / both_nz))
     if top and top[0][1] > both_nz * 0.5:
-        print("       => 有主峰 2^%d：定标整体差这么多，改 shift 即可，卷积是对的。" % top[0][0])
+        if top[0][0] == 0:
+            print("       => 主峰 2^0 包含已正确元素；不能据此判定卷积正确或建议修改 shift。")
+        else:
+            print("       => 主峰 2^%d 是乘性偏差线索，需结合错误分布验证；int8 检查 scale 表，不改 fixed_shift。" % top[0][0])
     else:
         print("       => 没有主峰：不是单纯的定标问题。")
 
