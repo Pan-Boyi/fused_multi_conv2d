@@ -324,5 +324,29 @@ case data requires a new case/ONNX/OM/binding.
 The public attribute order is `dtype, bias_mask, strides, pads, dilations,
 groups, data_format, offset_x, round_mode, pad_mode, enable_hf32, relu`.
 Required attributes come first. Private calibration `fixed_shift` and
-`a16w8_shift` follow the twelve public attributes internally. Rebuild the
+`a16w8_shift` occupy static tiling slots 13/14, after twelve public attributes
+and the compiler's internal workspace slot. Rebuild the
 operator package and regenerate case/ONNX/OM/binding after this order change.
+
+## 检查真实 ATC tiling 中的定标值
+
+AscendC 的静态编译在 12 个公开属性后插入内部 `ascendc_op_para_size`，
+因此 tiling 的 `fixed_shift` / `a16w8_shift` 索引是 13 / 14。
+旧代码少算这个内部位置，会把 fp16 的 conv1 shift 读成 0、A16W8 读成 2；
+runner 从 case 打印的 42 / 29 并不能证明 kernel 实际收到了这些值。
+
+在 A 加载已修正的算子包环境后，可对现有 case 做独立的真实编译验证：
+
+```bash
+python3 tools/verify_fc2d_atc_tiling.py out/profile/base_fp16/case.bin \
+  --soc <soc_version> --out-dir out/native_tiling/base_fp16_new
+```
+
+输出目录必须是新目录。工具复制 case、生成 fresh ONNX/OM，并在本次 ATC
+进程内记录官方 `do_op_tiling` 的原始返回值，核对 312 字节 tiling 中的实际 shift、
+bias/relu 和 launch blockDim；不修改 SDK 文件。原始捕获与
+`tiling_verification.json` 一起保存。没有捕获、旧属性错位或不同 case 的数据会失败，
+对应 OM 的 binding 会删除，阻止它通过现有上传/运行检查。
+
+该工具验证编译参数，实板精度仍按上板流程执行。单元测试保留了两份真实修复前
+ATC 数据，防止用只包含公开/私有属性的手造 fixture 漏掉 SDK 插入位置。
