@@ -26,7 +26,7 @@ def install():
             def capture(*args, _original=original, _module=name, **kwargs):
                 optype = args[0] if args else kwargs.get('optype')
                 result = _original(*args, **kwargs)
-                if optype == 'FusedConv2d':
+                if optype == 'FusedMultiConv2d':
                     write({'event': 'tiling', 'module': _module, 'optype': optype,
                            'attrs': kwargs.get('attrs', args[6] if len(args) > 6 else None),
                            'result': result})

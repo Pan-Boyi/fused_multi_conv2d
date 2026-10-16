@@ -14,7 +14,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-import run_fused_conv2d as R   # noqa: E402
+import run_fused_multi_conv2d as R   # noqa: E402
 
 if len(sys.argv) < 3:
     raise SystemExit("用法: make_conf.py <case.bin> <输出目录>")

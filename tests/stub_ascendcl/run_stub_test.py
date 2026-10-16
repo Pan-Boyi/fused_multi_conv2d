@@ -11,7 +11,7 @@ import sys
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path.insert(0, str(ROOT))
-import run_fused_conv2d as runner
+import run_fused_multi_conv2d as runner
 
 
 def select_cases(out_root, names, explicit_dirs):
@@ -87,8 +87,8 @@ def main(argv=None):
                 if mode == 'fallback':
                     env['FC2D_STUB_NONAME'] = '1'
                 log = case_work / ('run_' + mode + '.log')
-                ok = run_mode([sys.executable, str(ROOT / 'run_fused_conv2d.py'), str(case),
-                               'FusedConv2d', '0', str(model)], env, work, log)
+                ok = run_mode([sys.executable, str(ROOT / 'run_fused_multi_conv2d.py'), str(case),
+                               'FusedMultiConv2d', '0', str(model)], env, work, log)
                 print('%s %s %s; log: %s' % (directory, mode, 'PASS' if ok else 'FAIL', log))
                 failed |= not ok
         return 1 if failed else 0

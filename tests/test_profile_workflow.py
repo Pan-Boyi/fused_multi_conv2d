@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT))
 import fc2d
 import fc2d_onnx
 import run_profile as profile
-import run_fused_conv2d as runner
+import run_fused_multi_conv2d as runner
 sys.path.insert(0, str(ROOT / 'tests/stub_ascendcl'))
 import run_stub_test as stub_test
 

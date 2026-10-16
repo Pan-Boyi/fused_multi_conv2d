@@ -1,4 +1,4 @@
-# fused_multi_conv2d —— FusedConv2d @ 5102 的上板验证
+# fused_multi_conv2d —— FusedMultiConv2d @ 5102 的上板验证
 
 **改一个 json（`cases.json`）就能换形状**，别的地方不用动。
 
@@ -51,7 +51,7 @@ python3 run_profile.py profile.json
 | `check` | 本地 | 形状预检 |
 | `case` | 本地 | 生成 `case.bin` |
 | `om` | 本地 | 从 ABI 8 case 生成含常量 filters 的 ONNX，跑 `atc --framework=5`，写 OM/case SHA256 binding |
-| `push` | 本地 -> 远端 | 每条 case 一个干净目录,拷 `case.bin`、`.om`、`.om.fc2d.json`、`run_fused_conv2d.py` |
+| `push` | 本地 -> 远端 | 每条 case 一个干净目录,拷 `case.bin`、`.om`、`.om.fc2d.json`、`run_fused_multi_conv2d.py` |
 | `prof` | 远端 | `$MSPROF bash <runner wrapper>`，分别记录 runner 与 profiler 返回码，并找出**本次**新生成的 `PROF_*`。`$MSPROF` 是 `profile.msprof` 给死的绝对路径(缺省 `/var/msprof`),**不搜 PATH** —— 远端那个 ssh 是非交互 shell,读不到 `~/.bashrc` 里 source 的 `set_env.sh`,搜 PATH 会说「没有 msprof」而其实装着。指向 msprof 那个可执行文件本身。 |
 | `pull` | 远端 -> 本地 | 把那个 `PROF_*` 拉回 `prof_out/<json 名>/<case 名>/` |
 | `export` | 本地 | `TbeWorkTestSuit` 的 `msprof.py export summary` |
@@ -59,7 +59,7 @@ python3 run_profile.py profile.json
 
 几个不显眼但要紧的点:
 
-- **`run_fused_conv2d.py` 每次都重新拷过去。** 它和 `case.bin` 的格式是配套的,
+- **`run_fused_multi_conv2d.py` 每次都重新拷过去。** 它和 `case.bin` 的格式是配套的,
   远端留着一份旧的会报「case 文件版本 N,本脚本认 M」,而那时人往往已经在查算子了。
 - **图模型有 7 个运行输入。** 顺序为 x、bias1、bias2、scale1、scale2、
   relu_weight1、relu_weight2。scale2 按 dtype 使用 quant_scale2 或 dequant_scale2；
@@ -197,10 +197,10 @@ S 较小时将整数选在可精确表示的格点上。MMAD 恢复同一整数�
 ```bash
 python3 fc2d.py cases.json --only base_fp16 --steps run
 # 或者直接调 runner（参数顺序随意：.bin 结尾的是 case，目录是 om，数字是 device）
-python3 run_fused_conv2d.py out/base_fp16/case.bin FusedConv2d 0 out/base_fp16/om
+python3 run_fused_multi_conv2d.py out/base_fp16/case.bin FusedMultiConv2d 0 out/base_fp16/om
 ```
 
-`run_fused_conv2d.py` 的环境变量：`REL_TOL`（默认 1e-3）、`RATIO_MIN`（默认 1.0）、
+`run_fused_multi_conv2d.py` 的环境变量：`REL_TOL`（默认 1e-3）、`RATIO_MIN`（默认 1.0）、
 `REPEAT` / `WARMUP`（计时）。加 `--run-arg --dry-run` 可以不碰硬件把主流程走一遍，
 用来在没有设备的机器上验脚本本身。
 
@@ -214,10 +214,10 @@ python3 run_fused_conv2d.py out/base_fp16/case.bin FusedConv2d 0 out/base_fp16/o
 | `run_profile.py` | 总驱动，八步 |
 | `fc2d.py` | 被 `run_profile.py` import；也能单独跑单机流程 |
 | `gen_case.cpp` | 编成 `gen_case`，按形状生成 `case.bin`（输入 + golden）|
-| `fused_conv2d_golden.h` | 两条通路的 CPU golden，被 `gen_case.cpp` include |
+| `fused_multi_conv2d_golden.h` | 两条通路的 CPU golden，被 `gen_case.cpp` include |
 | `fc2d_geom.cpp` | 编成 `fc2d_geom`，形状预检 |
-| `fused_conv2d_shape.h` | 算子共用几何头的**副本**，被 `fc2d_geom.cpp` include |
-| `run_fused_conv2d.py` | 在板子上执行的那一端，由 `run_profile.py` 自动拷过去 |
+| `fused_multi_conv2d_shape.h` | 算子共用几何头的**副本**，被 `fc2d_geom.cpp` include |
+| `run_fused_multi_conv2d.py` | 在板子上执行的那一端，由 `run_profile.py` 自动拷过去 |
 | `cases.json` | 可选。历史功能算例清单，使用显式 stride/pad。它只有形状、没有 remote 段，所以要这样接进来：<br>`python3 run_profile.py profile.json --cases cases.json --no-msprof` |
 
 两个 C++ 工具是**编出来的，不进仓**（`.gitignore` 里就是 `gen_case` / `fc2d_geom`）。
@@ -232,10 +232,10 @@ g++ -std=c++17 -O2                   fc2d_geom.cpp -o fc2d_geom -I.
 `gen_case` 的 `-ffp-contract=off` 不是可选的：它要拿 fp32 参考模型和定点模型对账，
 开着 FMA 合并的话参考值本身会随编译器优化漂，自检的容差就没意义了。
 
-`fused_conv2d_shape.h` 是算子那份的副本。**算子那边改了几何就要重拷**：
+`fused_multi_conv2d_shape.h` 是算子那份的副本。**算子那边改了几何就要重拷**：
 
 ```bash
-python3 fc2d.py --sync-shape-header <ops-nn>/conv/fused_conv2d/op_kernel/fused_conv2d_shape.h
+python3 fc2d.py --sync-shape-header <ops-nn>/conv/fused_multi_conv2d/op_kernel/fused_multi_conv2d_shape.h
 ```
 
 重拷之后不用管重编 —— 头变新了，下次用到 `fc2d_geom` 时会自动重来。它是顾问性质的：
@@ -338,7 +338,9 @@ and lists whose length is not two are rejected. JSON case configuration accepts 
 three keys as [0,0]; the generated ONNX encodes them as INTS.
 
 Case ABI remains 8 because geometry and tensor payloads are unchanged. Model binding
-schema is now 2, so schema-1 bindings and their old String-contract OMs cannot be reused.
+schema is now 3 and records `op_type: FusedMultiConv2d`; older bindings and OMs must be regenerated.
+The operator directory is `conv/fused_multi_conv2d`, the kernel entry is `fused_multi_conv2d`,
+and the generated ACLNN prefix is `aclnnFusedMultiConv2d`.
 Existing ABI-8 cases may be used as compilation input, but regenerate ONNX, OM and binding
 after rebuilding and loading the new operator package.
 

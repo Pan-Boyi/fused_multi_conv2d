@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import fc2d
 import fc2d_onnx
-import run_fused_conv2d as runner
+import run_fused_multi_conv2d as runner
 
 
 class PrototypeContract(unittest.TestCase):
@@ -95,7 +95,7 @@ class PrototypeContract(unittest.TestCase):
             model.write_bytes(b'synthetic model')
             binding_path=runner.write_model_binding(str(path),str(model))
             binding=json.loads(Path(binding_path).read_text())
-            self.assertEqual(binding['schema_version'],2)
+            self.assertEqual(binding['schema_version'],3)
             binding['schema_version']=1
             Path(str(model)+'.fc2d.json').write_text(json.dumps(binding))
             with contextlib.redirect_stdout(io.StringIO()),self.assertRaises(SystemExit):

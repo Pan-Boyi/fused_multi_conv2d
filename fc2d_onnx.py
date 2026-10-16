@@ -209,10 +209,10 @@ def build_model(plan, filter_tensors):
     graph_outputs = [helper.make_tensor_value_info("y", ONNX_DT[yt], yshape)]
 
     # domain 用默认域（空串，解析器归一成 ai.onnx）。插件注册的是
-    # ai.onnx::<9..22>::FusedConv2d，所以 opset 换个数也还对得上。
-    node = helper.make_node("FusedConv2d", node_inputs, ["y"],
-                            name="fused_conv2d", domain="", **plan["attrs"])
-    graph = helper.make_graph([node], "fused_conv2d", graph_inputs, graph_outputs, initializer=initializers)
+    # ai.onnx::<9..22>::FusedMultiConv2d，所以 opset 换个数也还对得上。
+    node = helper.make_node("FusedMultiConv2d", node_inputs, ["y"],
+                            name="fused_multi_conv2d", domain="", **plan["attrs"])
+    graph = helper.make_graph([node], "fused_multi_conv2d", graph_inputs, graph_outputs, initializer=initializers)
     model = helper.make_model(graph, producer_name="fc2d_onnx.py",
                               opset_imports=[helper.make_opsetid("", OPSET)])
     model.ir_version = IR_VERSION
@@ -230,10 +230,10 @@ def write_onnx(case_path, path):
     import fc2d
     spec = fc2d.read_spec(case_path)
     plan = tensor_plan(spec)
-    import run_fused_conv2d as runner
+    import run_fused_multi_conv2d as runner
     tensors, *_ = runner.load_case(case_path)
     model = build_model(plan, tensors)
-    # **onnx.checker 预期不过**：FusedConv2d 不是标准 ONNX 算子，标准类型推导
+    # **onnx.checker 预期不过**：FusedMultiConv2d 不是标准 ONNX 算子，标准类型推导
     # 认不出它。atc 的解析器直接读 protobuf、不跑 ONNX 的类型推导，照样能编 ——
     # 这一条被删掉的 onnx_block/build_block.py 已经实测过（那边是 Conv 吃 int8
     # 出 int32，同样 checker 不过而 atc 能编）。所以只当警告。
@@ -253,7 +253,7 @@ def main(argv):
     if len(argv) < 2:
         print("用法: fc2d_onnx.py <case.bin> [out.onnx]")
         return 2
-    out = argv[1] if len(argv) > 1 else "fused_conv2d.onnx"
+    out = argv[1] if len(argv) > 1 else "fused_multi_conv2d.onnx"
     plan, checker = write_onnx(argv[0], out)
     print("写出 %s" % out)
     print("  onnx.checker: %s" % checker)

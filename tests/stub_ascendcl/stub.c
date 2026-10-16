@@ -1,4 +1,4 @@
-/* libascendcl.so 的桩：让 run_fused_conv2d.py 的整条模型 API 下发路径能在
+/* libascendcl.so 的桩：让 run_fused_multi_conv2d.py 的整条模型 API 下发路径能在
  * 没有 NPU 的机器上跑完。
  *
  * 为什么需要：真机上 aclInit 就会失败（chipType=0），dry-run 又刻意绕开 ACL 分支，

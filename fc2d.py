@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-fused_conv2d 上板验证的总驱动 —— **改一个 json 就能换形状**。
+fused_multi_conv2d 上板验证的总驱动 —— **改一个 json 就能换形状**。
 
     python3 fc2d.py cases.json                  # 全流程：生成 case -> 出 om -> 上板跑
     python3 fc2d.py cases.json --only base_fp16 # 只做某几条（名字，可给多个）
@@ -63,13 +63,13 @@ DTYPE_S8F16 = 2
 DTYPE_A16W8 = 3
 
 
-# run_fused_conv2d.py 里有**同一份** SPEC_KEYS 的抄本。它必须能单独跑在板子机上
-# （do_push 只拷 case.bin / .om / .om.fc2d.json / run_fused_conv2d.py 四个文件过去），所以没法
+# run_fused_multi_conv2d.py 里有**同一份** SPEC_KEYS 的抄本。它必须能单独跑在板子机上
+# （do_push 只拷 case.bin / .om / .om.fc2d.json / run_fused_multi_conv2d.py 四个文件过去），所以没法
 # import 这边的定义。两份一旦长歪，读到的就是相邻字段的值 —— 不报错，只是全错。
 # 加了 out_fp16 那次就是这么被绊了一下：这边加了、那边没加，表现是「golden 输出
 # 1548288 字节，按 774144 个 fp16 元素应为 774144」，跟字段清单看不出关系。
 def _check_spec_keys_in_sync():
-    path = os.path.join(HERE, "run_fused_conv2d.py")
+    path = os.path.join(HERE, "run_fused_multi_conv2d.py")
     if not os.path.isfile(path):
         return
     with open(path) as fh:
@@ -78,7 +78,7 @@ def _check_spec_keys_in_sync():
         return
     other = [x.strip().strip('"') for x in m.group(1).replace("\n", " ").split(",") if x.strip()]
     if other != SPEC_KEYS:
-        die("SPEC_KEYS 和 run_fused_conv2d.py 里那份对不上：\n"
+        die("SPEC_KEYS 和 run_fused_multi_conv2d.py 里那份对不上：\n"
             "    这边 %s\n    那边 %s\n"
             "  两边读的是同一个 .bin，对不上会静默读错字段。" % (SPEC_KEYS, other))
 
@@ -224,7 +224,7 @@ def read_spec(path):
 
 # ---------------------------------------------------------------- 两个 C++ 工具
 # 源码进仓，二进制不进（.gitignore 里就写着 gen_case / fc2d_geom）。所以
-# **每一次新克隆的第一次运行都会缺它们**，而且改过 fused_conv2d_shape.h 之后
+# **每一次新克隆的第一次运行都会缺它们**，而且改过 fused_multi_conv2d_shape.h 之后
 # 旧二进制还在、还能跑，只是按过期的几何算 —— 那种错比编译失败难查得多。
 #
 # 与其在报错里写一行「先编：g++ ...」让人照抄，不如脚本自己编：缺了就编，
@@ -265,7 +265,7 @@ def do_check(c, l1):
 
     **顾问性质**：真正说了算的是算子的 tiling。但 fc2d_geom 用的是算子共用几何头
     的副本、调的是同一个 PickHb，所以只要副本没过期结论就一致；不一致本身就是
-    「该重拷 fused_conv2d_shape.h 了」的信号。
+    「该重拷 fused_multi_conv2d_shape.h 了」的信号。
 
     没有这一步的话，形状不合法要等到 atc 失败才知道，而 atc 的原因只在
     ~/ascend/log/ 里，找起来很费劲。
@@ -304,7 +304,7 @@ def do_om(c, paths, soc):
             "    合法的名字就是 $ASCEND_HOME_PATH/compiler/data/platform_config 下每个 .ini 的文件名")
     if not os.path.isfile(paths["bin"]):
         die("%s 还没生成 —— 先跑 --steps case" % paths["bin"])
-    import run_fused_conv2d as runner
+    import run_fused_multi_conv2d as runner
     frozen_case_sha256 = runner._file_sha256(paths["bin"])
     read_spec(paths["bin"])
     os.makedirs(paths["omdir"], exist_ok=True)
@@ -322,7 +322,7 @@ def do_om(c, paths, soc):
     # 预检：onnx 解析插件在不在。
     #
     # 这是这条路最容易踩、而报错最不指向原因的一步。缺插件时 atc 报的是
-    #     E10501: IR for Op ... with optype FusedConv2d is not registered
+    #     E10501: IR for Op ... with optype FusedMultiConv2d is not registered
     # 或者干脆说不认识这个节点 —— 两种都不会提「你的算子包里没有 framework/onnx」。
     # 插件要进 vendor 包，ops-nn 侧需要 variables.cmake 里有
     # ONNX_PLUGIN_LIB_INSTALL_DIR、且 gen_cust_symbol() 调了 gen_onnx_plugin_symbol()
@@ -330,9 +330,9 @@ def do_om(c, paths, soc):
     # 两种装法都要认：
     #   * 算子**编进 CANN 内置算子库**（线上编包走这条）-> 插件在
     #     $ASCEND_OPP_PATH/built-in/framework/onnx/，不需要 ASCEND_CUSTOM_OPP_PATH。
-    #   * 本机 `build.sh --ops=fused_conv2d` 编的 **vendor 包** -> 插件在
+    #   * 本机 `build.sh --ops=fused_multi_conv2d` 编的 **vendor 包** -> 插件在
     #     $ASCEND_CUSTOM_OPP_PATH/framework/onnx/。
-    # 判据是**有没有插件 .so 并且里面有 FusedConv2d**，不是有没有设某个环境变量 ——
+    # 判据是**有没有插件 .so 并且里面有 FusedMultiConv2d**，不是有没有设某个环境变量 ——
     # 按环境变量判会在内置装法上误报。
     def _find_plugins(root):
         hits = []
@@ -358,7 +358,7 @@ def do_om(c, paths, soc):
         for so in _find_plugins(root):
             try:
                 with open(so, "rb") as f:
-                    if b"FusedConv2d" in f.read():
+                    if b"FusedMultiConv2d" in f.read():
                         carriers.append((var, so))
             except OSError:
                 pass
@@ -369,10 +369,10 @@ def do_om(c, paths, soc):
         print("  [!] ASCEND_CUSTOM_OPP_PATH / ASCEND_OPP_PATH / ASCEND_HOME_PATH 一个都没设，"
               "查不了 onnx 解析插件在不在。先 source <CANN>/set_env.sh。")
     else:
-        print("  [!] 这些路径下找不到带 FusedConv2d 的 framework/onnx/liboponnx_plugin*.so: %s"
+        print("  [!] 这些路径下找不到带 FusedMultiConv2d 的 framework/onnx/liboponnx_plugin*.so: %s"
               % ", ".join("%s=%s" % (v, r) for v, r in roots))
         print("      atc 多半会报 E10501「IR for Op ... is not registered」或者说不认识这个节点。")
-        print("      内置装法要确认编包时带上了 conv/fused_conv2d/framework/；")
+        print("      内置装法要确认编包时带上了 conv/fused_multi_conv2d/framework/；")
         print("      vendor 装法要确认 ASCEND_CUSTOM_OPP_PATH 指到 <装到哪>/vendors/<name>_nn。")
 
     import fc2d_onnx
@@ -412,20 +412,20 @@ def do_om(c, paths, soc):
 
 
 def do_run(c, paths, device, extra):
-    runner = os.path.join(HERE, "run_fused_conv2d.py")
+    runner = os.path.join(HERE, "run_fused_multi_conv2d.py")
     if not os.path.isfile(runner):
-        die("找不到 run_fused_conv2d.py")
+        die("找不到 run_fused_multi_conv2d.py")
     if not os.path.isfile(paths["bin"]):
         die("%s 还没生成" % paths["bin"])
     if not os.path.isdir(paths["omdir"]):
         die("%s 不存在 —— 先跑 --steps om" % paths["omdir"])
-    cmd = [sys.executable, runner, paths["bin"], "FusedConv2d", str(device), paths["omdir"]] + extra
+    cmd = [sys.executable, runner, paths["bin"], "FusedMultiConv2d", str(device), paths["omdir"]] + extra
     print("  " + " ".join(cmd))
     return run(cmd)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="fused_conv2d 上板验证的总驱动")
+    ap = argparse.ArgumentParser(description="fused_multi_conv2d 上板验证的总驱动")
     ap.add_argument("cases", nargs="?", default=os.path.join(HERE, "cases.json"),
                     help="形状清单 json（默认 cases.json）")
     ap.add_argument("--only", action="append", default=[],
@@ -440,21 +440,21 @@ def main():
     ap.add_argument("--outdir", default=None, help="产物目录，默认 <json 所在目录>/out")
     ap.add_argument("--list", action="store_true", help="只列出会做哪些")
     ap.add_argument("--sync-shape-header", metavar="PATH", default=None,
-                    help="从 ops-nn 重拷一份 fused_conv2d_shape.h（形状预检用的副本）。"
+                    help="从 ops-nn 重拷一份 fused_multi_conv2d_shape.h（形状预检用的副本）。"
                          "算子那边改了几何就跑一次，否则预检的结论会和 atc 不一致。")
     ap.add_argument("--keep-going", action="store_true",
                     help="某条失败了继续做下一条（默认第一条失败就停）")
     # 不用 argparse.REMAINDER：位置参数 cases 之后的**所有**东西都会被它吞掉，
     # 连 --steps 都进不了 args.steps —— 踩过，表现是 --steps check 完全不起作用。
     ap.add_argument("--run-arg", action="append", default=[],
-                    help="原样转给 run_fused_conv2d.py 的参数，可给多次（如 --run-arg --dry-run）")
+                    help="原样转给 run_fused_multi_conv2d.py 的参数，可给多次（如 --run-arg --dry-run）")
     args = ap.parse_args()
 
     if args.sync_shape_header:
         src = args.sync_shape_header
         if not os.path.isfile(src):
             die("找不到 %s" % src)
-        dst = os.path.join(HERE, "fused_conv2d_shape.h")
+        dst = os.path.join(HERE, "fused_multi_conv2d_shape.h")
         with open(dst) as f:
             old = f.read()
         # 保留副本顶上那段说明（它讲的是「这是副本、怎么重拷」），只换正文。
@@ -465,7 +465,7 @@ def main():
             body = f.read()
         with open(dst, "w") as f:
             f.write(banner + body)
-        print("已从 %s 重拷 fused_conv2d_shape.h" % src)
+        print("已从 %s 重拷 fused_multi_conv2d_shape.h" % src)
         print("两个 C++ 工具会在下次用到时自动重编（头比二进制新）")
         return 0
 
@@ -551,7 +551,7 @@ def main():
             if "run" in steps:
                 rc = do_run(c, paths, device, extra)
                 if rc != 0:
-                    raise RuntimeError("run_fused_conv2d.py 返回 %d" % rc)
+                    raise RuntimeError("run_fused_multi_conv2d.py 返回 %d" % rc)
         except SystemExit:
             raise
         except Exception as e:  # noqa: BLE001 - 驱动脚本，要把哪条失败了说清楚

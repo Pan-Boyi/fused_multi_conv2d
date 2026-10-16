@@ -1,20 +1,20 @@
 // ===========================================================================
-// 这是 ops-nn 仓里 conv/fused_conv2d/op_kernel/fused_conv2d_shape.h 的**副本**。
+// 这是 ops-nn 仓里 conv/fused_multi_conv2d/op_kernel/fused_multi_conv2d_shape.h 的**副本**。
 //
 // 放一份在 harness 里，只为了 fc2d.py 能在生成 case 之前就回答「这个形状能不能
 // 跑」—— 否则要等到 atc 失败，而那条原因只在 ~/ascend/log/ 里。
 //
 // **算子那边改了就要重拷。** 一条命令：
-//     python3 fc2d.py --sync-shape-header <ops-nn>/conv/fused_conv2d/op_kernel/fused_conv2d_shape.h
+//     python3 fc2d.py --sync-shape-header <ops-nn>/conv/fused_multi_conv2d/op_kernel/fused_multi_conv2d_shape.h
 //
 // 它是顾问性质的：真正说了算的永远是算子的 tiling。两边不一致时 fc2d.py 的预检会
 // 和 atc 的结论不同，那本身就是「该重拷了」的信号。
 // ===========================================================================
 /*
- * fused_conv2d 的**运行期几何** —— host 和 device 共用的唯一出处。
+ * fused_multi_conv2d 的**运行期几何** —— host 和 device 共用的唯一出处。
  *
  * 这个文件存在的理由是一次真实的事故：改 kernel 几何时把 FC2D_HB 从 18 改成 6，
- * 却漏了 op_host/op_tiling/fused_conv2d_tiling.cpp 里那份同名的 HB = 18。
+ * 却漏了 op_host/op_tiling/fused_multi_conv2d_tiling.cpp 里那份同名的 HB = 18。
  * tiling 于是告诉 kernel「一共 8 个 chunk、每核 1 个」，而 kernel 按自己的
  * NCHUNK = 24 分带 —— 每个核只算了 1 个 chunk，输出正好只写了 1/3，上板才发现。
  * 更糟的是 tiling UT 里断言的是 chunkTotal == 8，把错误的期望一起编码进去了。
@@ -43,15 +43,15 @@
  * 先例：conv3d_transpose_v2 的 tiling.cpp 也是这样 include op_kernel 下的头的。
  * 也不能用 <algorithm> / <cmath>：device 侧那边没有。
  */
-#ifndef FUSED_CONV2D_SHAPE_H
-#define FUSED_CONV2D_SHAPE_H
+#ifndef FUSED_MULTI_CONV2D_SHAPE_H
+#define FUSED_MULTI_CONV2D_SHAPE_H
 
 // ---------------------------------------------------------------------------
 // host 和 device 共用一份函数体，但两边对函数的要求不一样。
 //
 // device 侧（ccec）要求被 kernel 调用的函数带 [aicore] 属性 —— 不带属性的函数被
 // 当成 **host 函数**，根本不生成 device 代码，于是链接期报
-//     ld.lld: error: undefined symbol: FusedConv2dShape::DeriveWithHb(...)
+//     ld.lld: error: undefined symbol: FusedMultiConv2dShape::DeriveWithHb(...)
 // 这条错误完全不提「少了个属性」，只说符号不见了。
 //
 // host 侧（普通 g++ 编 op_tiling）当然没有这个属性，写上去编不过。
@@ -68,7 +68,7 @@
 #define FC2D_GEOM_CE constexpr
 #endif
 
-namespace FusedConv2dShape {
+namespace FusedMultiConv2dShape {
 
 // ---------------------------------------------------------------------------
 // 几何的修订号。**每次改动几何的判据或 L1/L0 布局都要 +1，并在下面记一行。**
@@ -1633,6 +1633,6 @@ FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
     return DeriveWith(p, bestHb2, bestNw, l1Budget, g);
 }
 
-} // namespace FusedConv2dShape
+} // namespace FusedMultiConv2dShape
 
-#endif // FUSED_CONV2D_SHAPE_H
+#endif // FUSED_MULTI_CONV2D_SHAPE_H

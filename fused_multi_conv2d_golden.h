@@ -1,10 +1,10 @@
 /*
- * fused_conv2d 的上板 golden —— **按形状参数化**，两条通路各一套。
+ * fused_multi_conv2d 的上板 golden —— **按形状参数化**，两条通路各一套。
  *
  * ===========================================================================
  * 这个文件和 ops-nn 仓里那份同名文件的分工
  * ===========================================================================
- * ops-nn 的 tests/ut/op_kernel/fused_conv2d_golden.h 是 CPU 仿真用的：int8 那条
+ * ops-nn 的 tests/ut/op_kernel/fused_multi_conv2d_golden.h 是 CPU 仿真用的：int8 那条
  * 链能在仿真里整条跑完并逐位比对，fp16 那条在仿真里根本没有 mmad 模型。
  *
  * 这一份是**上板**用的，所以两条通路都要有数值 golden：
@@ -20,8 +20,8 @@
  *
  * int8 只有一个 golden：那条链上的运算全是精确整数，没有需要第二个参照的假设。
  */
-#ifndef FUSED_CONV2D_GOLDEN_H
-#define FUSED_CONV2D_GOLDEN_H
+#ifndef FUSED_MULTI_CONV2D_GOLDEN_H
+#define FUSED_MULTI_CONV2D_GOLDEN_H
 
 #include <cmath>
 #include <cstdint>
@@ -670,4 +670,4 @@ inline Result Build(const Case& c, bool fp16Out = false, int inputMultiple = 1)
 
 } // namespace fc2d_golden
 
-#endif // FUSED_CONV2D_GOLDEN_H
+#endif // FUSED_MULTI_CONV2D_GOLDEN_H

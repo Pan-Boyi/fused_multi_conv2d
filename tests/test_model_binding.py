@@ -13,7 +13,7 @@ import shutil
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-import run_fused_conv2d as runner
+import run_fused_multi_conv2d as runner
 import run_profile
 import fc2d
 import fc2d_onnx
@@ -63,6 +63,19 @@ class ModelBinding(unittest.TestCase):
         sidecar.unlink()
         self.assert_rejected(self.case, model)
 
+    def test_binding_rejects_previous_schema_and_wrong_operator(self):
+        model, sidecar = self.make_model()
+        binding = json.loads(sidecar.read_text())
+        self.assertEqual(binding['op_type'], 'FusedMultiConv2d')
+        for old_schema in (1, 2):
+            previous = dict(binding, schema_version=old_schema)
+            previous.pop('op_type')
+            sidecar.write_text(json.dumps(previous))
+            self.assert_rejected(self.case, model)
+        for op_type in (None, 'OtherOperator'):
+            sidecar.write_text(json.dumps(dict(binding, op_type=op_type)))
+            self.assert_rejected(self.case, model)
+
     def test_changed_case_or_unsupported_contract_is_rejected(self):
         model, sidecar = self.make_model()
         altered = self.work / 'changed_case.bin'
@@ -77,8 +90,8 @@ class ModelBinding(unittest.TestCase):
         model, sidecar = self.make_model()
         sidecar.unlink()
         env = dict(os.environ, LD_LIBRARY_PATH='/missing-test-library-directory')
-        result = subprocess.run([sys.executable, str(ROOT / 'run_fused_conv2d.py'),
-                                 str(self.case), 'FusedConv2d', '0', str(model)],
+        result = subprocess.run([sys.executable, str(ROOT / 'run_fused_multi_conv2d.py'),
+                                 str(self.case), 'FusedMultiConv2d', '0', str(model)],
                                 env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('missing or invalid case/OM binding', result.stdout)
@@ -125,8 +138,8 @@ class ModelBinding(unittest.TestCase):
             stream.write('filter1 6144\nfilter2 384\n')
         env = dict(os.environ, LD_LIBRARY_PATH=str(stub), DYLD_LIBRARY_PATH=str(stub), FC2D_STUB_CONF=str(conf),
                    FC2D_STUB_GOLDEN=str(stub / 'golden.bin'), REPEAT='1', WARMUP='0')
-        result = subprocess.run([sys.executable, str(ROOT / 'run_fused_conv2d.py'),
-                                 str(self.case), 'FusedConv2d', '0', str(model)],
+        result = subprocess.run([sys.executable, str(ROOT / 'run_fused_multi_conv2d.py'),
+                                 str(self.case), 'FusedMultiConv2d', '0', str(model)],
                                 env=env, cwd=str(stub), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('model has 9 inputs', result.stdout)

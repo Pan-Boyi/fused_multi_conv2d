@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FusedConv2d 上板执行 + profiling 的总驱动 —— **全部配置来自一个 json**。
+FusedMultiConv2d 上板执行 + profiling 的总驱动 —— **全部配置来自一个 json**。
 
     python3 run_profile.py profile.json                    # 全流程
     python3 run_profile.py profile.json --only base_fp16   # 只做某几条
@@ -46,7 +46,7 @@ case.bin 保存逻辑输入、参考输出和属性 spec；ONNX 从 spec 派生�
       -> gen_case 的命令行
       -> case.bin 头部的 spec（32 个 int，形状 + 属性的唯一真相）
       -> .onnx（从 spec 读，**不从 json 读**）-> atc --framework=5 -> .om
-      -> 执行时下发的输入（run_fused_conv2d.py 也从 case.bin 读；
+      -> 执行时下发的输入（run_fused_multi_conv2d.py 也从 case.bin 读；
          属性不下发，编译期已烘进 om）
 
 中间没有第二份形状。前四步的实现直接复用 fc2d.py，不另写一份。
@@ -135,7 +135,7 @@ DEFAULT_COLUMNS = [
 #
 # 本地侧的隐式依赖，harness 只做预检、不负责装：
 #   1. 算子包要先本地编好装上，并 export ASCEND_CUSTOM_OPP_PATH 指到
-#      <装到哪>/vendors/<name>_nn。FusedConv2d 不在 toolkit 的内置库里。
+#      <装到哪>/vendors/<name>_nn。FusedMultiConv2d 不在 toolkit 的内置库里。
 #   2. 算子包里必须有 onnx 解析插件：vendors/<name>_nn/framework/onnx/
 #      liboponnx_plugin_*.so。缺了 atc 报的是 E10501「IR for Op ... is not
 #      registered」，完全不指向真正的原因。ops-nn 侧要两处修才会产出它
@@ -161,7 +161,7 @@ REMOTE_DEFAULTS = {
     "dir": "",                 # 远端工作目录，脚本会在下面建 fc2d_run/<name>/
     "cann_env": "",            # 远端要 source 的 set_env.sh，空 = 不 source
     "device": 0,
-    "repeat": 10,              # run_fused_conv2d.py 的 REPEAT，计时用
+    "repeat": 10,              # run_fused_multi_conv2d.py 的 REPEAT，计时用
     "warmup": 0,
     "ssh_opts": ["-o", "StrictHostKeyChecking=no",
                  "-o", "UserKnownHostsFile=/dev/null",
@@ -369,7 +369,7 @@ def remote_script(rt, case_name, om_name, use_msprof, msprof, expected_binding):
     records the actual runner RC; PROF data remains available for failure diagnosis.
     """
     wd = "%s/%s" % (rt.dir.rstrip("/"), case_name)
-    command = "python3 run_fused_conv2d.py case.bin FusedConv2d %d %s" % (
+    command = "python3 run_fused_multi_conv2d.py case.bin FusedMultiConv2d %d %s" % (
         rt.device, shlex.quote(om_name))
     lines = ["set -o pipefail", "cd %s || exit 1" % shlex.quote(wd)]
     if rt.cann_env:
@@ -379,7 +379,7 @@ def remote_script(rt, case_name, om_name, use_msprof, msprof, expected_binding):
         "python3 - %s %s <<'FC2D_VERIFY'" %
         (shlex.quote(om_name), shlex.quote(json.dumps(expected_binding))),
         "import json, sys",
-        "import run_fused_conv2d as runner",
+        "import run_fused_multi_conv2d as runner",
         "actual = runner.validate_model_binding('case.bin', sys.argv[1])",
         "if actual != json.loads(sys.argv[2]):",
         "    raise SystemExit('remote case/OM differs from the selected local binding')",
@@ -449,7 +449,7 @@ def remote_identity(rt):
 
 
 def load_profile_state(paths, om_file, rt=None):
-    import run_fused_conv2d as runner
+    import run_fused_multi_conv2d as runner
     binding = runner.validate_model_binding(paths["bin"], om_file)
     try:
         with open(profile_state_path(paths)) as stream:
@@ -468,14 +468,14 @@ def load_profile_state(paths, om_file, rt=None):
 # ---------------------------------------------------------------- 各步骤
 def do_push(rt, c, paths, om_file):
     # Reject stale model/case combinations before any remote mutation.
-    import run_fused_conv2d as runner
+    import run_fused_multi_conv2d as runner
     runner.validate_model_binding(paths["bin"], om_file)
     binding_file = om_file + ".fc2d.json"
     # 下面要 rm -rf 这个目录。远端路径是 json 给的，先把明显危险的挡掉 ——
     # remote.dir 空着的话 wd 会变成 "/<case 名>"，那条 rm 就打到根目录下面去了。
     if not rt.dir.startswith("/") or rt.dir.rstrip("/").count("/") < 1:
         raise RuntimeError("remote.dir 必须是一个绝对路径且不能是根目录附近，当前是 %r" % rt.dir)
-    for f in (paths["bin"], om_file, binding_file, os.path.join(HERE, "run_fused_conv2d.py")):
+    for f in (paths["bin"], om_file, binding_file, os.path.join(HERE, "run_fused_multi_conv2d.py")):
         if not os.path.isfile(f):
             raise RuntimeError("本地缺文件 %s" % f)
     wd = "%s/%s" % (rt.dir.rstrip("/"), c["name"])
@@ -492,15 +492,15 @@ def do_push(rt, c, paths, om_file):
         raise RuntimeError("拷 .om 失败")
     if rt.scp_to(binding_file, "%s/%s" % (wd, os.path.basename(binding_file))) != 0:
         raise RuntimeError("拷 .fc2d.json binding 失败")
-    # run_fused_conv2d.py 每次都拷。case.bin 的格式和它是配套的，远端留着一份旧的
+    # run_fused_multi_conv2d.py 每次都拷。case.bin 的格式和它是配套的，远端留着一份旧的
     # 会报「case 文件版本 N，本脚本认 M」，而那时人往往已经在查算子了。
-    if rt.scp_to(os.path.join(HERE, "run_fused_conv2d.py"), "%s/run_fused_conv2d.py" % wd) != 0:
-        raise RuntimeError("拷 run_fused_conv2d.py 失败")
+    if rt.scp_to(os.path.join(HERE, "run_fused_multi_conv2d.py"), "%s/run_fused_multi_conv2d.py" % wd) != 0:
+        raise RuntimeError("拷 run_fused_multi_conv2d.py 失败")
     print("[OK] 已拷到 %s:%s" % (rt.target, wd))
 
 
 def do_prof(rt, c, paths, om_file, use_msprof, msprof, show_script=False):
-    import run_fused_conv2d as runner
+    import run_fused_multi_conv2d as runner
     binding = runner.validate_model_binding(paths["bin"], om_file)
     script = remote_script(rt, c["name"], os.path.basename(om_file), use_msprof, msprof, binding)
     if show_script:
@@ -676,7 +676,7 @@ def load_config(path):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="FusedConv2d 上板执行 + profiling，全部配置来自一个 json")
+    ap = argparse.ArgumentParser(description="FusedMultiConv2d 上板执行 + profiling，全部配置来自一个 json")
     ap.add_argument("config", nargs="?", default=os.path.join(HERE, "profile.json"),
                     help="配置 json（默认 profile.json）")
     ap.add_argument("--only", action="append", default=[], help="只做名字匹配的这些 case，可给多次")

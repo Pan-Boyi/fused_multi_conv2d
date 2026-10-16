@@ -11,7 +11,7 @@
  * fc2d.py 从 cases.json 里读一条就展开成上面这样一行，所以**改 json 就能换形状**。
  *
  * ---------------------------------------------------------------------------
- * 文件格式（version = 7，和 run_fused_conv2d.py 配套）
+ * 文件格式（version = 7，和 run_fused_multi_conv2d.py 配套）
  * ---------------------------------------------------------------------------
  *   magic "FC2DCASE" (8B)
  *   version u32 = 7
@@ -23,7 +23,7 @@
  *   qscale   2 x u32   —— int8 通路两张 per-channel 表的统一系数位型（调试元数据）
  *   然后每个张量：name[16], dtype u32, ndim u32, dims[4] i64, nbytes u64, data
  *
- * **spec 是这个文件里唯一的形状真相。** run_fused_conv2d.py 和 fc2d.py 生成
+ * **spec 是这个文件里唯一的形状真相。** run_fused_multi_conv2d.py 和 fc2d.py 生成
  * singleop.json 时都从它读，所以 .bin 和 .om 不可能对不上形状 —— 上一版靠脚本
  * 里另写一份 shape，改了 golden 忘了改 json，板上报的是「算子没找到」。
  *
@@ -45,7 +45,7 @@
 #include <string>
 #include <vector>
 
-#include "fused_conv2d_golden.h"
+#include "fused_multi_conv2d_golden.h"
 
 using namespace fc2d_golden;
 
@@ -64,7 +64,7 @@ enum DTypeMode {
     DTYPE_A16W8 = 3,
 };
 
-// spec 数组的下标。**只能往后加，不能插**：run_fused_conv2d.py 按同样的下标读。
+// spec 数组的下标。**只能往后加，不能插**：run_fused_multi_conv2d.py 按同样的下标读。
 enum SpecIdx {
     SPEC_N_BATCH = 0,
     SPEC_CI,
@@ -91,7 +91,7 @@ enum SpecIdx {
     SPEC_SAFE_F1, // 部分和不溢出所允许的最大 F（只有 fp16 有意义）
     SPEC_SAFE_F2,
     // 1 = 出口是 fp16 而入口是 int8（那条 per-channel 反量化的通路）。
-    // **只能往后加**：run_fused_conv2d.py 和 fc2d.py 按同样的下标读。
+    // **只能往后加**：run_fused_multi_conv2d.py 和 fc2d.py 按同样的下标读。
     SPEC_OUT_FP16,
     // 精确区分 fp16 / int8 / s8f16 / a16w8。elemBytes 只描述 x，不足以表达混合通路。
     SPEC_DTYPE_MODE,
@@ -302,7 +302,7 @@ int main(int argc, char** argv)
     const std::vector<int64_t> xDims = {c.n, c.ci, c.hi, c.wi};
     const std::vector<int64_t> yDims = {c.n, c.cout2, c.Ho2(), c.Wo2()};
     // Graph inputs carry true logical shapes and unpacked NCHW data. GE applies
-    // NCHW -> FRACTAL_Z at the FusedConv2d filter inputs during graph compilation.
+    // NCHW -> FRACTAL_Z at the FusedMultiConv2d filter inputs during graph compilation.
     const std::vector<int64_t> f1Dims = {c.cout1, c.ci, c.kh1, c.kw1};
     const std::vector<int64_t> f2Dims = {c.cout2, c.cout1, c.Kh2(), c.Kw2()};
 

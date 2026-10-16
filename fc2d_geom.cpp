@@ -4,7 +4,7 @@
  *   ./fc2d_geom --dtype fp16|int8|s8f16|a16w8 --ci 32 --hi 288 --wi 112
  *                --cout1 64 --cout2 96 [--l1 1048576]
  *
- * 用的是算子共用几何头的一份副本（fused_conv2d_shape.h）。**顾问性质**：真正说了
+ * 用的是算子共用几何头的一份副本（fused_multi_conv2d_shape.h）。**顾问性质**：真正说了
  * 算的是算子的 tiling。不过两边调的是同一个 DeriveWithHb / PickHb，只要副本没过期
  * 结论就一致。
  *
@@ -13,9 +13,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include "fused_conv2d_shape.h"
+#include "fused_multi_conv2d_shape.h"
 
-using namespace FusedConv2dShape;
+using namespace FusedMultiConv2dShape;
 
 static int ArgInt(int argc, char** argv, const char* key, int dflt)
 {
@@ -80,10 +80,10 @@ int main(int argc, char** argv)
         // 滚动、几何修订号），副本没跟着重拷，于是预检一直在用旧判据拒，而算子包
         // 其实已经能跑了 —— 白花了一整轮来回。重拷见 README 的 --sync-shape-header。
         std::fprintf(stderr, "不支持[%s]: %s\n", FC2D_GEOM_REV, RejectText(rc));
-        std::fprintf(stderr, "    （这份 fused_conv2d_shape.h 是算子那份的副本。"
+        std::fprintf(stderr, "    （这份 fused_multi_conv2d_shape.h 是算子那份的副本。"
                              "如果算子那边比 %s 更新，先跑 "
-                             "python3 fc2d.py --sync-shape-header <ops-nn>/conv/fused_conv2d/"
-                             "op_kernel/fused_conv2d_shape.h）\n", FC2D_GEOM_REV);
+                             "python3 fc2d.py --sync-shape-header <ops-nn>/conv/fused_multi_conv2d/"
+                             "op_kernel/fused_multi_conv2d_shape.h）\n", FC2D_GEOM_REV);
         return 1;
     }
     std::printf("    [%s] ", FC2D_GEOM_REV);

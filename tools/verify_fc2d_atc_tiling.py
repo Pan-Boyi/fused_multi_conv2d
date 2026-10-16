@@ -13,17 +13,17 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import fc2d
-import run_fused_conv2d as runner
+import run_fused_multi_conv2d as runner
 
 TAIL_FIELDS = ('blockDim', 'fixedShift1', 'fixedShift2', 'hasBias1', 'hasBias2', 'relu1', 'relu2')
-# Current FusedConv2dTilingData consists of 78 uint32 fields. An ABI change must
+# Current FusedMultiConv2dTilingData consists of 78 uint32 fields. An ABI change must
 # update this check, rather than silently decoding a different structure.
 TILING_BYTES = 312
 
 
 def check_tiling(spec, record):
-    if record.get('optype') != 'FusedConv2d':
-        raise ValueError('capture does not describe FusedConv2d')
+    if record.get('optype') != 'FusedMultiConv2d':
+        raise ValueError('capture does not describe FusedMultiConv2d')
     attrs = record.get('attrs') or []
     names = [attr.get('name') for attr in attrs]
     if len(names) < 13 or names[12] != 'ascendc_op_para_size':
@@ -74,10 +74,10 @@ def check_capture(spec, directory):
     for path in sorted(Path(directory).glob('tiling.*.jsonl')):
         for line in path.read_text().splitlines():
             record = json.loads(line)
-            if record.get('event') == 'tiling' and record.get('optype') == 'FusedConv2d':
+            if record.get('event') == 'tiling' and record.get('optype') == 'FusedMultiConv2d':
                 reports.append(check_tiling(spec, record))
     if not reports:
-        raise ValueError('no native FusedConv2d tiling was captured; verification is incomplete')
+        raise ValueError('no native FusedMultiConv2d tiling was captured; verification is incomplete')
     if len({item['tiling_data_sha256'] for item in reports}) != 1:
         raise ValueError('multiple different tiling results captured; use one fresh case per verification')
     return reports[0]
@@ -113,7 +113,7 @@ def compile_and_verify(case, output, soc):
     cache.mkdir()
     try:
         with compilation_environment(capture, cache):
-            fc2d.do_om({'name': 'FusedConv2d'}, paths, soc)
+            fc2d.do_om({'name': 'FusedMultiConv2d'}, paths, soc)
         report = check_capture(spec, capture)
         models = list((output / 'om').glob('*.om'))
         if len(models) != 1:

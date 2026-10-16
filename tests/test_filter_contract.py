@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import fc2d
 import fc2d_onnx
-import run_fused_conv2d as runner
+import run_fused_multi_conv2d as runner
 
 
 class FilterContract(unittest.TestCase):

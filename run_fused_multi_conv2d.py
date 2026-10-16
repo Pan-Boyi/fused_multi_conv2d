@@ -6,14 +6,14 @@
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
-"""FusedConv2d @ 5102 单算子验证 —— 目标机器上不需要编译器。
+"""FusedMultiConv2d @ 5102 单算子验证 —— 目标机器上不需要编译器。
 
 用 ctypes 直接调 libascendcl.so 里的 aclmdl*（模型 API），输入和 golden 全部来自
 gen_case 生成的 .bin。所以这台机器只要有 python3 + CANN 就够了，不需要 g++、
 不需要 aclnn 头、不需要 numpy。
 
-    python3 run_fused_conv2d.py [case.bin] [op_type] [device_id] [om]
-    默认  fused_conv2d_case.bin  FusedConv2d  0  (无 om)
+    python3 run_fused_multi_conv2d.py [case.bin] [op_type] [device_id] [om]
+    默认  fused_multi_conv2d_case.bin  FusedMultiConv2d  0  (无 om)
 
 第 4 个参数 om 可以是**单个 .om 文件**，也可以是装着 .om 的目录：
     ... 0 om_out/base_int8.om           加载这一个（走 aclmdlLoadFromFile）
@@ -25,7 +25,7 @@ gen_case 生成的 .bin。所以这台机器只要有 python3 + CANN 就够了�
     REPEAT=1         计时的下发次数。想避开冷启动就调大，比如 REPEAT=10
     WARMUP=0         正式计时前先空跑多少次（不计入统计）。总次数 = WARMUP + REPEAT
 
-设备上没装带 FusedConv2d 的算子包时，传第 4 个参数：那是在有算子包的机器上用
+设备上没装带 FusedMultiConv2d 的算子包时，传第 4 个参数：那是在有算子包的机器上用
 fc2d.py / run_profile.py 的 om 步骤编出来的单算子离线模型。运行时就从它里面找算子，
 不再要求本机的算子信息库里有这个算子。
 
@@ -155,8 +155,8 @@ def write_model_binding(case_path, om_path, expected_case_sha256=None):
     case_sha = _file_sha256(case_path)
     if expected_case_sha256 is not None and case_sha != expected_case_sha256:
         die("case SHA256 changed during compilation; regenerate case and OM")
-    # Schema 2 requires the per-layer integer enum attribute contract.
-    binding = {"schema_version": 2, "case_abi": CASE_VERSION, "weight_mode": "constant",
+    # Schema 3 binds the renamed OpType as well as the per-layer integer enum contract.
+    binding = {"schema_version": 3, "op_type": "FusedMultiConv2d", "case_abi": CASE_VERSION, "weight_mode": "constant",
                "model_input_count": 7, "model_sha256": _file_sha256(om_path),
                "case_sha256": expected_case_sha256 or case_sha}
     path = om_path + ".fc2d.json"
@@ -175,7 +175,7 @@ def validate_model_binding(case_path, om_path):
             binding = json.load(stream)
     except (OSError, ValueError) as exc:
         die("missing or invalid case/OM binding %s: %s; regenerate case and OM" % (path, exc))
-    contract = {"schema_version": 2, "case_abi": CASE_VERSION, "weight_mode": "constant", "model_input_count": 7}
+    contract = {"schema_version": 3, "op_type": "FusedMultiConv2d", "case_abi": CASE_VERSION, "weight_mode": "constant", "model_input_count": 7}
     if not isinstance(binding, dict) or any(binding.get(k) != v for k, v in contract.items()):
         die("unsupported binding; regenerate the seven-input constant-weight OM")
     if binding.get("model_sha256") != _file_sha256(om_path):
@@ -202,7 +202,7 @@ def runtime_input_slots(info):
     """Validate case tensor names and return the seven graph runtime inputs."""
     unknown = set(info["order"]) - set(INPUT_SLOTS)
     if unknown:
-        die("case 里有不属于 FusedConv2d 的输入: %s" % sorted(unknown))
+        die("case 里有不属于 FusedMultiConv2d 的输入: %s" % sorted(unknown))
     return model_input_slots(info)
 
 
@@ -249,7 +249,7 @@ def load_case(path):
         die("%s 不是 case 文件（magic = %r）" % (path, magic))
     if version != CASE_VERSION:
         die("case 文件版本 %d，本脚本认版本 %d。\n"
-            "        gen_case 和 run_fused_conv2d.py 必须配套 —— 重新生成一次 .bin。"
+            "        gen_case 和 run_fused_multi_conv2d.py 必须配套 —— 重新生成一次 .bin。"
             % (version, CASE_VERSION))
     spec = dict(zip(SPEC_KEYS, spec_vals))
 
@@ -983,15 +983,15 @@ def main():
     dry_run = "--dry-run" in argv
     if dry_run:
         argv = [a for a in argv if a != "--dry-run"]
-    case_path, op_type, device_id, om_arg = "fused_conv2d_case.bin", "FusedConv2d", 0, None
+    case_path, op_type, device_id, om_arg = "fused_multi_conv2d_case.bin", "FusedMultiConv2d", 0, None
     positional = []
     for a in argv:
         # 按**后缀和类型**认，不按「带不带斜杠」。上一版是「带 / 就当 om 目录」，
         # 而 case 文件现在都在 out/<名字>/case.bin 这样的子目录里 —— 一进来就被
-        # 当成 om 目录，然后 "FusedConv2d" 落到 case 文件那一位上，报「找不到
-        # case 文件 FusedConv2d」。
+        # 当成 om 目录，然后 "FusedMultiConv2d" 落到 case 文件那一位上，报「找不到
+        # case 文件 FusedMultiConv2d」。
         if a.endswith(".bin"):
-            if case_path != "fused_conv2d_case.bin":
+            if case_path != "fused_multi_conv2d_case.bin":
                 die("给了两个 .bin：%s 和 %s" % (case_path, a))
             case_path = a
         elif a.endswith(".om") or os.path.isdir(a):
@@ -1042,7 +1042,7 @@ def main():
     if repeat < 0:
         die("REPEAT 不能为负")
 
-    print('FusedConv2d @ 5102 验证 —— ctypes + aclmdl* 图 om（目标机不需要编译器、不需要算子包）')
+    print('FusedMultiConv2d @ 5102 验证 —— ctypes + aclmdl* 图 om（目标机不需要编译器、不需要算子包）')
     print('  case = "%s"   opType = "%s"   device = %d' % (case_path, op_type, device_id))
     print('  om     = %s' % (om_arg if om_arg else "(不用离线模型，走本机算子信息库)"))
     print('  REL_TOL = %g   RATIO_MIN = %g   repeat = %d   warmup = %d\n'
@@ -1177,7 +1177,7 @@ def main():
         # 「目录里留着上一个形状的 om，旧的反而先匹配上」。
         if om_file is None:
             if om_dir is None:
-                die("没给 om。图 om 要指名到文件：run_fused_conv2d.py case.bin FusedConv2d <device> <xxx.om>")
+                die("没给 om。图 om 要指名到文件：run_fused_multi_conv2d.py case.bin FusedMultiConv2d <device> <xxx.om>")
             oms = [f for f in os.listdir(om_dir) if f.endswith(".om")]
             if len(oms) != 1:
                 die("%s 下有 %d 个 .om（%s）。图 om 要指名到文件，不能靠目录匹配。"
@@ -1200,7 +1200,7 @@ def main():
         if n_in != 7:
             die("model has %d inputs; require the seven-input constant-weight graph, regenerate OM" % n_in)
         if n_out != 1:
-            die("这个模型报了 %d 个输出，FusedConv2d 只有一个 y" % n_out)
+            die("这个模型报了 %d 个输出，FusedMultiConv2d 只有一个 y" % n_out)
 
         keep = []          # 挡住 GC：host 侧缓冲在 memcpy 之前不能被回收
         dev_ptrs, descs, bufs = [], [], []
