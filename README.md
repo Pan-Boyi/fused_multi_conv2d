@@ -158,6 +158,9 @@ PROF 或 binding 不匹配时明确失败。`export/parse` 不连接远端。重
 | `bias` | `false` | 带不带 bias（两层一起）|
 | `enable_relu` | `[1,1]` | 每层一个 ReluMode，目前仅支持 0/1 |
 | `fixed_shift_value` | `[0,0]` | 统一私有定标；fp16 使用两项，A16W8 仅使用第一项 |
+| `data_format` | `[0,0]` | 每层格式编号；当前只支持 0=NCHW |
+| `round_mode` | `[0,0]` | 每层舍入编号；当前只支持 0=rint |
+| `pad_mode` | `[0,0]` | 每层补边模式；当前只支持 0=SPECIFIC，5=NOTSET 为保留值 |
 
 写错字段名会直接报错并列出认识的字段 —— 不会静默用缺省值跑一个你没打算跑的形状。
 
@@ -321,8 +324,23 @@ The public order is `bias_mask, dtype, strides, pads, dilations, groups,
 data_format, offset_x, round_mode, pad_mode, enable_hf32, enable_relu`.
 Only bias_mask is required. dtype defaults to -1 and follows x; s8f16 explicitly selects fp16.
 Private fixed_shift_value follows the SDK workspace slot at index 13.
-ListString migration remains pending: current CANN 9.2 lacks OpDef ListString;
-data_format/round_mode/pad_mode currently retain String.
+The three attributes now use two-entry ListInt values, defaulting to [0,0]:
+
+| Attribute | Integer mapping |
+| --- | --- |
+| data_format | 0=NCHW, 1=NHWC |
+| round_mode | 0=rint, 1=round |
+| pad_mode | 0=SPECIFIC, 1=SAME, 2=VALID, 3=SAME_UPPER, 4=SAME_LOWER, 5=NOTSET |
+
+Each entry belongs to one convolution. Only zero is implemented; other defined codes,
+including NOTSET=5, are reserved and rejected. Unknown codes, scalar strings/integers,
+and lists whose length is not two are rejected. JSON case configuration accepts these
+three keys as [0,0]; the generated ONNX encodes them as INTS.
+
+Case ABI remains 8 because geometry and tensor payloads are unchanged. Model binding
+schema is now 2, so schema-1 bindings and their old String-contract OMs cannot be reused.
+Existing ABI-8 cases may be used as compilation input, but regenerate ONNX, OM and binding
+after rebuilding and loading the new operator package.
 
 ABI 8 records the unified effective shift, including A16W8. Regenerate ABI 7 or earlier cases,
 ONNX, OM and binding; old bindings cannot be reused after this contract change.

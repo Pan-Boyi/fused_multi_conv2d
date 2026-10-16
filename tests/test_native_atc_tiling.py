@@ -22,6 +22,9 @@ class NativeTilingCapture(unittest.TestCase):
         fixture = self.fixture(mode)
         record = copy.deepcopy(fixture['record'])
         record['attrs'] = [{'name': name} for name in ('bias_mask','dtype','strides','pads','dilations','groups','data_format','offset_x','round_mode','pad_mode','enable_hf32','enable_relu','ascendc_op_para_size','fixed_shift_value')]
+        for attr in record['attrs']:
+            if attr['name'] in ('data_format','round_mode','pad_mode'):
+                attr.update(dtype='list_int', value=[0,0])
         words = list(struct.unpack('<78I', bytes.fromhex(record['result']['tiling_data'])))
         words[-6] = 29 if mode == 'a16w8' else 42
         record['result']['tiling_data'] = struct.pack('<78I', *words).hex()
@@ -52,6 +55,16 @@ class NativeTilingCapture(unittest.TestCase):
         words[-6:-4] = [34, 37]
         record['result']['tiling_data'] = struct.pack('<78I', *words).hex()
         self.assertEqual(tool.check_tiling(spec, record)['fields']['fixedShift2'], 37)
+
+    def test_rejects_old_string_contract_wrong_enum_types_and_nonzero_codes(self):
+        spec, good = self.corrected('fp16')
+        for name, old in (('data_format','NCHW'),('round_mode','rint'),('pad_mode','SPECIFIC')):
+            for dtype, value in (('str',old),('int',0),('list_int',[0]),('list_int',[0,1]),('list_int',None)):
+                record=copy.deepcopy(good)
+                attr=next(a for a in record['attrs'] if a['name']==name)
+                attr.update(dtype=dtype,value=value)
+                with self.subTest(name=name,dtype=dtype,value=value), self.assertRaisesRegex(ValueError,'enum attribute contract'):
+                    tool.check_tiling(spec,record)
 
     def test_missing_sdk_slot_wrong_wire_size_or_geometry_is_rejected(self):
         spec, record = self.corrected('fp16')

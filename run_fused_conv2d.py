@@ -155,7 +155,8 @@ def write_model_binding(case_path, om_path, expected_case_sha256=None):
     case_sha = _file_sha256(case_path)
     if expected_case_sha256 is not None and case_sha != expected_case_sha256:
         die("case SHA256 changed during compilation; regenerate case and OM")
-    binding = {"schema_version": 1, "case_abi": CASE_VERSION, "weight_mode": "constant",
+    # Schema 2 requires the per-layer integer enum attribute contract.
+    binding = {"schema_version": 2, "case_abi": CASE_VERSION, "weight_mode": "constant",
                "model_input_count": 7, "model_sha256": _file_sha256(om_path),
                "case_sha256": expected_case_sha256 or case_sha}
     path = om_path + ".fc2d.json"
@@ -174,7 +175,7 @@ def validate_model_binding(case_path, om_path):
             binding = json.load(stream)
     except (OSError, ValueError) as exc:
         die("missing or invalid case/OM binding %s: %s; regenerate case and OM" % (path, exc))
-    contract = {"schema_version": 1, "case_abi": CASE_VERSION, "weight_mode": "constant", "model_input_count": 7}
+    contract = {"schema_version": 2, "case_abi": CASE_VERSION, "weight_mode": "constant", "model_input_count": 7}
     if not isinstance(binding, dict) or any(binding.get(k) != v for k, v in contract.items()):
         die("unsupported binding; regenerate the seven-input constant-weight OM")
     if binding.get("model_sha256") != _file_sha256(om_path):
@@ -1375,8 +1376,8 @@ def main():
                  info["kh"], info["kw"], kh2, kw2, info["s1"], info["s2"],
                  info["ph1"], info["pw1"], info["ph2"], info["pw2"]))
         print("            保留属性（声明了但算子还不支持，全发 IR 缺省）: "
-              "dilations=[1,1,1,1,1,1,1,1] groups=[1,1] data_format=NCHW offset_x=[0,0] "
-              "round_mode=rint pad_mode=SPECIFIC enable_hf32=[false,false]")
+              "dilations=[1,1,1,1,1,1,1,1] groups=[1,1] data_format=[0,0](NCHW) offset_x=[0,0] "
+              "round_mode=[0,0](rint) pad_mode=[0,0](SPECIFIC) enable_hf32=[false,false]")
 
         def launch():
             # aclmdlExecute 是**同步**的：返回时 kernel 已经跑完，不需要

@@ -61,6 +61,46 @@ class PrototypeContract(unittest.TestCase):
                 self.assertTrue(all(v==int(v) and -128<=v<=127 for v in integers))
                 self.assertTrue(any(tensors['y_expect'][2]))
 
+    def test_mapped_enum_defaults_reach_onnx_as_two_integer_values(self):
+        with tempfile.TemporaryDirectory() as temp:
+            case=fc2d.normalise(dict(dtype='int8',hi=8,wi=9,cout2=2),0)
+            path=Path(temp)/'case.bin'
+            subprocess.run(fc2d.gen_case_argv(case,str(path)),check=True,stdout=subprocess.DEVNULL)
+            spec=fc2d.read_spec(str(path));tensors,*_=runner.load_case(str(path))
+            plan=fc2d_onnx.tensor_plan(spec); model=fc2d_onnx.build_model(plan,tensors)
+            for name in fc2d.MAPPED_ENUM_VALUES:
+                self.assertEqual(case[name],[0,0]);self.assertEqual(plan['attrs'][name],[0,0])
+                attr=next(a for a in model.graph.node[0].attribute if a.name==name)
+                self.assertEqual(attr.type,7)  # ONNX INTS, not STRING or INT.
+                self.assertEqual(list(attr.ints),[0,0])
+
+    def test_mapped_enum_lengths_types_and_unsupported_modes_are_rejected(self):
+        for name, mapping in fc2d.MAPPED_ENUM_VALUES.items():
+            for values in ([],[0],[0,0,0],0,mapping[0],[False,0],[0.0,0]):
+                with self.subTest(name=name,values=values),contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit):fc2d.normalise({name:values},0)
+            for value in range(-1,len(mapping)+1):
+                if value==0:continue
+                for layer in range(2):
+                    values=[0,0];values[layer]=value
+                    with self.subTest(name=name,values=values),contextlib.redirect_stdout(io.StringIO()):
+                        with self.assertRaises(SystemExit):fc2d.normalise({name:values},0)
+        self.assertEqual(fc2d.MAPPED_ENUM_VALUES['pad_mode'][5],'NOTSET')
+
+    def test_schema1_model_bindings_are_rejected_after_enum_contract_change(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/'case.bin';model=Path(temp)/'case.om'
+            case=fc2d.normalise(dict(dtype='int8',hi=8,wi=9,cout2=2),0)
+            subprocess.run(fc2d.gen_case_argv(case,str(path)),check=True,stdout=subprocess.DEVNULL)
+            model.write_bytes(b'synthetic model')
+            binding_path=runner.write_model_binding(str(path),str(model))
+            binding=json.loads(Path(binding_path).read_text())
+            self.assertEqual(binding['schema_version'],2)
+            binding['schema_version']=1
+            Path(str(model)+'.fc2d.json').write_text(json.dumps(binding))
+            with contextlib.redirect_stdout(io.StringIO()),self.assertRaises(SystemExit):
+                runner.validate_model_binding(str(path),str(model))
+
     def test_abi7_is_rejected_by_readers_and_model_binding(self):
         with tempfile.TemporaryDirectory() as temp:
             path=Path(temp)/'case.bin';case=fc2d.normalise(dict(dtype='int8',hi=8,wi=9,cout2=2),0)

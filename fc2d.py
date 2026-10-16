@@ -114,6 +114,17 @@ DEFAULTS = {
     "bias": False,
     "enable_relu": [True, True],
     "fixed_shift_value": [0, 0],
+    "data_format": [0, 0],
+    "round_mode": [0, 0],
+    "pad_mode": [0, 0],
+}
+
+
+# Public enum codes, independent of the device instruction's enum values.
+MAPPED_ENUM_VALUES = {
+    "data_format": ("NCHW", "NHWC"),
+    "round_mode": ("rint", "round"),
+    "pad_mode": ("SPECIFIC", "SAME", "VALID", "SAME_UPPER", "SAME_LOWER", "NOTSET"),
 }
 
 
@@ -157,6 +168,16 @@ def normalise(case, index):
         die("case %s: fixed_shift_value requires two integers in [0,58]" % out["name"])
     if out["dtype"] == "a16w8" and fs[0] > 29:
         die("case %s: A16W8 fixed_shift_value[0] must be in [0,29]" % out["name"])
+    for name, mapping in MAPPED_ENUM_VALUES.items():
+        values = out[name]
+        if not isinstance(values, list) or len(values) != 2 or any(type(v) is not int for v in values):
+            die("case %s: %s requires two integer enum codes" % (out["name"], name))
+        for layer, value in enumerate(values):
+            if value < 0 or value >= len(mapping):
+                die("case %s: %s[%d]=%d is an invalid enum code" % (out["name"], name, layer, value))
+            if value != 0:
+                die("case %s: %s[%d]=%d (%s) is not implemented; only 0 (%s) is supported" %
+                    (out["name"], name, layer, value, mapping[value], mapping[0]))
     return out
 
 

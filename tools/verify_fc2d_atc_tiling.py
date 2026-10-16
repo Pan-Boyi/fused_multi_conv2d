@@ -32,6 +32,10 @@ def check_tiling(spec, record):
               'data_format', 'offset_x', 'round_mode', 'pad_mode', 'enable_hf32', 'enable_relu']
     if names[:12] != public or (len(names) > 13 and names[13] != 'fixed_shift_value'):
         raise ValueError('unsupported operator attribute layout: rebuild the package for the current prototype')
+    for attr in attrs:
+        if attr['name'] in ('data_format', 'round_mode', 'pad_mode'):
+            if attr.get('dtype') not in ('list_int', 'list_int64') or attr.get('value') != [0, 0]:
+                raise ValueError('unsupported enum attribute contract for %s: expected ListInt [0,0]; rebuild package and OM' % attr['name'])
     # The capture records Python-side inputs. GE appends registered private defaults
     # inside native tiling, so an omitted fixed_shift_value need not appear here.
     result = record.get('result')
