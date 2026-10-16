@@ -537,7 +537,7 @@ struct Result {
 // fp16Out = true 就是「int8 进 / fp16 出」那条：**前半段完全一样**（conv1 VREQ8
 // 出 int8 的 mid、conv2 的 int32 累加器），只有 conv2 的出口换成按通道反量化。
 // 用同一个函数而不是另写一份，是为了让两条通路对前半段不可能有分歧。
-inline Result Build(const Case& c, bool fp16Out = false)
+inline Result Build(const Case& c, bool fp16Out = false, int inputMultiple = 1)
 {
     Result r;
     const int ho1 = c.Ho1(), wo1 = c.Wo1(), ho2 = c.Ho2(), wo2 = c.Wo2();
@@ -550,6 +550,7 @@ inline Result Build(const Case& c, bool fp16Out = false)
     };
     r.xNchw.resize((size_t)c.XElems());
     fill(r.xNchw, 0x11);
+    for (auto& value : r.xNchw) { value = static_cast<int8_t>((value / inputMultiple) * inputMultiple); }
     r.w1Nchw.resize((size_t)c.W1Elems());
     fill(r.w1Nchw, 0x22);
     r.w2Nchw.resize((size_t)c.W2Elems());

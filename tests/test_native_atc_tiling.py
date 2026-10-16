@@ -21,17 +21,23 @@ class NativeTilingCapture(unittest.TestCase):
     def corrected(self, mode):
         fixture = self.fixture(mode)
         record = copy.deepcopy(fixture['record'])
+        record['attrs'] = [{'name': name} for name in ('bias_mask','dtype','strides','pads','dilations','groups','data_format','offset_x','round_mode','pad_mode','enable_hf32','enable_relu','ascendc_op_para_size','fixed_shift_value')]
         words = list(struct.unpack('<78I', bytes.fromhex(record['result']['tiling_data'])))
         words[-6] = 29 if mode == 'a16w8' else 42
         record['result']['tiling_data'] = struct.pack('<78I', *words).hex()
-        return fixture['spec'], record
+        spec = copy.deepcopy(fixture['spec'])
+        if mode == 'a16w8':
+            spec['shift1'] = 29
+        return spec, record
 
     def test_real_pre_fix_captures_reveal_wrong_private_shifts(self):
         for mode, got, expected in (('fp16', 0, 42), ('a16w8', 2, 29)):
             with self.subTest(mode=mode):
                 fixture = self.fixture(mode)
-                with self.assertRaisesRegex(ValueError, 'fixedShift1=%d, expected %d' % (got, expected)):
-                    tool.check_tiling(fixture['spec'], fixture['record'])
+                with self.assertRaisesRegex(ValueError, 'operator attribute layout'):
+                    spec = copy.deepcopy(fixture['spec'])
+                    if mode == 'a16w8': spec['shift1'] = 29
+                    tool.check_tiling(spec, fixture['record'])
 
     def test_decode_correct_shifts_and_independent_overrides(self):
         for mode in ('fp16', 'a16w8'):
@@ -50,8 +56,8 @@ class NativeTilingCapture(unittest.TestCase):
     def test_missing_sdk_slot_wrong_wire_size_or_geometry_is_rejected(self):
         spec, record = self.corrected('fp16')
         missing = copy.deepcopy(record)
-        missing['attrs'].pop()
-        with self.assertRaisesRegex(ValueError, 'missing reserved slot'):
+        missing['attrs'].pop(12)
+        with self.assertRaisesRegex(ValueError, 'attribute layout'):
             tool.check_tiling(spec, missing)
         malformed = copy.deepcopy(record)
         malformed['result']['tiling_data'] = '00000000'

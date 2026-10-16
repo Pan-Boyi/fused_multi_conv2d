@@ -294,8 +294,8 @@ class DefaultAndContractCases(unittest.TestCase):
             subprocess.run([str(ROOT / 'gen_case'), str(case)] + args,
                            check=True, stdout=subprocess.DEVNULL)
             spec = fc2d.read_spec(str(case))
-            self.assertEqual([spec['s1'], spec['s2']], fc2d.DEFAULTS['strides'])
-            self.assertEqual([spec[k] for k in ('ph1', 'pw1', 'ph2', 'pw2')], fc2d.DEFAULTS['pads'])
+            self.assertEqual([spec['s1'], spec['s2']], fc2d.DEFAULTS['strides'][::2])
+            self.assertEqual([spec[k] for k in ('ph1', 'pw1', 'ph2', 'pw2')], fc2d.DEFAULTS['pads'][::2])
             self.assertEqual([spec['ho2'], spec['wo2']], [4, 5])
             geom = subprocess.check_output([str(ROOT / 'fc2d_geom')] + args, text=True)
             self.assertIn('conv1 -> 6x7, conv2 -> 4x5', geom)
@@ -320,7 +320,7 @@ class DefaultAndContractCases(unittest.TestCase):
                 self.assertEqual([list(t.dims) for t in model.graph.initializer],
                                  [[64, 32, *case['kernel'][:2]], [2, 64, *case['kernel'][2:]]])
                 self.assertNotIn('kernel_size', plan['attrs'])
-                self.assertEqual(plan['attrs']['fixed_shift'], case['fixed_shift'])
+                self.assertEqual(plan['attrs']['fixed_shift_value'], case['fixed_shift_value'])
                 self.assertEqual(plan['attrs']['strides'], case['strides'])
                 self.assertEqual(plan['attrs']['pads'], case['pads'])
                 conf_dir = directory / 'conf'

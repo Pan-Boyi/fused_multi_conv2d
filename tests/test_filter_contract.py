@@ -35,19 +35,19 @@ class FilterContract(unittest.TestCase):
                         "--hi", "20", "--wi", "30", "--kh", "1", "--kw", "3",
                         "--kh2", "3", "--kw2", "1", "--s1", "1", "--s2", "2",
                         "--ph1", "0", "--pw1", "1", "--ph2", "1", "--pw2", "0",
-                        "--bias", "1"], check=True, stdout=subprocess.DEVNULL)
+                        "--bias", "1", "--shift1", "29" if mode == "a16w8" else "42", "--shift2", "42"], check=True, stdout=subprocess.DEVNULL)
         return path
 
     def test_four_dtype_paths_use_logical_filter_shapes_and_bytes(self):
         for mode in ("fp16", "int8", "s8f16", "a16w8"):
             with self.subTest(mode=mode):
                 path = self.make_case(mode)
-                self.assertEqual(struct.unpack_from("<I", path.read_bytes(), 8)[0], 7)
+                self.assertEqual(struct.unpack_from("<I", path.read_bytes(), 8)[0], 8)
                 spec = fc2d.read_spec(str(path))
                 tensors, *unused = runner.load_case(str(path))
                 plan = fc2d_onnx.tensor_plan(spec)
                 self.assertNotIn("kernel_size", plan["attrs"])
-                self.assertEqual(list(plan["attrs"]), ['dtype', 'bias_mask', 'strides', 'pads', 'dilations', 'groups', 'data_format', 'offset_x', 'round_mode', 'pad_mode', 'enable_hf32', 'relu', 'fixed_shift', 'a16w8_shift'])
+                self.assertEqual(list(plan["attrs"]), ['bias_mask', 'dtype', 'strides', 'pads', 'dilations', 'groups', 'data_format', 'offset_x', 'round_mode', 'pad_mode', 'enable_hf32', 'enable_relu', 'fixed_shift_value'])
                 slots = {name: (dt, shape) for name, dt, shape in plan["slots"]}
                 width = 2 if mode == "fp16" else 1
                 for name, dims in (("filter1", [64, 32, 1, 3]),

@@ -11,7 +11,7 @@ conv1 用 `quant_scale1[Cout1]` 的 per-channel VREQ8 出 int8 mid，conv2 用
 
 `a16w8` 是混合通路：`x` 为 fp16，两张 filter 为 int8，conv1 通过
 `quant_scale1[Cout1]` 得到 int8 mid，conv2 再通过 `dequant_scale2[Cout2]` 输出 fp16。
-case generator 使用 fp16 可精确表示的小整数输入，并固定 `a16w8_shift=29`，因此板侧
+case generator 根据 `fixed_shift_value[0]` 缩放输入，并保持与精确整数参考一致，因此板侧
 结果可与精确整数 golden 逐位比对。
 
 两个 C++ 小工具（`gen_case` / `fc2d_geom`）**不进仓**，脚本用到时自己编 ——
@@ -50,7 +50,7 @@ python3 run_profile.py profile.json
 | :-- | :-- | :-- |
 | `check` | 本地 | 形状预检 |
 | `case` | 本地 | 生成 `case.bin` |
-| `om` | 本地 | 从 ABI 7 case 生成含常量 filters 的 ONNX，跑 `atc --framework=5`，写 OM/case SHA256 binding |
+| `om` | 本地 | 从 ABI 8 case 生成含常量 filters 的 ONNX，跑 `atc --framework=5`，写 OM/case SHA256 binding |
 | `push` | 本地 -> 远端 | 每条 case 一个干净目录,拷 `case.bin`、`.om`、`.om.fc2d.json`、`run_fused_conv2d.py` |
 | `prof` | 远端 | `$MSPROF bash <runner wrapper>`，分别记录 runner 与 profiler 返回码，并找出**本次**新生成的 `PROF_*`。`$MSPROF` 是 `profile.msprof` 给死的绝对路径(缺省 `/var/msprof`),**不搜 PATH** —— 远端那个 ssh 是非交互 shell,读不到 `~/.bashrc` 里 source 的 `set_env.sh`,搜 PATH 会说「没有 msprof」而其实装着。指向 msprof 那个可执行文件本身。 |
 | `pull` | 远端 -> 本地 | 把那个 `PROF_*` 拉回 `prof_out/<json 名>/<case 名>/` |
@@ -108,13 +108,13 @@ case.bin 保存逻辑输入、golden 和属性 spec。ONNX 从这份 spec 读取
 `<model.om>.fc2d.json`，以完整 case 与 OM 的 SHA256 防止错配。
 
 ```text
-case 配置 -> gen_case -> ABI 7 case.bin -> ONNX -> ATC -> OM + binding
+case 配置 -> gen_case -> ABI 8 case.bin -> ONNX -> ATC -> OM + binding
                                                         -> 上传 -> runner
 ```
 
 修改 case 的形状、dtype、weights、golden 或属性后都要重新生成 ONNX/OM/binding。
 历史 cases.json 与 profile.json 的旧 stride/pad 已显式填写，保持原有板测几何；
-新增 case 省略时使用 strides=[1,1]、pads=[0,0,0,0]。
+新增 case 省略时使用 strides=[1,1,1,1]、pads=[0,0,0,0,0,0,0,0]。
 
 ## 恢复 profiling 阶段
 
@@ -141,7 +141,7 @@ PROF 或 binding 不匹配时明确失败。`export/parse` 不连接远端。重
   "cases": [
     {"name": "base", "dtype": "both", "ci": 32, "hi": 288, "wi": 112, "cout1": 64, "cout2": 96},
     {"name": "k5x5", "dtype": "int8", "ci": 32, "hi": 64, "wi": 64, "cout1": 32, "cout2": 32,
-     "kernel": [5, 5], "pads": [2, 2], "bias": true}
+     "kernel": [5, 5], "pads": [2,2,2,2,2,2,2,2], "bias": true}
   ]
 }
 ```
@@ -153,11 +153,11 @@ PROF 或 binding 不匹配时明确失败。`export/parse` 不连接远端。重
 | `n` `ci` `hi` `wi` | 1 / 32 / 288 / 112 | 输入形状 NCHW |
 | `cout1` `cout2` | 64 / 96 | 两层的输出通道 |
 | `kernel` | `[3, 3]` | `[kh, kw]`（两层同核）或 `[kh1, kw1, kh2, kw2]`（两层各一个核，比如 `[1,1,3,3]` 是 1x1 接 3x3） |
-| `strides` | `[1, 1]` | `[stride1, stride2]`，两层各一个 |
-| `pads` | `[0, 0, 0, 0]` | `[p1, p2]`（H/W 同值）或 `[padH1, padW1, padH2, padW2]`。非方核必须用长度 4 的那种 |
+| `strides` | `[1,1,1,1]` | `[H1,W1,H2,W2]`，每层 H=W |
+| `pads` | 八个 0 | `[T1,B1,L1,R1,T2,B2,L2,R2]`，每层上下和左右分别对称；高度与宽度可不同 |
 | `bias` | `false` | 带不带 bias（两层一起）|
-| `relu` | `[true, true]` | `[relu1, relu2]` |
-| `fixed_shift` | `[42, 42]` | 私有定标配置，只有 fp16 通路用，见下 |
+| `enable_relu` | `[1,1]` | 每层一个 ReluMode，目前仅支持 0/1 |
+| `fixed_shift_value` | `[0,0]` | 统一私有定标；fp16 使用两项，A16W8 仅使用第一项 |
 
 写错字段名会直接报错并列出认识的字段 —— 不会静默用缺省值跑一个你没打算跑的形状。
 
@@ -170,14 +170,10 @@ PROF 或 binding 不匹配时明确失败。`export/parse` 不连接远端。重
 板上先看 `y_exact` 的相对误差过不过，再看 `y_expect` 能不能逐位对上。
 只有前者过、后者不过，说明卷积算对了但定点模型猜错了 —— 是两件不同的事。
 
-`fixed_shift` 与 `a16w8_shift` 已从算子的公开 OpDef、GE proto 和 binary 属性表
-移除。case/ONNX 保留同名内部定标配置，解析插件将其写入 GE 私有属性，再由 tiling
-校验并下发；非 ONNX 融合阶段可写入相同名称。省略时分别使用 `[42,42]` 与 `29`，
-不会根据 shape/dtype 自动计算。修改这两个配置仍然需要重新编译 OM。
-
-`fixed_shift` 的语义是 **累加器 = 真值 × 2^(58 − S)**，所以 **S 越大定标越小**，
-和直觉相反。42（F = 16）是厂商工作点。`gen_case` 会打出「部分和不溢出允许到 F ≤ ?」，
-超了会警告 —— 超了的话逐位比对不可能成立，因为累加器真的溢出了。
+`fixed_shift_value` 为统一的私有 ListInt，默认 `[0,0]`；原型不公开该属性。
+ONNX 插件或融合阶段将其写入 GE，tiling 校验后下发。全 fp16 两项范围 `[0,58]`，
+A16W8 第一项范围 `[0,29]`、第二项不参与计算。旧 `fixed_shift`、`a16w8_shift` 名称不再接受。
+历史数值用例显式保留原有工作点；原型默认零需要按实际输入进行标定，不能直接代替原工作点。
 
 **int8 量化**：一个 golden，精确整数运算 + per-channel VREQ8
 （round-half-to-even + 饱和 + relu），应当逐位相等。当前 case 为了与历史 golden
@@ -189,9 +185,9 @@ per-channel `quant_scale` 表的位型或 bit46 不对，不是卷积本身算�
 **s8f16**：前两层乘累加都是精确整数，conv1 通过 `quant_scale1` 输出 int8 mid，
 conv2 通过 `dequant_scale2` 输出 fp16；golden 应逐位相等。
 
-**a16w8**：输入是 fp16、filter 是 int8。生成器把输入限制在 fp16 可精确表示的整数，
-并使用 `a16w8_shift=29`，使 conv1 累加与整数参考一致；其余量化/反量化与 s8f16
-相同，因此同样执行逐位比对。
+**a16w8**：输入是 fp16、filter 是 int8。生成器按 `2^(S-29)` 缩放整数输入；
+S 较小时将整数选在可精确表示的格点上。MMAD 恢复同一整数参考，支持 S=0..29；
+历史用例显式使用 S=29，其余量化/反量化与 s8f16 相同。
 
 ## 单独跑一条
 
@@ -290,14 +286,14 @@ python3 fc2d.py contract_cases.json --steps om --soc <soc_version>
 bash tests/stub_ascendcl/run_stub_test.sh --out-root out/contract_cases
 ```
 
-`contract_cases.json` 覆盖四 dtype、缺省几何、短 pads、两层不同非方核、真实 Cout2=2、
+`contract_cases.json` 覆盖四 dtype、缺省几何、对称 pads、两层不同非方核、真实 Cout2=2、
 私有 shift 与独立 bias/relu。测试中的 synthetic ATC/OM 只验证框架控制流；ACL 桩复制
 golden 到输出，不代表设备计算正确或性能结果。真实精度和 profiling 按
 HARDWARE_VALIDATION_WORKFLOW.md 在服务器 A/B 执行。
 
-## Filter contract and case ABI 7
+## Filter contract and case ABI 8
 
-Case ABI 7 retains true logical NCHW filter tensors:
+Case ABI 8 retains true logical NCHW filter tensors:
 filter1=[Cout1,Cin,Kh1,Kw1], filter2=[Cout2,Cout1,Kh2,Kw2].
 The ONNX builder embeds both tensors as initializers. GE folds them to FRACTAL_Z
 at compilation and preserves their origin shape/format; kernel dimensions and
@@ -309,7 +305,7 @@ are fixed in the OM. This path avoids the unavailable runtime NCHW-to-FRACTAL_Z
 TransData engine in the locally validated MC62 SDK. ATC uses input_format=NCHW;
 bias/scale/relu_weight remain one-dimensional ND inputs.
 
-Regenerate ABI 6 cases with the matching gen_case (ABI 7) and rebuild ONNX/OM
+Regenerate ABI 6 cases with the matching gen_case (ABI 8) and rebuild ONNX/OM
 with the new operator package. Both case readers reject old versions. Cout2=2
 stays two logical output channels while internal FRACTAL_Z weights pad to 16.
 Measure performance again using freshly compiled models.
@@ -321,17 +317,20 @@ run_profile.py uploads all four. Changing weights, attributes, geometry or any
 case data requires a new case/ONNX/OM/binding.
 
 
-The public attribute order is `dtype, bias_mask, strides, pads, dilations,
-groups, data_format, offset_x, round_mode, pad_mode, enable_hf32, relu`.
-Required attributes come first. Private calibration `fixed_shift` and
-`a16w8_shift` occupy static tiling slots 13/14, after twelve public attributes
-and the compiler's internal workspace slot. Rebuild the
-operator package and regenerate case/ONNX/OM/binding after this order change.
+The public order is `bias_mask, dtype, strides, pads, dilations, groups,
+data_format, offset_x, round_mode, pad_mode, enable_hf32, enable_relu`.
+Only bias_mask is required. dtype defaults to -1 and follows x; s8f16 explicitly selects fp16.
+Private fixed_shift_value follows the SDK workspace slot at index 13.
+ListString migration remains pending: current CANN 9.2 lacks OpDef ListString;
+data_format/round_mode/pad_mode currently retain String.
+
+ABI 8 records the unified effective shift, including A16W8. Regenerate ABI 7 or earlier cases,
+ONNX, OM and binding; old bindings cannot be reused after this contract change.
 
 ## 检查真实 ATC tiling 中的定标值
 
 AscendC 的静态编译在 12 个公开属性后插入内部 `ascendc_op_para_size`，
-因此 tiling 的 `fixed_shift` / `a16w8_shift` 索引是 13 / 14。
+因此统一私有 `fixed_shift_value` 的索引是 13。
 旧代码少算这个内部位置，会把 fp16 的 conv1 shift 读成 0、A16W8 读成 2；
 runner 从 case 打印的 42 / 29 并不能证明 kernel 实际收到了这些值。
 

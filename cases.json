@@ -14,11 +14,11 @@
     "  cout1 cout2   两层的输出通道",
     "  kernel        [kh, kw]（两层同核）或 [kh1, kw1, kh2, kw2]（两层分开给，",
     "                比如 1x1 接 3x3）",
-    "  strides       [stride1, stride2]，两层各一个；缺省 [1,1]",
-    "  pads          [p1, p2]（H/W 同值）或 [padH1, padW1, padH2, padW2]；缺省全零",
+    "  strides       [H1,W1,H2,W2]，每层高宽相等；缺省 [1,1,1,1]",
+    "  pads          [T1,B1,L1,R1,T2,B2,L2,R2]，上下、左右对称；缺省八个零",
     "  bias          带不带 bias（两层一起）",
-    "  relu          [relu1, relu2]",
-    "  fixed_shift   [S1, S2]，只有 fp16 通路用。累加器 = 真值 * 2^(58-S)，",
+    "  enable_relu   [relu1, relu2]，每项仅支持 0/1",
+    "  fixed_shift_value [S1,S2]，默认 [0,0]；A16W8 仅使用第一项，范围 [0,29]。",
     "                所以 **S 越大定标越小**。42 是厂商工作点，一般不用动；",
     "                gen_case 会把「部分和不溢出允许到 F<=?」打出来，超了会警告。",
     "",
@@ -37,8 +37,9 @@
       "wi": 112,
       "cout1": 64,
       "cout2": 96,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "base_bias",
@@ -49,8 +50,9 @@
       "cout1": 64,
       "cout2": 96,
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "k1x1",
@@ -64,15 +66,10 @@
         1,
         1
       ],
-      "strides": [
-        1,
-        1
-      ],
-      "pads": [
-        0,
-        0
-      ],
-      "bias": true
+      "strides": [1, 1, 1, 1],
+      "pads": [0, 0, 0, 0, 0, 0, 0, 0],
+      "bias": true,
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "k1x1_s2",
@@ -86,14 +83,9 @@
         1,
         1
       ],
-      "strides": [
-        1,
-        2
-      ],
-      "pads": [
-        0,
-        0
-      ]
+      "strides": [1, 1, 2, 2],
+      "pads": [0, 0, 0, 0, 0, 0, 0, 0],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "s1_1",
@@ -103,11 +95,9 @@
       "wi": 64,
       "cout1": 32,
       "cout2": 32,
-      "strides": [
-        1,
-        1
-      ],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 1, 1],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "s2_2",
@@ -117,12 +107,10 @@
       "wi": 64,
       "cout1": 32,
       "cout2": 32,
-      "strides": [
-        2,
-        2
-      ],
+      "strides": [2, 2, 2, 2],
       "bias": true,
-      "pads": [1, 1, 1, 1]
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "s2_1",
@@ -132,12 +120,10 @@
       "wi": 64,
       "cout1": 32,
       "cout2": 48,
-      "strides": [
-        2,
-        1
-      ],
+      "strides": [2, 2, 1, 1],
       "bias": true,
-      "pads": [1, 1, 1, 1]
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "k2x2_nopad",
@@ -151,14 +137,9 @@
         2,
         2
       ],
-      "strides": [
-        1,
-        2
-      ],
-      "pads": [
-        0,
-        0
-      ]
+      "strides": [1, 1, 2, 2],
+      "pads": [0, 0, 0, 0, 0, 0, 0, 0],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "k5x5",
@@ -172,12 +153,10 @@
         5,
         5
       ],
-      "pads": [
-        2,
-        2
-      ],
+      "pads": [2, 2, 2, 2, 2, 2, 2, 2],
       "bias": true,
-      "strides": [1, 2]
+      "strides": [1, 1, 2, 2],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "k7x7",
@@ -191,11 +170,9 @@
         7,
         7
       ],
-      "pads": [
-        3,
-        3
-      ],
-      "strides": [1, 2]
+      "pads": [3, 3, 3, 3, 3, 3, 3, 3],
+      "strides": [1, 1, 2, 2],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "k1x3",
@@ -209,17 +186,10 @@
         1,
         3
       ],
-      "strides": [
-        1,
-        1
-      ],
-      "pads": [
-        0,
-        0,
-        0,
-        0
-      ],
-      "bias": true
+      "strides": [1, 1, 1, 1],
+      "pads": [0, 0, 0, 0, 0, 0, 0, 0],
+      "bias": true,
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "k3x1",
@@ -233,17 +203,10 @@
         3,
         1
       ],
-      "strides": [
-        1,
-        1
-      ],
-      "pads": [
-        0,
-        0,
-        0,
-        0
-      ],
-      "bias": true
+      "strides": [1, 1, 1, 1],
+      "pads": [0, 0, 0, 0, 0, 0, 0, 0],
+      "bias": true,
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "k3x5",
@@ -257,14 +220,10 @@
         3,
         5
       ],
-      "pads": [
-        1,
-        2,
-        1,
-        2
-      ],
+      "pads": [1, 1, 2, 2, 1, 1, 2, 2],
       "bias": true,
-      "strides": [1, 2]
+      "strides": [1, 1, 2, 2],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "pad_asym",
@@ -274,14 +233,10 @@
       "wi": 32,
       "cout1": 32,
       "cout2": 32,
-      "pads": [
-        1,
-        1,
-        0,
-        1
-      ],
+      "pads": [1, 1, 1, 1, 0, 0, 1, 1],
       "bias": true,
-      "strides": [1, 2]
+      "strides": [1, 1, 2, 2],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "wide_cin",
@@ -292,8 +247,9 @@
       "cout1": 32,
       "cout2": 16,
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "wide_cmid",
@@ -304,8 +260,9 @@
       "cout1": 128,
       "cout2": 32,
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "wide_cout",
@@ -315,8 +272,9 @@
       "wi": 32,
       "cout1": 32,
       "cout2": 128,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "cin96",
@@ -327,8 +285,9 @@
       "cout1": 32,
       "cout2": 32,
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "cmid96",
@@ -339,8 +298,9 @@
       "cout1": 96,
       "cout2": 32,
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "cout48",
@@ -351,8 +311,9 @@
       "cout1": 64,
       "cout2": 48,
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "hw_48x16",
@@ -363,8 +324,9 @@
       "cout1": 32,
       "cout2": 32,
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "hw_16x48",
@@ -374,12 +336,10 @@
       "wi": 48,
       "cout1": 32,
       "cout2": 32,
-      "relu": [
-        true,
-        false
-      ],
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "enable_relu": [true, false],
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "hw_64x16",
@@ -390,8 +350,9 @@
       "cout1": 32,
       "cout2": 16,
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "hw_40x24",
@@ -401,8 +362,9 @@
       "wi": 24,
       "cout1": 32,
       "cout2": 16,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "hw_112x112",
@@ -412,8 +374,9 @@
       "wi": 112,
       "cout1": 32,
       "cout2": 32,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "batch2",
@@ -425,8 +388,9 @@
       "cout1": 32,
       "cout2": 32,
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "batch2_s11",
@@ -437,11 +401,9 @@
       "wi": 32,
       "cout1": 32,
       "cout2": 16,
-      "strides": [
-        1,
-        1
-      ],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 1, 1],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "norelu",
@@ -451,13 +413,11 @@
       "wi": 32,
       "cout1": 32,
       "cout2": 32,
-      "relu": [
-        false,
-        false
-      ],
+      "enable_relu": [false, false],
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "base_s8f16",
@@ -467,8 +427,9 @@
       "wi": 112,
       "cout1": 64,
       "cout2": 96,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "base_bias_s8f16",
@@ -479,8 +440,9 @@
       "cout1": 64,
       "cout2": 96,
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "k1x1_s8f16",
@@ -494,15 +456,10 @@
         1,
         1
       ],
-      "strides": [
-        1,
-        1
-      ],
-      "pads": [
-        0,
-        0
-      ],
-      "bias": true
+      "strides": [1, 1, 1, 1],
+      "pads": [0, 0, 0, 0, 0, 0, 0, 0],
+      "bias": true,
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "k1x1_s2_s8f16",
@@ -516,14 +473,9 @@
         1,
         1
       ],
-      "strides": [
-        1,
-        2
-      ],
-      "pads": [
-        0,
-        0
-      ]
+      "strides": [1, 1, 2, 2],
+      "pads": [0, 0, 0, 0, 0, 0, 0, 0],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "s1_1_s8f16",
@@ -533,11 +485,9 @@
       "wi": 64,
       "cout1": 32,
       "cout2": 32,
-      "strides": [
-        1,
-        1
-      ],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 1, 1],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "s2_2_s8f16",
@@ -547,12 +497,10 @@
       "wi": 64,
       "cout1": 32,
       "cout2": 32,
-      "strides": [
-        2,
-        2
-      ],
+      "strides": [2, 2, 2, 2],
       "bias": true,
-      "pads": [1, 1, 1, 1]
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "s2_1_s8f16",
@@ -562,12 +510,10 @@
       "wi": 64,
       "cout1": 32,
       "cout2": 48,
-      "strides": [
-        2,
-        1
-      ],
+      "strides": [2, 2, 1, 1],
       "bias": true,
-      "pads": [1, 1, 1, 1]
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "k2x2_nopad_s8f16",
@@ -581,14 +527,9 @@
         2,
         2
       ],
-      "strides": [
-        1,
-        2
-      ],
-      "pads": [
-        0,
-        0
-      ]
+      "strides": [1, 1, 2, 2],
+      "pads": [0, 0, 0, 0, 0, 0, 0, 0],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "k5x5_s8f16",
@@ -602,12 +543,10 @@
         5,
         5
       ],
-      "pads": [
-        2,
-        2
-      ],
+      "pads": [2, 2, 2, 2, 2, 2, 2, 2],
       "bias": true,
-      "strides": [1, 2]
+      "strides": [1, 1, 2, 2],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "k7x7_s8f16",
@@ -621,11 +560,9 @@
         7,
         7
       ],
-      "pads": [
-        3,
-        3
-      ],
-      "strides": [1, 2]
+      "pads": [3, 3, 3, 3, 3, 3, 3, 3],
+      "strides": [1, 1, 2, 2],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "k1x3_s8f16",
@@ -639,17 +576,10 @@
         1,
         3
       ],
-      "strides": [
-        1,
-        1
-      ],
-      "pads": [
-        0,
-        0,
-        0,
-        0
-      ],
-      "bias": true
+      "strides": [1, 1, 1, 1],
+      "pads": [0, 0, 0, 0, 0, 0, 0, 0],
+      "bias": true,
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "k3x1_s8f16",
@@ -663,17 +593,10 @@
         3,
         1
       ],
-      "strides": [
-        1,
-        1
-      ],
-      "pads": [
-        0,
-        0,
-        0,
-        0
-      ],
-      "bias": true
+      "strides": [1, 1, 1, 1],
+      "pads": [0, 0, 0, 0, 0, 0, 0, 0],
+      "bias": true,
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "k3x5_s8f16",
@@ -687,14 +610,10 @@
         3,
         5
       ],
-      "pads": [
-        1,
-        2,
-        1,
-        2
-      ],
+      "pads": [1, 1, 2, 2, 1, 1, 2, 2],
       "bias": true,
-      "strides": [1, 2]
+      "strides": [1, 1, 2, 2],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "pad_asym_s8f16",
@@ -704,14 +623,10 @@
       "wi": 32,
       "cout1": 32,
       "cout2": 32,
-      "pads": [
-        1,
-        1,
-        0,
-        1
-      ],
+      "pads": [1, 1, 1, 1, 0, 0, 1, 1],
       "bias": true,
-      "strides": [1, 2]
+      "strides": [1, 1, 2, 2],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "wide_cin_s8f16",
@@ -722,8 +637,9 @@
       "cout1": 32,
       "cout2": 16,
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "wide_cmid_s8f16",
@@ -734,8 +650,9 @@
       "cout1": 128,
       "cout2": 32,
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "wide_cout_s8f16",
@@ -745,8 +662,9 @@
       "wi": 32,
       "cout1": 32,
       "cout2": 128,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "cin96_s8f16",
@@ -757,8 +675,9 @@
       "cout1": 32,
       "cout2": 32,
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "cmid96_s8f16",
@@ -769,8 +688,9 @@
       "cout1": 96,
       "cout2": 32,
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "cout48_s8f16",
@@ -781,8 +701,9 @@
       "cout1": 64,
       "cout2": 48,
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "hw_48x16_s8f16",
@@ -793,8 +714,9 @@
       "cout1": 32,
       "cout2": 32,
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "hw_16x48_s8f16",
@@ -804,12 +726,10 @@
       "wi": 48,
       "cout1": 32,
       "cout2": 32,
-      "relu": [
-        true,
-        false
-      ],
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "enable_relu": [true, false],
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "hw_64x16_s8f16",
@@ -820,8 +740,9 @@
       "cout1": 32,
       "cout2": 16,
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "hw_40x24_s8f16",
@@ -831,8 +752,9 @@
       "wi": 24,
       "cout1": 32,
       "cout2": 16,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "hw_112x112_s8f16",
@@ -842,8 +764,9 @@
       "wi": 112,
       "cout1": 32,
       "cout2": 32,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "batch2_s8f16",
@@ -855,8 +778,9 @@
       "cout1": 32,
       "cout2": 32,
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "batch2_s11_s8f16",
@@ -867,11 +791,9 @@
       "wi": 32,
       "cout1": 32,
       "cout2": 16,
-      "strides": [
-        1,
-        1
-      ],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 1, 1],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "norelu_s8f16",
@@ -881,13 +803,11 @@
       "wi": 32,
       "cout1": 32,
       "cout2": 32,
-      "relu": [
-        false,
-        false
-      ],
+      "enable_relu": [false, false],
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "base_a16w8",
@@ -897,8 +817,9 @@
       "wi": 112,
       "cout1": 64,
       "cout2": 96,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [29, 42]
     },
     {
       "name": "base_bias_a16w8",
@@ -909,8 +830,9 @@
       "cout1": 64,
       "cout2": 96,
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [29, 42]
     },
     {
       "name": "k1x1_a16w8",
@@ -924,15 +846,10 @@
         1,
         1
       ],
-      "strides": [
-        1,
-        1
-      ],
-      "pads": [
-        0,
-        0
-      ],
-      "bias": true
+      "strides": [1, 1, 1, 1],
+      "pads": [0, 0, 0, 0, 0, 0, 0, 0],
+      "bias": true,
+      "fixed_shift_value": [29, 42]
     },
     {
       "name": "k1x1_s2_a16w8",
@@ -946,14 +863,9 @@
         1,
         1
       ],
-      "strides": [
-        1,
-        2
-      ],
-      "pads": [
-        0,
-        0
-      ]
+      "strides": [1, 1, 2, 2],
+      "pads": [0, 0, 0, 0, 0, 0, 0, 0],
+      "fixed_shift_value": [29, 42]
     },
     {
       "name": "s1_1_a16w8",
@@ -963,11 +875,9 @@
       "wi": 64,
       "cout1": 32,
       "cout2": 32,
-      "strides": [
-        1,
-        1
-      ],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 1, 1],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [29, 42]
     },
     {
       "name": "s2_2_a16w8",
@@ -977,12 +887,10 @@
       "wi": 64,
       "cout1": 32,
       "cout2": 32,
-      "strides": [
-        2,
-        2
-      ],
+      "strides": [2, 2, 2, 2],
       "bias": true,
-      "pads": [1, 1, 1, 1]
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [29, 42]
     },
     {
       "name": "s2_1_a16w8",
@@ -992,12 +900,10 @@
       "wi": 64,
       "cout1": 32,
       "cout2": 48,
-      "strides": [
-        2,
-        1
-      ],
+      "strides": [2, 2, 1, 1],
       "bias": true,
-      "pads": [1, 1, 1, 1]
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [29, 42]
     },
     {
       "name": "k2x2_nopad_a16w8",
@@ -1011,14 +917,9 @@
         2,
         2
       ],
-      "strides": [
-        1,
-        2
-      ],
-      "pads": [
-        0,
-        0
-      ]
+      "strides": [1, 1, 2, 2],
+      "pads": [0, 0, 0, 0, 0, 0, 0, 0],
+      "fixed_shift_value": [29, 42]
     },
     {
       "name": "k5x5_a16w8",
@@ -1032,12 +933,10 @@
         5,
         5
       ],
-      "pads": [
-        2,
-        2
-      ],
+      "pads": [2, 2, 2, 2, 2, 2, 2, 2],
       "bias": true,
-      "strides": [1, 2]
+      "strides": [1, 1, 2, 2],
+      "fixed_shift_value": [29, 42]
     },
     {
       "name": "k7x7_a16w8",
@@ -1051,11 +950,9 @@
         7,
         7
       ],
-      "pads": [
-        3,
-        3
-      ],
-      "strides": [1, 2]
+      "pads": [3, 3, 3, 3, 3, 3, 3, 3],
+      "strides": [1, 1, 2, 2],
+      "fixed_shift_value": [29, 42]
     },
     {
       "name": "k1x3_a16w8",
@@ -1069,17 +966,10 @@
         1,
         3
       ],
-      "strides": [
-        1,
-        1
-      ],
-      "pads": [
-        0,
-        0,
-        0,
-        0
-      ],
-      "bias": true
+      "strides": [1, 1, 1, 1],
+      "pads": [0, 0, 0, 0, 0, 0, 0, 0],
+      "bias": true,
+      "fixed_shift_value": [29, 42]
     },
     {
       "name": "k3x1_a16w8",
@@ -1093,17 +983,10 @@
         3,
         1
       ],
-      "strides": [
-        1,
-        1
-      ],
-      "pads": [
-        0,
-        0,
-        0,
-        0
-      ],
-      "bias": true
+      "strides": [1, 1, 1, 1],
+      "pads": [0, 0, 0, 0, 0, 0, 0, 0],
+      "bias": true,
+      "fixed_shift_value": [29, 42]
     },
     {
       "name": "k3x5_a16w8",
@@ -1117,14 +1000,10 @@
         3,
         5
       ],
-      "pads": [
-        1,
-        2,
-        1,
-        2
-      ],
+      "pads": [1, 1, 2, 2, 1, 1, 2, 2],
       "bias": true,
-      "strides": [1, 2]
+      "strides": [1, 1, 2, 2],
+      "fixed_shift_value": [29, 42]
     },
     {
       "name": "pad_asym_a16w8",
@@ -1134,14 +1013,10 @@
       "wi": 32,
       "cout1": 32,
       "cout2": 32,
-      "pads": [
-        1,
-        1,
-        0,
-        1
-      ],
+      "pads": [1, 1, 1, 1, 0, 0, 1, 1],
       "bias": true,
-      "strides": [1, 2]
+      "strides": [1, 1, 2, 2],
+      "fixed_shift_value": [29, 42]
     },
     {
       "name": "wide_cin_a16w8",
@@ -1152,8 +1027,9 @@
       "cout1": 32,
       "cout2": 16,
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [29, 42]
     },
     {
       "name": "wide_cmid_a16w8",
@@ -1164,8 +1040,9 @@
       "cout1": 128,
       "cout2": 32,
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [29, 42]
     },
     {
       "name": "wide_cout_a16w8",
@@ -1175,8 +1052,9 @@
       "wi": 32,
       "cout1": 32,
       "cout2": 128,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [29, 42]
     },
     {
       "name": "cin96_a16w8",
@@ -1187,8 +1065,9 @@
       "cout1": 32,
       "cout2": 32,
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [29, 42]
     },
     {
       "name": "cmid96_a16w8",
@@ -1199,8 +1078,9 @@
       "cout1": 96,
       "cout2": 32,
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [29, 42]
     },
     {
       "name": "cout48_a16w8",
@@ -1211,8 +1091,9 @@
       "cout1": 64,
       "cout2": 48,
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [29, 42]
     },
     {
       "name": "hw_48x16_a16w8",
@@ -1223,8 +1104,9 @@
       "cout1": 32,
       "cout2": 32,
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [29, 42]
     },
     {
       "name": "hw_16x48_a16w8",
@@ -1234,12 +1116,10 @@
       "wi": 48,
       "cout1": 32,
       "cout2": 32,
-      "relu": [
-        true,
-        false
-      ],
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "enable_relu": [true, false],
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [29, 42]
     },
     {
       "name": "hw_64x16_a16w8",
@@ -1250,8 +1130,9 @@
       "cout1": 32,
       "cout2": 16,
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [29, 42]
     },
     {
       "name": "hw_40x24_a16w8",
@@ -1261,8 +1142,9 @@
       "wi": 24,
       "cout1": 32,
       "cout2": 16,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [29, 42]
     },
     {
       "name": "hw_112x112_a16w8",
@@ -1272,8 +1154,9 @@
       "wi": 112,
       "cout1": 32,
       "cout2": 32,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [29, 42]
     },
     {
       "name": "batch2_a16w8",
@@ -1285,8 +1168,9 @@
       "cout1": 32,
       "cout2": 32,
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [29, 42]
     },
     {
       "name": "batch2_s11_a16w8",
@@ -1297,11 +1181,9 @@
       "wi": 32,
       "cout1": 32,
       "cout2": 16,
-      "strides": [
-        1,
-        1
-      ],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 1, 1],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [29, 42]
     },
     {
       "name": "norelu_a16w8",
@@ -1311,13 +1193,11 @@
       "wi": 32,
       "cout1": 32,
       "cout2": 32,
-      "relu": [
-        false,
-        false
-      ],
+      "enable_relu": [false, false],
       "bias": true,
-      "strides": [1, 2],
-      "pads": [1, 1, 1, 1]
+      "strides": [1, 1, 2, 2],
+      "pads": [1, 1, 1, 1, 1, 1, 1, 1],
+      "fixed_shift_value": [29, 42]
     }
   ]
 }

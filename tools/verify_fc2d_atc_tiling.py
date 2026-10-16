@@ -28,6 +28,12 @@ def check_tiling(spec, record):
     names = [attr.get('name') for attr in attrs]
     if len(names) < 13 or names[12] != 'ascendc_op_para_size':
         raise ValueError('unsupported SDK attribute layout: missing reserved slot 12')
+    public = ['bias_mask', 'dtype', 'strides', 'pads', 'dilations', 'groups',
+              'data_format', 'offset_x', 'round_mode', 'pad_mode', 'enable_hf32', 'enable_relu']
+    if names[:12] != public or (len(names) > 13 and names[13] != 'fixed_shift_value'):
+        raise ValueError('unsupported operator attribute layout: rebuild the package for the current prototype')
+    # The capture records Python-side inputs. GE appends registered private defaults
+    # inside native tiling, so an omitted fixed_shift_value need not appear here.
     result = record.get('result')
     if not isinstance(result, dict):
         raise ValueError('native tiling did not return a result object')
@@ -41,8 +47,11 @@ def check_tiling(spec, record):
     geometry = tuple(spec[key] for key in ('n', 'ci', 'hi', 'wi', 'cout1', 'cout2'))
     if words[:6] != geometry:
         raise ValueError('native tiling belongs to a different case geometry')
+    geometry_fields = ('kh','kw','kh2','kw2','s1','s2','ph1','pw1','ph2','pw2')
+    if all(key in spec for key in geometry_fields) and words[6:16] != tuple(spec[key] for key in geometry_fields):
+        raise ValueError('native tiling geometry differs from case kernel/stride/padding')
     tail = dict(zip(TAIL_FIELDS, words[-7:]))
-    expected = {'fixedShift1': 29 if spec['dtype_mode'] == fc2d.DTYPE_A16W8 else spec['shift1'],
+    expected = {'fixedShift1': spec['shift1'],
                 'fixedShift2': spec['shift2'], 'hasBias1': int(bool(spec['bias'])),
                 'hasBias2': int(bool(spec['bias'])), 'relu1': int(bool(spec['relu1'])),
                 'relu2': int(bool(spec['relu2']))}
@@ -120,7 +129,7 @@ def compile_and_verify(case, output, soc):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('case', help='an ABI 7 case.bin; copied into the new output directory')
+    parser.add_argument('case', help='an ABI 8 case.bin; copied into the new output directory')
     parser.add_argument('--soc', required=True, help='the actual ATC target SoC')
     parser.add_argument('--out-dir', required=True, help='a new directory; existing directories are rejected')
     args = parser.parse_args()

@@ -44,7 +44,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # gen_case.cpp 里 SpecIdx 的顺序。**两边必须一致**，改那边就得改这边。
 # 末尾的 kh2 / kw2 是 conv2 的核，**只能往后加**：老的 .bin 在这两个位置上是 0，
 # 而那时两层必然同核，所以退回 kh / kw 就是对的 —— 相同核可按此回退；
-# ABI 7 stores filters as logical NCHW, so version 6 packed cases must be regenerated.
+# ABI 8 retains logical NCHW filters and records the unified effective shift.
 # 注意这张表是被 _check_spec_keys_in_sync() 正则逐字比对的，**列表里不能写注释**。
 SPEC_KEYS = [
     "n", "ci", "hi", "wi", "cout1", "cout2", "kh", "kw", "s1", "s2",
@@ -55,7 +55,7 @@ SPEC_KEYS = [
 SPEC_N = 32
 HDR_FMT = "<8sIIQQQ" + "%di" % SPEC_N + "II"
 HDR_LEN = struct.calcsize(HDR_FMT)
-CASE_VERSION = 7
+CASE_VERSION = 8
 
 DTYPE_FP16 = 0
 DTYPE_INT8 = 1
@@ -109,11 +109,11 @@ DEFAULTS = {
     "n": 1, "ci": 32, "hi": 288, "wi": 112,
     "cout1": 64, "cout2": 96,
     "kernel": [3, 3],
-    "strides": [1, 1],
-    "pads": [0, 0, 0, 0],
+    "strides": [1, 1, 1, 1],
+    "pads": [0, 0, 0, 0, 0, 0, 0, 0],
     "bias": False,
-    "relu": [True, True],
-    "fixed_shift": [42, 42],
+    "enable_relu": [True, True],
+    "fixed_shift_value": [0, 0],
 }
 
 
@@ -140,25 +140,28 @@ def normalise(case, index):
     if len(k) == 2:
         out["kernel"] = [k[0], k[1], k[0], k[1]]
     s = out["strides"]
-    if not isinstance(s, list) or len(s) != 2:
-        die("case %s 的 strides 要写成 [stride1, stride2]（两个卷积各一个）" % out["name"])
+    if not isinstance(s, list) or len(s) != 4 or any(type(v) is not int or v < 1 or v > 2147483647 for v in s):
+        die("case %s: strides requires four positive integers [H1,W1,H2,W2]" % out["name"])
+    if s[0] != s[1] or s[2] != s[3]:
+        die("case %s: each convolution requires equal H/W strides" % out["name"])
     p = out["pads"]
-    if not isinstance(p, list) or len(p) not in (2, 4):
-        die("case %s 的 pads 要写成 [p1, p2] 或 [padH1, padW1, padH2, padW2]" % out["name"])
-    if len(p) == 2:
-        # 长度 2 = H 和 W 同值。非方核必须用长度 4 的那种。
-        out["pads"] = [p[0], p[0], p[1], p[1]]
-    r = out["relu"]
-    if not isinstance(r, list) or len(r) != 2:
-        die("case %s 的 relu 要写成 [relu1, relu2]" % out["name"])
-    fs = out["fixed_shift"]
-    if not isinstance(fs, list) or len(fs) != 2:
-        die("case %s 的 fixed_shift 要写成 [shift1, shift2]" % out["name"])
+    if not isinstance(p, list) or len(p) != 8 or any(type(v) is not int or v < 0 or v > 2147483647 for v in p):
+        die("case %s: pads requires eight nonnegative integers [T1,B1,L1,R1,T2,B2,L2,R2]" % out["name"])
+    if any(p[i] != p[i+1] for i in range(0, 8, 2)):
+        die("case %s: padding must be symmetric on each axis" % out["name"])
+    r = out["enable_relu"]
+    if not isinstance(r, list) or len(r) != 2 or any(v not in (0,1) for v in r):
+        die("case %s: enable_relu supports two modes, each 0 or 1" % out["name"])
+    fs = out["fixed_shift_value"]
+    if not isinstance(fs, list) or len(fs) != 2 or any(type(v) is not int or not 0 <= v <= 58 for v in fs):
+        die("case %s: fixed_shift_value requires two integers in [0,58]" % out["name"])
+    if out["dtype"] == "a16w8" and fs[0] > 29:
+        die("case %s: A16W8 fixed_shift_value[0] must be in [0,29]" % out["name"])
     return out
 
 
 def gen_case_argv(c, out_path):
-    ph1, pw1, ph2, pw2 = c["pads"]
+    ph1, pw1, ph2, pw2 = c["pads"][::2]
     return [
         os.path.join(HERE, "gen_case"), out_path,
         "--dtype", c["dtype"],
@@ -166,11 +169,11 @@ def gen_case_argv(c, out_path):
         "--cout1", str(c["cout1"]), "--cout2", str(c["cout2"]),
         "--kh", str(c["kernel"][0]), "--kw", str(c["kernel"][1]),
         "--kh2", str(c["kernel"][2]), "--kw2", str(c["kernel"][3]),
-        "--s1", str(c["strides"][0]), "--s2", str(c["strides"][1]),
+        "--s1", str(c["strides"][0]), "--s2", str(c["strides"][2]),
         "--ph1", str(ph1), "--pw1", str(pw1), "--ph2", str(ph2), "--pw2", str(pw2),
         "--bias", "1" if c["bias"] else "0",
-        "--relu1", "1" if c["relu"][0] else "0", "--relu2", "1" if c["relu"][1] else "0",
-        "--shift1", str(c["fixed_shift"][0]), "--shift2", str(c["fixed_shift"][1]),
+        "--relu1", "1" if c["enable_relu"][0] else "0", "--relu2", "1" if c["enable_relu"][1] else "0",
+        "--shift1", str(c["fixed_shift_value"][0]), "--shift2", str(c["fixed_shift_value"][1]),
     ]
 
 
@@ -249,13 +252,13 @@ def do_check(c, l1):
     exe = ensure_tool("fc2d_geom")
     # dtype 原样传下去：fc2d_geom 也认 a16w8，会分别按 fp16 x、int8 filter/mid
     # 以及 q1/dq2 两张 per-channel 表计算 L1，预检不能漏掉这些真实占用。
-    ph1, pw1, ph2, pw2 = c["pads"]
+    ph1, pw1, ph2, pw2 = c["pads"][::2]
     argv = [exe, "--dtype", c["dtype"],
             "--n", str(c["n"]), "--ci", str(c["ci"]), "--hi", str(c["hi"]), "--wi", str(c["wi"]),
             "--cout1", str(c["cout1"]), "--cout2", str(c["cout2"]),
             "--kh", str(c["kernel"][0]), "--kw", str(c["kernel"][1]),
             "--kh2", str(c["kernel"][2]), "--kw2", str(c["kernel"][3]),
-            "--s1", str(c["strides"][0]), "--s2", str(c["strides"][1]),
+            "--s1", str(c["strides"][0]), "--s2", str(c["strides"][2]),
             "--ph1", str(ph1), "--pw1", str(pw1), "--ph2", str(ph2), "--pw2", str(pw2),
             "--l1", str(l1)]
     if run(argv) != 0:
@@ -360,7 +363,7 @@ def do_om(c, paths, soc):
     for fn in os.listdir(paths["omdir"]):
         if fn.endswith(".om"):
             os.remove(os.path.join(paths["omdir"], fn))
-    # ABI 7 retains logical weights in case.bin. ONNX stores them as constants;
+    # ABI 8 retains logical weights in case.bin. ONNX stores them as constants;
     # GE folds them to FRACTAL_Z, so the compiled graph has seven runtime inputs.
     # --framework=5 下 --output 是**文件前缀**而不是目录，atc 自己补 .om。
     out_prefix = os.path.join(paths["omdir"], c["name"])
@@ -497,13 +500,13 @@ def main():
     print("步骤: %s   产物: %s   设备: %d" % (" -> ".join(steps), outdir, device))
     print("共 %d 条:" % len(cases))
     for c in cases:
-        ph1, pw1, ph2, pw2 = c["pads"]
+        ph1, pw1, ph2, pw2 = c["pads"][::2]
         k = c["kernel"]
         ktxt = ("%dx%d" % (k[0], k[1]) if k[:2] == k[2:] else "%dx%d>%dx%d" % tuple(k))
         print("  %-16s %-5s n%d %d->%d->%d  %dx%d  k%-9s s%d/%d p%d,%d/%d,%d  bias=%s relu=%s/%s"
               % (c["name"], c["dtype"], c["n"], c["ci"], c["cout1"], c["cout2"], c["hi"], c["wi"],
-                 ktxt, c["strides"][0], c["strides"][1],
-                 ph1, pw1, ph2, pw2, c["bias"], c["relu"][0], c["relu"][1]))
+                 ktxt, c["strides"][0], c["strides"][2],
+                 ph1, pw1, ph2, pw2, c["bias"], c["enable_relu"][0], c["enable_relu"][1]))
     if args.list:
         return 0
 

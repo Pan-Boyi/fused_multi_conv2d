@@ -146,43 +146,23 @@ def tensor_plan(spec):
     slots["relu_weight1"] = ("float32", [spec["cout1"]])
     slots["relu_weight2"] = ("float32", [spec["cout2"]])
 
-    # Required public attrs, optional convolution attrs, then private calibration.
+    # Required attribute first, followed by optional attrs and private calibration.
+    # dtype=-1 follows x; only s8f16 needs an explicit output type override.
     attrs = {
-        # y 的 dtype。以前是算子从「dq2 传没传」推断的，三张定标表并进 scale 之后
-        # 那个判别消失了（x int8 出 int8 和 x int8 出 fp16 的输入侧完全同形），
-        # 所以改成显式声明。**房间惯例的名字是 dtype**，上一版叫 out_dtype。
-        "dtype": GE_DT_FLOAT16 if out_fp16 else GE_DT_INT8,
-        # 哪些层带 bias。**每层一项**（算子侧是 ListBool；ONNX 没有 BOOLS，所以
-        # 这里发 0/1 的整数列表，插件转成 vector<bool>）。上一版是整数位掩码。
-        # bias list 恒有一层一个实例，没被选中的那个张量算子不读。
         "bias_mask": [1 if has_bias else 0, 1 if has_bias else 0],
-        "strides": [int(spec["s1"]), int(spec["s2"])],
-        "pads": [int(spec["ph1"]), int(spec["pw1"]), int(spec["ph2"]), int(spec["pw2"])],
-        # ---- 以下七个从 ExtendConv2d 继承，算子侧声明了但还不支持 ----
-        # 发 IR 缺省值。算子的 CheckReservedAttrs 会拒任何非缺省值，所以这里
-        # **必须**和 IR 缺省逐字一致，否则所有用例都编不过。
-        "dilations": [1, 1, 1, 1],
-        "groups": 1,
+        "dtype": GE_DT_FLOAT16 if s8f16 else -1,
+        "strides": [int(spec["s1"]), int(spec["s1"]), int(spec["s2"]), int(spec["s2"])],
+        "pads": [int(spec[k]) for k in ("ph1","ph1","pw1","pw1","ph2","ph2","pw2","pw2")],
+        "dilations": [1] * 8,
+        "groups": [1,1],
         "data_format": "NCHW",
-        "offset_x": 0,
+        "offset_x": [0,0],
         "round_mode": "rint",
         "pad_mode": "SPECIFIC",
-        "enable_hf32": 0,
-        # relu 发整数而不是布尔：ONNX 的 AttributeProto 没有 BOOLS 这个类型，
-        # 算子侧 gert::RuntimeAttrs 也没有 GetListBool —— 两头都只能走整数列表。
-        # relu 的值是**硬件的 ReluMode 枚举**（kernel_utils_mode.h:54）：
-        #   0 = NO_RELU  1 = NORMAL_RELU  2 = SCALAR_RELU  3 = VECTOR_RELU
-        # 上一版它是 0/1 的开关；斜率表进原型之后扩成四态，而 0/1 的含义没变，
-        # 所以这里的生成逻辑不用动。2/3 算子侧目前会拒。
-        "relu": [RELU_NORMAL if spec["relu1"] else RELU_NO,
-                 RELU_NORMAL if spec["relu2"] else RELU_NO],
-        # Internal calibration metadata: the ONNX plugin writes these into GE
-        # PrivateAttr, outside the public OpDef/proto/binary attribute list.
-        # Preserve both layer shifts; they are not inferred from tensor shapes.
-        # 长度必须正好等于层数，算子那边短列表会直接拒（不会补成缺省）。
-        "fixed_shift": [int(spec["shift1"]), int(spec["shift2"])],
-        # Independent private 29-bit shift for A16W8 conv1.
-        "a16w8_shift": 29,
+        "enable_hf32": [0,0],
+        "enable_relu": [RELU_NORMAL if spec["relu1"] else RELU_NO,
+                        RELU_NORMAL if spec["relu2"] else RELU_NO],
+        "fixed_shift_value": [int(spec["shift1"]), int(spec["shift2"])],
     }
     return {
         "slots": [(n,) + tuple(slots[n]) for n in IR_SLOT_NAMES],

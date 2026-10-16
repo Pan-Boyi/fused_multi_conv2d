@@ -7,14 +7,8 @@
       "wi": 9,
       "cout2": 2,
       "bias": true,
-      "relu": [
-        true,
-        false
-      ],
-      "fixed_shift": [
-        41,
-        43
-      ]
+      "enable_relu": [true, false],
+      "fixed_shift_value": [41, 43]
     },
     {
       "name": "contract_int8_shortpads",
@@ -22,14 +16,9 @@
       "hi": 8,
       "wi": 9,
       "cout2": 2,
-      "pads": [
-        1,
-        0
-      ],
-      "relu": [
-        false,
-        true
-      ]
+      "pads": [1, 1, 1, 1, 0, 0, 0, 0],
+      "enable_relu": [false, true],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "contract_s8f16_non_square",
@@ -43,17 +32,10 @@
         3,
         1
       ],
-      "pads": [
-        0,
-        1,
-        1,
-        0
-      ],
+      "pads": [0, 0, 1, 1, 1, 1, 0, 0],
       "bias": true,
-      "relu": [
-        false,
-        false
-      ]
+      "enable_relu": [false, false],
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "contract_a16w8_defaults",
@@ -61,10 +43,8 @@
       "hi": 8,
       "wi": 9,
       "cout2": 2,
-      "relu": [
-        true,
-        true
-      ]
+      "enable_relu": [true, true],
+      "fixed_shift_value": [29, 42]
     }
   ]
 }

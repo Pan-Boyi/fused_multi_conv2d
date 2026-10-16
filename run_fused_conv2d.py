@@ -70,13 +70,13 @@ Y_SENTINEL_U16 = 0x7F7F   # fp16 输出的哨兵（两字节）
 Y_SENTINEL_I8 = 0x7F      # int8 输出的哨兵（一字节，正好是 int8 的 127）
 Y_ELEM_BYTES = 2          # fp16 那条；int8 那条用 1，见 decode_y()
 
-# case 文件的头（version 7）。**形状全在 spec 里**，脚本不再写死任何一个维度 ——
+# case 文件的头（version 8）。**形状全在 spec 里**，脚本不再写死任何一个维度 ——
 # gen_case 写它，fc2d.py 从它生成 .onnx（再 atc 编成 om），本脚本从它取输入数据，
 # 三处同源。属性不再下发 —— 图 om 的属性是编译期烘进去的。
-CASE_VERSION = 7
+CASE_VERSION = 8
 # 末尾的 kh2 / kw2 是 conv2 的核，**只能往后加**：老的 .bin 在这两个位置上是 0，
 # 而那时两层必然同核，所以退回 kh / kw 就是对的 —— 相同核可按此回退；
-# ABI 7 stores filters as logical NCHW, so version 6 packed cases must be regenerated.
+# ABI 8 stores filters as logical NCHW, so version 6 packed cases must be regenerated.
 # 注意这张表是被 _check_spec_keys_in_sync() 正则逐字比对的，**列表里不能写注释**。
 SPEC_KEYS = [
     "n", "ci", "hi", "wi", "cout1", "cout2", "kh", "kw", "s1", "s2",
@@ -150,12 +150,12 @@ def write_model_binding(case_path, om_path, expected_case_sha256=None):
     """Bind a constant-weight OM to the exact case used during compilation."""
     with open(case_path, "rb") as stream:
         header = stream.read(12)
-    if len(header) != 12 or struct.unpack_from("<I", header, 8)[0] != 7:
-        die("constant-weight OM binding requires case ABI 7; regenerate case and OM")
+    if len(header) != 12 or struct.unpack_from("<I", header, 8)[0] != CASE_VERSION:
+        die("constant-weight OM binding requires case ABI 8; regenerate case and OM")
     case_sha = _file_sha256(case_path)
     if expected_case_sha256 is not None and case_sha != expected_case_sha256:
         die("case SHA256 changed during compilation; regenerate case and OM")
-    binding = {"schema_version": 1, "case_abi": 7, "weight_mode": "constant",
+    binding = {"schema_version": 1, "case_abi": CASE_VERSION, "weight_mode": "constant",
                "model_input_count": 7, "model_sha256": _file_sha256(om_path),
                "case_sha256": expected_case_sha256 or case_sha}
     path = om_path + ".fc2d.json"
@@ -174,7 +174,7 @@ def validate_model_binding(case_path, om_path):
             binding = json.load(stream)
     except (OSError, ValueError) as exc:
         die("missing or invalid case/OM binding %s: %s; regenerate case and OM" % (path, exc))
-    contract = {"schema_version": 1, "case_abi": 7, "weight_mode": "constant", "model_input_count": 7}
+    contract = {"schema_version": 1, "case_abi": CASE_VERSION, "weight_mode": "constant", "model_input_count": 7}
     if not isinstance(binding, dict) or any(binding.get(k) != v for k, v in contract.items()):
         die("unsupported binding; regenerate the seven-input constant-weight OM")
     if binding.get("model_sha256") != _file_sha256(om_path):
@@ -293,7 +293,7 @@ def load_case(path):
         if name not in tensors:
             die("case 文件里缺张量 %s" % name)
 
-    # ABI 7 graph weights must retain exact logical shape; packed FZ buffers
+    # ABI 8 graph weights must retain exact logical shape; packed FZ buffers
     # with an accidentally rewritten header cannot masquerade as NCHW inputs.
     logical_filters = {
         "filter1": [spec["cout1"], spec["ci"], spec["kh"], spec["kw"]],
@@ -302,10 +302,12 @@ def load_case(path):
     }
     for name, expected in logical_filters.items():
         if tensors[name][1] != expected:
-            die("ABI 7 requires logical NCHW %s=%s, got %s; regenerate the case file"
+            die("ABI 8 requires logical NCHW %s=%s, got %s; regenerate the case file"
                 % (name, expected, tensors[name][1]))
 
     shift1, shift2 = spec["shift1"], spec["shift2"]
+    if isA16W8 and not (0 <= shift1 <= 29 and 0 <= shift2 <= 58):
+        die("A16W8 fixed_shift_value out of range")
     if isFp16 and not (0 <= shift1 <= FIX_SHIFT_LEN and 0 <= shift2 <= FIX_SHIFT_LEN):
         die("header 里的定点定标 %d / %d 超出 [0,%d]" % (shift1, shift2, FIX_SHIFT_LEN))
     info = dict(spec)
@@ -470,7 +472,7 @@ def report_ratio(got, want, n):
 
     分布包含已经正确的元素；局部块出错时，正确部分就能制造 2^0 主峰。
     主峰不能证明卷积正确，也不能单独确定定标改法。int8 的缩放走 per-channel
-    scale 表，不使用 fixed_shift；需结合逐位误差及空间分布判断。
+    scale 表，不使用 fixed_shift_value；需结合逐位误差及空间分布判断。
     """
     import math
     hist, sign_flip, sat_like, both_nz = {}, 0, 0, 0
@@ -498,7 +500,7 @@ def report_ratio(got, want, n):
         if top[0][0] == 0:
             print("       => 主峰 2^0 包含已正确元素；不能据此判定卷积正确或建议修改 shift。")
         else:
-            print("       => 主峰 2^%d 是乘性偏差线索，需结合错误分布验证；int8 检查 scale 表，不改 fixed_shift。" % top[0][0])
+            print("       => 主峰 2^%d 是乘性偏差线索，需结合错误分布验证；int8 检查 scale 表，不改 fixed_shift_value。" % top[0][0])
     else:
         print("       => 没有主峰：不是单纯的定标问题。")
 
@@ -1108,14 +1110,14 @@ def main():
               % (info["qs1"], "on" if info["relu"] else "off",
                  "on" if info["hasBias"] else "off"))
     elif info["isA16W8"]:
-        print("A16W8 定标: a16w8_shift=%d（累加器定标 2^(%d-%d)=1），"
+        print("A16W8 定标: fixed_shift_value[0]=%d（累加器定标 2^(%d-%d)），"
               "conv1 quant_scale1=%.9g，conv2 使用 per-channel dequant_scale2"
-              % (A16W8_SHIFT_LEN, A16W8_SHIFT_LEN, A16W8_SHIFT_LEN, info["qs1"]))
+              % (shift1, A16W8_SHIFT_LEN, shift1, info["qs1"]))
     else:
         # 只是打出来给人看。属性在编 om 那一步就烘进 om 了，板侧不下发
-        # （见下面 aclmdlAddDatasetBuffer 那段）。算子侧的名字是 fixed_shift，
+        # （见下面 aclmdlAddDatasetBuffer 那段）。算子侧的名字是 fixed_shift_value，
         # 一个 ListInt、每层一项。
-        print("定点定标（来自 header，编 om 时作为 private fixed_shift=[%d, %d] 烘进 om）"
+        print("定点定标（来自 header，编 om 时作为 private fixed_shift_value=[%d, %d] 烘进 om）"
               % (shift1, shift2))
         print("            对应累加器定标 2^%d / 2^%d —— 属性越大定标越小，别搞反"
               % (FIX_SHIFT_LEN - shift1, FIX_SHIFT_LEN - shift2))
@@ -1333,9 +1335,9 @@ def main():
         check(acl.aclmdlAddDatasetBuffer(ds_out, bufs[NIN]), "aclmdlAddDatasetBuffer(out) = %d")
 
         # **属性不下发。** 图 om 的属性在编译期就烘进去了，aclmdlExecute 不吃属性。
-        # 定标 fixed_shift 是私有 ListInt，每层一项；a16w8_shift 是独立私有 Int。
+        # 定标 fixed_shift_value 是私有 ListInt，每层一项；A16W8 仅使用第一项。
         # ONNX 插件将内部定标配置写入 GE PrivateAttr；kernel 数值语义保持不变。
-        # 必填的是 dtype / bias_mask；strides / pads 缺省表示步长1、无补边。
+        # 必填的是 bias_mask；dtype 默认 -1 跟随 x；strides / pads 缺省表示步长1、无补边。
         # 它们由编 om 那一步（fc2d_onnx.tensor_plan）给。另有七个从 ExtendConv2d
         # 继承、声明了但还不支持的属性（dilations / groups / data_format /
         # offset_x / round_mode / pad_mode / enable_hf32），都发 IR 缺省值。
@@ -1367,14 +1369,14 @@ def main():
         # 目前只会发 0/1 —— 2/3 要用 relu_weight 那张斜率表，算子侧会拒。
         relu_str = "[%d,%d]" % (1 if info["relu1"] else 0, 1 if info["relu2"] else 0)
         print("算子属性（编译期已烘进 om，此处仅供核对）: dtype=%d bias_mask=%s "
-              "private fixed_shift=[%d,%d] relu=%s private a16w8_shift=29 "
+              "private fixed_shift_value=[%d,%d] enable_relu=%s "
               "kernel=%dx%d>%dx%d strides=%d/%d pads=%d,%d/%d,%d"
               % (dtype_echo, bias_mask_str, shift1, shift2, relu_str,
                  info["kh"], info["kw"], kh2, kw2, info["s1"], info["s2"],
                  info["ph1"], info["pw1"], info["ph2"], info["pw2"]))
         print("            保留属性（声明了但算子还不支持，全发 IR 缺省）: "
-              "dilations=[1,1,1,1] groups=1 data_format=NCHW offset_x=0 "
-              "round_mode=rint pad_mode=SPECIFIC enable_hf32=false")
+              "dilations=[1,1,1,1,1,1,1,1] groups=[1,1] data_format=NCHW offset_x=[0,0] "
+              "round_mode=rint pad_mode=SPECIFIC enable_hf32=[false,false]")
 
         def launch():
             # aclmdlExecute 是**同步**的：返回时 kernel 已经跑完，不需要
@@ -1478,9 +1480,9 @@ def main():
         # 「累加器 LSB = 2^-(58-S)」在这里没有意义，报了只会误导。
         label = "a16w8" if info["isA16W8"] else "s8f16"
         print("\n[%s] 出口是 per-channel 反量化（VDEQF16），定标来自 dequant_scale2 那张表，" % label)
-        print("        不是 fixed_shift 的 2 的幂 —— 所以这里不报累加器 LSB。")
+        print("        不是 fixed_shift_value 的 2 的幂 —— 所以这里不报累加器 LSB。")
         if info["isA16W8"]:
-            print("        A16W8 case 使用 fp16 可精确表示的整数输入和 shift=29；判据为逐位相等。")
+            print("        A16W8 case 使用 可精确表示的缩放 fp16 输入和对应 shift；判据为逐位相等。")
         else:
             print("        判据就是逐位相等：golden 的乘累加是精确整数运算，出口按同一张表换算。")
     else:

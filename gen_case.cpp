@@ -54,7 +54,7 @@ constexpr uint32_t ACL_DT_INT8 = 2;
 constexpr uint32_t ACL_DT_INT32 = 3;
 constexpr uint32_t ACL_DT_UINT64 = 10;
 
-constexpr uint32_t CASE_VERSION = 7;
+constexpr uint32_t CASE_VERSION = 8;
 constexpr int SPEC_N = 32; // spec 数组的长度，留了余量
 
 enum DTypeMode {
@@ -223,9 +223,12 @@ int main(int argc, char** argv)
     c.bias = ArgInt(argc, argv, "--bias", c.bias ? 1 : 0) != 0;
     c.relu1 = ArgInt(argc, argv, "--relu1", c.relu1 ? 1 : 0) != 0;
     c.relu2 = ArgInt(argc, argv, "--relu2", c.relu2 ? 1 : 0) != 0;
-    c.shift1 = ArgInt(argc, argv, "--shift1", c.shift1);
-    c.shift2 = ArgInt(argc, argv, "--shift2", c.shift2);
+    c.shift1 = ArgInt(argc, argv, "--shift1", 0);
+    c.shift2 = ArgInt(argc, argv, "--shift2", 0);
 
+    if (c.shift1 < 0 || c.shift1 > (isA16W8 ? 29 : 58) || c.shift2 < 0 || c.shift2 > 58) {
+        std::fprintf(stderr, "[X] fixed_shift_value out of range\n"); return 2;
+    }
     // 形状的基本自洽性。算子的 tiling 还会再查一遍（而且更严），这里只挡住那些
     // 会让 golden 本身算不出来的。
     const int xC0 = c.C0();
@@ -305,15 +308,18 @@ int main(int argc, char** argv)
 
     if (isA16W8) {
         // ---- fp16 fmap + int8 filters / mid + fp16 output -----------------
-        // 输入只取 fp16 可精确表示的小整数，a16w8_shift1=29 对应 29-29=0 位
-        // 定标，因此 conv1 的 int32 累加与 int8 精确模型逐位一致。这样上板 golden
-        // 不依赖一个猜测性的通用 f16xs8 模型，同时仍然覆盖非零数据和完整卷积。
+        // Choose integer inputs on a lattice representable after scaling by 2^(S-29).
+        // MMAD restores the same exact integers, so the int8 oracle remains exact for S in [0,29].
         Case q = c;
         q.elemBytes = 1;
-        int8path::Result g = int8path::Build(q, /*fp16Out*/ true);
+        int8path::Result g = int8path::Build(q, /*fp16Out*/ true, 1 << std::max(0, 5 - c.shift1));
         std::vector<uint16_t> xF16(g.xNchw.size());
         for (size_t i = 0; i < g.xNchw.size(); ++i) {
-            xF16[i] = F32ToF16Bits((float)g.xNchw[i]);
+            xF16[i] = F32ToF16Bits(std::ldexp((float)g.xNchw[i], c.shift1 - 29));
+            if (F16BitsToF32(xF16[i]) != std::ldexp((float)g.xNchw[i], c.shift1 - 29)) {
+                std::fprintf(stderr, "[X] A16W8 exact golden requires representable scaled inputs; choose representable scaled input values\n");
+                std::fclose(f); std::remove(out); return 2;
+            }
         }
         uint32_t qs1 = 0;
         std::memcpy(&qs1, &g.scale1, 4);
@@ -321,7 +327,7 @@ int main(int argc, char** argv)
         const float one = 1.0f;
         uint32_t oneBits = 0;
         std::memcpy(&oneBits, &one, 4);
-        std::printf("  A16W8 conv1: a16w8_shift1=29，整数 fp16 输入，quant_scale1=%.9g\n", g.scale1);
+        std::printf("  A16W8 conv1: fixed_shift_value[0]=%d，精确 fp16 输入，quant_scale1=%.9g\n", c.shift1, g.scale1);
         std::printf("  conv2 反量化: per-channel，%d 个系数；golden 非零 %ld / %ld\n",
                     c.cout2, g.yNonZero, c.YElems());
 
