@@ -18,6 +18,7 @@ import fc2d
 import fc2d_onnx
 import run_profile as profile
 import run_fused_multi_conv2d as runner
+from fusion_test_support import write_test_binding, fake_graph, emit_tiling
 sys.path.insert(0, str(ROOT / 'tests/stub_ascendcl'))
 import run_stub_test as stub_test
 
@@ -90,7 +91,7 @@ class ProfileWorkflow(unittest.TestCase):
         Path(self.paths['omdir']).mkdir()
         self.model = Path(self.paths['omdir']) / 'contract.om'
         self.model.write_bytes(b'synthetic OM for runner testing; not an ATC result')
-        runner.write_model_binding(self.paths['bin'], str(self.model))
+        write_test_binding(self.paths['bin'], str(self.model))
         self.conf = self.work / 'stub_conf'
         subprocess.run([sys.executable, str(ROOT / 'tests/stub_ascendcl/make_conf.py'),
                         self.paths['bin'], str(self.conf)], check=True, stdout=subprocess.DEVNULL)
@@ -137,17 +138,31 @@ class ProfileWorkflow(unittest.TestCase):
     def test_all_stages_generate_graph_upload_run_download_export_and_parse(self):
         original_run = fc2d.run
 
-        def synthetic_atc(command):
+        def synthetic_atc(command, **kwargs):
             if command[0] == 'atc':
+                if '--mode=1' in command:
+                    om = next(arg.split('=',1)[1] for arg in command if arg.startswith('--om='))
+                    target = next(arg.split('=',1)[1] for arg in command if arg.startswith('--json='))
+                    names = runner.model_input_slots(fc2d.read_spec(self.paths['bin']))
+                    Path(target).write_text(json.dumps(fake_graph(names, Path(om).stem == 'stage1')))
+                    return 0
                 import onnx
                 model_path = next(arg.split('=', 1)[1] for arg in command if arg.startswith('--model='))
                 graph = onnx.load(model_path).graph
-                self.assertEqual(len(graph.input), 7)
-                self.assertEqual(len(graph.node[0].input), 9)
+                self.assertEqual(len(graph.input), 3)
+                self.assertEqual(sum(n.op_type == 'Conv' for n in graph.node), 2)
+                self.assertNotIn('FusedMultiConv2d',[n.op_type for n in graph.node])
                 self.assertEqual({t.name for t in graph.initializer}, {'filter1', 'filter2'})
                 self.assertIn('--input_format=NCHW', command)
                 prefix = next(arg.split('=', 1)[1] for arg in command if arg.startswith('--output='))
+                switch = next(arg.split('=',1)[1] for arg in command if arg.startswith('--fusion_switch_file='))
+                switches = json.loads(Path(switch).read_text())['Switch']['GraphFusion']
+                self.assertEqual(switches['Conv2DFixPipeToExtendConv2DFusionPass'],'on')
+                self.assertEqual(switches['ExtendConv2DPairToFusedMultiConv2DFusionPass'],
+                                 'off' if Path(prefix).name=='stage1' else 'on')
                 Path(prefix + '.om').write_bytes(b'synthetic ATC result')
+                if Path(prefix).name != 'stage1':
+                    emit_tiling(fc2d.read_spec(self.paths['bin']))
                 return 0
             return original_run(command)
 
@@ -189,14 +204,14 @@ class ProfileWorkflow(unittest.TestCase):
             with self.subTest(changed=changed):
                 path = Path(self.paths['bin']) if changed == 'case' else self.model
                 path.write_bytes(path.read_bytes() + b'changed')
-                runner.write_model_binding(self.paths['bin'], str(self.model))
+                write_test_binding(self.paths['bin'], str(self.model))
                 self.assertEqual(self.cli('parse')[0], 1)
 
     def test_remote_old_but_self_consistent_bundle_is_rejected_before_execution(self):
         self.push()
         remote_model = Path(self.remote.dir) / 'contract/contract.om'
         remote_model.write_bytes(b'old remote model')
-        runner.write_model_binding(str(remote_model.parent / 'case.bin'), str(remote_model))
+        write_test_binding(str(remote_model.parent / 'case.bin'), str(remote_model))
         rc, output = self.cli('prof')
         self.assertEqual(rc, 1, output)
         self.assertIn('differs from the selected local binding', output)
@@ -249,7 +264,7 @@ class ProfileWorkflow(unittest.TestCase):
         (directory / 'om').mkdir()
         model = directory / 'om/second.om'
         model.write_bytes(b'second valid model')
-        runner.write_model_binding(str(directory / 'case.bin'), str(model))
+        write_test_binding(str(directory / 'case.bin'), str(model))
         self.model.write_bytes(b'stale first model')
         document = json.loads(self.config.read_text())
         document['cases'] = [self.case, second]
@@ -316,7 +331,7 @@ class DefaultAndContractCases(unittest.TestCase):
                     plan, status = fc2d_onnx.write_onnx(paths['bin'], paths['onnx'])
                 model = onnx.load(paths['onnx'])
                 self.assertEqual([v.name for v in model.graph.input], runner.model_input_slots(fc2d.read_spec(paths['bin'])))
-                self.assertEqual(len(model.graph.node[0].input), 9)
+                self.assertEqual(sum(n.op_type == 'Conv' for n in model.graph.node), 2)
                 self.assertEqual([list(t.dims) for t in model.graph.initializer],
                                  [[64, 32, *case['kernel'][:2]], [2, 64, *case['kernel'][2:]]])
                 self.assertNotIn('kernel_size', plan['attrs'])
@@ -343,7 +358,7 @@ class DefaultAndContractCases(unittest.TestCase):
                 (directory / 'om').mkdir()
                 fake_om = directory / 'om/test.om'
                 fake_om.write_bytes(b'synthetic ACL stub OM, not a compiled device model')
-                runner.write_model_binding(paths['bin'], str(fake_om))
+                write_test_binding(paths['bin'], str(fake_om))
             env = dict(os.environ, PYTHON=sys.executable)
             result = subprocess.run(['bash', str(ROOT / 'tests/stub_ascendcl/run_stub_test.sh'),
                                      '--out-root', str(output), '--work-dir', str(Path(temp) / 'stub')],
@@ -371,7 +386,7 @@ class StubSelection(unittest.TestCase):
         (directory / 'om').mkdir()
         model = directory / 'om/model.om'
         model.write_bytes(b'synthetic stub OM')
-        runner.write_model_binding(str(case), str(model))
+        write_test_binding(str(case), str(model))
         return directory.resolve()
 
     def test_supports_plain_and_config_directory_without_pairing_mistakes(self):

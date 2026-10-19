@@ -57,8 +57,8 @@ class FilterContract(unittest.TestCase):
                     self.assertEqual(len(tensors[name][2]), width * dims[0] * dims[1] * dims[2] * dims[3])
                 self.assertEqual(tensors["filter1"][2], tensors["w1_nchw"][2])
                 model = fc2d_onnx.build_model(plan, tensors)
-                self.assertEqual(len(model.graph.input), 7)
-                self.assertEqual(len(model.graph.node[0].input), 9)
+                self.assertEqual(len(model.graph.input), 3 if mode == "fp16" else 5)
+                self.assertEqual(sum(node.op_type == "Conv" for node in model.graph.node), 2)
                 initializers = {t.name: t for t in model.graph.initializer}
                 self.assertEqual(set(initializers), {"filter1", "filter2"})
                 self.assertEqual(list(initializers["filter2"].dims), [2, 64, 3, 1])

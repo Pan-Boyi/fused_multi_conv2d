@@ -56,6 +56,17 @@ class NativeTilingCapture(unittest.TestCase):
         record['result']['tiling_data'] = struct.pack('<78I', *words).hex()
         self.assertEqual(tool.check_tiling(spec, record)['fields']['fixedShift2'], 37)
 
+    def test_only_shifts_consumed_by_each_dtype_path_are_compared(self):
+        spec, record = self.corrected('a16w8')
+        spec['shift2'] = 0
+        self.assertEqual(tool.check_tiling(spec, record)['fields']['fixedShift1'],29)
+        spec, record = self.corrected('fp16')
+        spec.update(dtype_mode=1, shift1=0, shift2=0)
+        self.assertEqual(tool.check_tiling(spec, record)['tiling_data_bytes'],312)
+        spec['dtype_mode'] = 0
+        with self.assertRaisesRegex(ValueError,'fixedShift1'):
+            tool.check_tiling(spec,record)
+
     def test_rejects_old_string_contract_wrong_enum_types_and_nonzero_codes(self):
         spec, good = self.corrected('fp16')
         for name, old in (('data_format','NCHW'),('round_mode','rint'),('pad_mode','SPECIFIC')):

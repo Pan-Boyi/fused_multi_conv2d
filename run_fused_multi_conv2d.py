@@ -91,7 +91,7 @@ REC_FMT = "<16sII4qQ"           # name, dtype, ndim, dims[4], nbytes
 REC_LEN = struct.calcsize(REC_FMT)
 
 # Case existence lists include constant filters for reference generation. They do
-# not define graph runtime order; model_input_slots supplies that seven-input order.
+# not define graph runtime order; model_input_slots supplies the consumed inputs.
 ORDER = ["x", "filter1", "bias1", "filter2", "bias2"]
 INPUT_SLOTS = ["x", "filter1", "filter2", "bias1", "bias2",
                "quant_scale1", "quant_scale2", "dequant_scale2",
@@ -115,26 +115,12 @@ DTYPE_A16W8 = 3
 
 
 def model_input_slots(info):
-    """这条 dtype 通路 + bias 配置下，om **实际**要的输入，按 IR 顺序。
-
-    必须和 fc2d_onnx.tensor_plan 的槽位取舍逐项一致 —— 两边是同一个约定的两份
-    实现。为什么不 import：运行器要能单独跑在板子机上，do_push 只拷 case.bin /
-    .om / .fc2d.json / 这个文件过去，import 不到 fc2d_onnx。
-    （同样的理由让 SPEC_KEYS 也有两份抄本，见 _check_spec_keys_in_sync。）
-    """
-    # 三个运行时 list 都恒长：bias 恒两个（bias_mask 说哪些是真的）、scale 恒两个
-    # （dtype 组合说哪张会被读）、relu_weight 恒两个（算子目前一张都不读）。
-    # **DYNAMIC 输入的实例数不能是 0**，所以「没有」不能用「少给张量」表达 ——
-    # 详见 fc2d_onnx.tensor_plan 里那段。
-    # Both filter instances are constants inside the graph.
-    slots = ["x", "bias1", "bias2", "quant_scale1"]
-    # instance 1 的名字按这条通路上的用途取。
-    if info["dtype_mode"] in (DTYPE_S8F16, DTYPE_A16W8):
-        slots.append("dequant_scale2")
-    else:
-        slots.append("quant_scale2")
-    # relu_weight 的两个实例：恒是占位，case.bin 里没有，按模型报的字节数补零。
-    slots += ["relu_weight1", "relu_weight2"]
+    """Actual external Data nodes; missing list instances are Const nodes made by the pass."""
+    slots = ["x"]
+    if info["bias"]:
+        slots += ["bias1", "bias2"]
+    if info["dtype_mode"] != DTYPE_FP16:
+        slots += ["quant_scale1", "dequant_scale2" if info["dtype_mode"] in (DTYPE_S8F16, DTYPE_A16W8) else "quant_scale2"]
     return slots
 
 
@@ -146,7 +132,40 @@ def _file_sha256(path):
     return digest.hexdigest()
 
 
-def write_model_binding(case_path, om_path, expected_case_sha256=None):
+def _binding_spec(path):
+    with open(path, "rb") as stream:
+        header = stream.read(HDR_LEN)
+    if len(header) != HDR_LEN:
+        die("truncated case header")
+    values = struct.unpack(HDR_FMT, header)
+    if values[0] != b"FC2DCASE" or values[1] != CASE_VERSION:
+        die("binding requires case ABI 8")
+    return dict(zip(SPEC_KEYS, values[6:6 + SPEC_N]))
+
+
+def _valid_fusion_report(report, names):
+    if not isinstance(report, dict):
+        return False
+    expected = {"pass_name": "ExtendConv2DPairToFusedMultiConv2DFusionPass",
+                "stage1_pass_name": "Conv2DFixPipeToExtendConv2DFusionPass",
+                "fused_node_count": 1, "unfused_convolution_count": 0, "input_names": names,
+                "source_conv_count": 2, "stage1_extend_count": 2}
+    if any(report.get(key) != value for key, value in expected.items()):
+        return False
+    for key in ("source_graph_sha256", "stage1_graph_sha256", "model_graph_sha256"):
+        value = report.get(key)
+        if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+            return False
+    tiling = report.get("native_tiling")
+    if not isinstance(tiling, dict) or tiling.get("tiling_data_bytes") != 312:
+        return False
+    digest = tiling.get("tiling_data_sha256")
+    if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        return False
+    return True
+
+
+def write_model_binding(case_path, om_path, expected_case_sha256=None, fusion_report=None):
     """Bind a constant-weight OM to the exact case used during compilation."""
     with open(case_path, "rb") as stream:
         header = stream.read(12)
@@ -155,10 +174,14 @@ def write_model_binding(case_path, om_path, expected_case_sha256=None):
     case_sha = _file_sha256(case_path)
     if expected_case_sha256 is not None and case_sha != expected_case_sha256:
         die("case SHA256 changed during compilation; regenerate case and OM")
-    # Schema 3 binds the renamed OpType as well as the per-layer integer enum contract.
-    binding = {"schema_version": 3, "op_type": "FusedMultiConv2d", "case_abi": CASE_VERSION, "weight_mode": "constant",
-               "model_input_count": 7, "model_sha256": _file_sha256(om_path),
-               "case_sha256": expected_case_sha256 or case_sha}
+    info = _binding_spec(case_path)
+    names = model_input_slots(info)
+    if not _valid_fusion_report(fusion_report, names):
+        die("verified production fusion report is required; rebuild through canndev PR 82567")
+    binding = {"schema_version": 4, "op_type": "FusedMultiConv2d", "case_abi": CASE_VERSION,
+               "pipeline": "onnx_conv_pair_fusion", "weight_mode": "constant", "model_input_count": len(names),
+               "model_input_names": names, "fusion": fusion_report,
+               "model_sha256": _file_sha256(om_path), "case_sha256": expected_case_sha256 or case_sha}
     path = om_path + ".fc2d.json"
     with open(path + ".tmp", "w") as stream:
         json.dump(binding, stream, indent=2, sort_keys=True)
@@ -175,9 +198,14 @@ def validate_model_binding(case_path, om_path):
             binding = json.load(stream)
     except (OSError, ValueError) as exc:
         die("missing or invalid case/OM binding %s: %s; regenerate case and OM" % (path, exc))
-    contract = {"schema_version": 3, "op_type": "FusedMultiConv2d", "case_abi": CASE_VERSION, "weight_mode": "constant", "model_input_count": 7}
+    contract = {"schema_version": 4, "op_type": "FusedMultiConv2d", "case_abi": CASE_VERSION, "weight_mode": "constant", "pipeline": "onnx_conv_pair_fusion"}
     if not isinstance(binding, dict) or any(binding.get(k) != v for k, v in contract.items()):
-        die("unsupported binding; regenerate the seven-input constant-weight OM")
+        die("unsupported binding; regenerate OM through the production GE fusion pass")
+    info = _binding_spec(case_path)
+    names = model_input_slots(info)
+    proof = binding.get("fusion", {})
+    if binding.get("model_input_count") != len(names) or binding.get("model_input_names") != names or not _valid_fusion_report(proof, names):
+        die("invalid fusion/input contract; regenerate OM")
     if binding.get("model_sha256") != _file_sha256(om_path):
         die("OM SHA256 differs from its binding; regenerate case and OM")
     if binding.get("case_sha256") != _file_sha256(case_path):
@@ -185,21 +213,9 @@ def validate_model_binding(case_path, om_path):
     return binding
 
 
-# 恒长占位槽的 dtype 编号（DTYPE_NAME/DTYPE_SIZE 那张表里的编号）。
-# **只进日志**：真正下发的是字节数，按模型自己报的大小补零。但日志里报错 dtype
-# 会让人把「占位」当成「喂错了表」，所以还是按声明的类型写对。
-PLACEHOLDER_DTYPE = {
-    "quant_scale1": 10,    # uint64
-    "quant_scale2": 10,
-    "dequant_scale2": 10,
-    "relu_weight1": 0,     # float32
-    "relu_weight2": 0,
-}
-PLACEHOLDER_ELEM = {10: 8, 0: 4}
-
 
 def runtime_input_slots(info):
-    """Validate case tensor names and return the seven graph runtime inputs."""
+    """Validate case tensor names and return the consumed graph runtime inputs."""
     unknown = set(info["order"]) - set(INPUT_SLOTS)
     if unknown:
         die("case 里有不属于 FusedMultiConv2d 的输入: %s" % sorted(unknown))
@@ -1097,9 +1113,9 @@ def main():
         dtype, dims, data = tensors[name]
         print("  %-9s %-6s %-16s %9d 字节" % (name, DTYPE_NAME[dtype], dims, len(data)))
     slots = runtime_input_slots(info)
-    print("模型运行输入（7 个；两张 filter 是 OM 常量，算子有 9 个输入实例）:")
+    print("模型运行输入（%d 个；两张 filter 是 OM 常量）:" % len(model_input_slots(info)))
     for i, name in enumerate(slots):
-        print("  %d: %s%s" % (i, name, "" if name in tensors else " <零占位>"))
+        print("  %d: %s" % (i, name))
     if info["outInt8"]:
         print("量化系数（header 调试元数据；实际以 per-channel uint64 张量下发）: "
               "quant_scale1=%.9g quant_scale2=%.9g  relu=%s  bias=%s"
@@ -1118,7 +1134,7 @@ def main():
         # 只是打出来给人看。属性在编 om 那一步就烘进 om 了，板侧不下发
         # （见下面 aclmdlAddDatasetBuffer 那段）。算子侧的名字是 fixed_shift_value，
         # 一个 ListInt、每层一项。
-        print("定点定标（来自 header，编 om 时作为 private fixed_shift_value=[%d, %d] 烘进 om）"
+        print("定点定标契约（来自 header，编译时核对真实 tiling）fixed_shift_value=[%d, %d]"
               % (shift1, shift2))
         print("            对应累加器定标 2^%d / 2^%d —— 属性越大定标越小，别搞反"
               % (FIX_SHIFT_LEN - shift1, FIX_SHIFT_LEN - shift2))
@@ -1128,7 +1144,7 @@ def main():
 
     if om_file is not None:
         validate_model_binding(case_path, om_file)
-        print("  case/OM SHA256 binding verified (constant filters, 7 graph inputs)")
+        print("  case/OM SHA256 and production fusion binding verified")
     elif not dry_run:
         die("provide a freshly compiled constant-weight OM and its .fc2d.json binding")
 
@@ -1197,8 +1213,8 @@ def main():
         n_in = int(acl.aclmdlGetNumInputs(mdesc))
         n_out = int(acl.aclmdlGetNumOutputs(mdesc))
         print("  aclmdlLoadFromFile OK: model_id=%d, %d 个输入, %d 个输出" % (model_id, n_in, n_out))
-        if n_in != 7:
-            die("model has %d inputs; require the seven-input constant-weight graph, regenerate OM" % n_in)
+        if n_in != len(model_input_slots(info)):
+            die("model has %d inputs; differs from the verified fusion graph, regenerate OM" % n_in)
         if n_out != 1:
             die("这个模型报了 %d 个输出，FusedMultiConv2d 只有一个 y" % n_out)
 
@@ -1226,28 +1242,12 @@ def main():
         # ---- 按**模型自己报的**输入表喂数据 ----
         # 和单算子 om 的本质差别：单算子那套「槽位不能压缩、q1/q2 不能左移」的规则
         # 在这条路上不适用 —— 那条规则是 aclopExecuteV2 按 numInputs 匹配 .om 带来的。
-        # Graph inputs are x and two instances of bias/scale/relu_weight.
-        # Both filter instances are constants inside the OM.
-        # The graph always exposes seven inputs. bias_mask disables the unused
-        # bias values, and scale/relu_weight placeholders preserve both list instances.
+        # Unused bias/scale/relu_weight instances are internal Const nodes
+        # created by the production pass; they are not runtime placeholders.
         present = model_input_slots(info)
-        # 有两类**纯占位**输入，恒长要求图里必须有它们，但 gen_case 不产：
-        #   * 全 fp16 通路的两个 scale 实例 —— 这条通路不用定标表
-        #   * relu_weight 的两个实例 —— 斜率表在算子侧还没落地，恒不被读
-        # 按模型自己报的字节数现合成零缓冲。算子一次都不会去读它们（scale 那两个
-        # 是 kernel 入口的 if constexpr 在编译期剪掉的，relu_weight 是 host 侧
-        # tiling 把用到它的 relu 模式拒掉的）。
-        #
-        # 只允许这几个槽缺；别的槽缺了是真问题，要出声。
-        placeholder_ok = {"quant_scale1", "quant_scale2", "dequant_scale2",
-                          "relu_weight1", "relu_weight2"}
-        missing = [n for n in present if n not in tensors]
-        unexpected = [n for n in missing if n not in placeholder_ok]
-        if unexpected:
-            die("这条通路要喂 %s，但 case.bin 里没有：%s" % (present, unexpected))
+        missing = [name for name in present if name not in tensors]
         if missing:
-            print("  （%s 是恒长要求的占位输入，case.bin 里没有，按零缓冲喂）"
-                  % ", ".join(missing))
+            die("case.bin missing graph inputs: %s" % missing)
 
         # **优先按名字定位下标，不赌模型的输入顺序。** om 的模型输入名就是 onnx 图的
         # 输入名，而那又是 case.bin 里的张量名 —— fc2d_onnx.py 刻意让三者同名，
@@ -1288,30 +1288,17 @@ def main():
                 raw = name_by_idx(mdesc, i)
                 if raw:
                     mn = raw.decode("utf-8", "replace")
-            if slot in tensors:
-                data = tensors[slot][2]
-                mark = "OK" if len(data) == nb else "** 模型要 %d，case.bin 给 %d **" % (nb, len(data))
-                if len(data) != nb:
-                    bad = True
-                src = "case.bin 的 %-16s" % slot
-            else:
-                # 恒长占位：按模型报的字节数补零，所以字节数天然对得上。
-                mark = "OK（零占位）"
-                src = "零缓冲占位    %-6s" % ""
+            data = tensors[slot][2]
+            mark = "OK" if len(data) == nb else "** 模型要 %d，case.bin 给 %d **" % (nb, len(data))
+            if len(data) != nb:
+                bad = True
+            src = "case.bin 的 %-16s" % slot
             print("  [%d] 模型说 %-16s <- %s %9d 字节  %s" % (i, mn, src, nb, mark))
         if bad:
             die("输入字节数和模型要的对不上。顺序错了也会这样 —— 上面那张表就是模型要的顺序。")
 
         for i, slot in enumerate(feed):
-            if slot in tensors:
-                dtype, dims, data = tensors[slot]
-            else:
-                # 恒长占位。dtype/dims 只用于日志，真正下发的是字节数，所以直接
-                # 按模型报的大小补零。
-                nb = int(acl.aclmdlGetInputSizeByIndex(mdesc, i))
-                dtype = PLACEHOLDER_DTYPE.get(slot, 10)
-                dims = [nb // PLACEHOLDER_ELEM.get(dtype, 8)]
-                data = bytes(nb)
+            dtype, dims, data = tensors[slot]
             make_operand(dtype, dims, data)
 
         # 输出缓冲预填哨兵 127：kernel 一个字节都没写的话，读回来还是 127，
@@ -1337,18 +1324,10 @@ def main():
 
         # **属性不下发。** 图 om 的属性在编译期就烘进去了，aclmdlExecute 不吃属性。
         # 定标 fixed_shift_value 是私有 ListInt，每层一项；A16W8 仅使用第一项。
-        # ONNX 插件将内部定标配置写入 GE PrivateAttr；kernel 数值语义保持不变。
-        # 必填的是 bias_mask；dtype 默认 -1 跟随 x；strides / pads 缺省表示步长1、无补边。
-        # 它们由编 om 那一步（fc2d_onnx.tensor_plan）给。另有七个从 ExtendConv2d
-        # 继承、声明了但还不支持的属性（dilations / groups / data_format /
-        # offset_x / round_mode / pad_mode / enable_hf32），都发 IR 缺省值。
-        # 于是「下发的属性集和编 .om 时那份对不上 -> MatchOpModel fail -> 报成 100024
-        # 算子没找到」这一整类失败不存在了 —— 那是 aclopExecuteV2 按 op 类型 +
-        # shape/dtype/format + **全部 attr 的值**一起匹配 .om 带来的。
-        # 现在属性的唯一来源是编 om 那一步（fc2d_onnx.tensor_plan），两边不可能不一致。
-        #
-        # 仍然打出来：它是"这个 .om 到底是按什么几何编的"的唯一人读线索，
-        # 而且 om 里没有地方能直接看到这些值。
+        # 融合后的真实 native tiling 必须与 case 的有效定标一致，运行器不覆写属性。
+        # Geometric attributes and fixed-point calibration below describe the
+        # case contract. Compilation verified the actual native tiling before
+        # writing the binding; no attributes are changed during execution.
         attr = None
         kh2 = info.get("kh2") or info["kh"]
         kw2 = info.get("kw2") or info["kw"]
@@ -1356,7 +1335,7 @@ def main():
         # —— dtype 给错会把整条通路从「int8 出口 VREQ8」换成「fp16 出口 VDEQF16」
         # 而 om 照样编得过去；bias_mask 给错会静默多加或少加一次 bias。
         # 板上拿到错数时，这一行是唯一能核对「om 到底按什么编的」的地方。
-        # 两个值的算法必须和 fc2d_onnx.tensor_plan 一致。
+        # 与融合后 tiling 验证采用同一份 case spec。
         dtype_echo = 2 if info["outInt8"] else 1   # ge::DataType: fp16=1, int8=2
         # bias_mask 现在是**每层一项的列表**（算子侧是 ListBool），不再是整数位掩码。
         bias_mask_echo = [1, 1] if info["bias"] else [0, 0]

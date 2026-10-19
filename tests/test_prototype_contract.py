@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 import fc2d
 import fc2d_onnx
 import run_fused_multi_conv2d as runner
+from fusion_test_support import write_test_binding
 
 
 class PrototypeContract(unittest.TestCase):
@@ -70,9 +71,10 @@ class PrototypeContract(unittest.TestCase):
             plan=fc2d_onnx.tensor_plan(spec); model=fc2d_onnx.build_model(plan,tensors)
             for name in fc2d.MAPPED_ENUM_VALUES:
                 self.assertEqual(case[name],[0,0]);self.assertEqual(plan['attrs'][name],[0,0])
-                attr=next(a for a in model.graph.node[0].attribute if a.name==name)
-                self.assertEqual(attr.type,7)  # ONNX INTS, not STRING or INT.
-                self.assertEqual(list(attr.ints),[0,0])
+                # Mapped enums belong to the target IR. Source nodes keep the
+                # standard ONNX Conv geometry and are never directly fused targets.
+                self.assertEqual(sum(n.op_type == 'Conv' for n in model.graph.node),2)
+                self.assertNotIn('FusedMultiConv2d',[n.op_type for n in model.graph.node])
 
     def test_mapped_enum_lengths_types_and_unsupported_modes_are_rejected(self):
         for name, mapping in fc2d.MAPPED_ENUM_VALUES.items():
@@ -93,9 +95,9 @@ class PrototypeContract(unittest.TestCase):
             case=fc2d.normalise(dict(dtype='int8',hi=8,wi=9,cout2=2),0)
             subprocess.run(fc2d.gen_case_argv(case,str(path)),check=True,stdout=subprocess.DEVNULL)
             model.write_bytes(b'synthetic model')
-            binding_path=runner.write_model_binding(str(path),str(model))
+            binding_path=write_test_binding(str(path),str(model))
             binding=json.loads(Path(binding_path).read_text())
-            self.assertEqual(binding['schema_version'],3)
+            self.assertEqual(binding['schema_version'],4)
             binding['schema_version']=1
             Path(str(model)+'.fc2d.json').write_text(json.dumps(binding))
             with contextlib.redirect_stdout(io.StringIO()),self.assertRaises(SystemExit):
@@ -108,7 +110,7 @@ class PrototypeContract(unittest.TestCase):
             raw=bytearray(path.read_bytes()); struct.pack_into('<I',raw,8,7);path.write_bytes(raw)
             model=Path(temp)/'case.om';model.write_bytes(b'synthetic test model')
             for call in (lambda:fc2d.read_spec(str(path)),lambda:runner.load_case(str(path)),
-                         lambda:runner.write_model_binding(str(path),str(model))):
+                         lambda:write_test_binding(str(path),str(model))):
                 with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit): call()
 
 if __name__=='__main__': unittest.main()

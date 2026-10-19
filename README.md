@@ -32,6 +32,57 @@ python3 fc2d.py cases.json --steps run
 
 产物默认在 `out/<json 名>/<case 名>/`：`case.bin`（输入 + golden）、`.onnx`、`om/*.om`、`om/*.om.fc2d.json`。
 
+## 两阶段融合验证
+
+源 ONNX 只构造两个连续的 `Conv`，两张 filter 保存真实 NCHW 形状并作为 initializer。
+按用例加入 `AscendRequant`、`AscendDequant` 和 `Relu`，由已安装 CANN 中的原始 Pass 完成：
+
+```text
+Conv + [重定标/反量化] + [Relu] -> Conv + [重定标/反量化] + [Relu]
+                         ↓ 一阶段
+             ExtendConv2D -> ExtendConv2D
+                         ↓ 二阶段
+                  FusedMultiConv2d
+```
+
+harness 不创建 ExtendConv2D/FusedMultiConv2d 源节点，不依赖 FusedMultiConv2d 的 ONNX
+解析插件，也不实现或修改融合 Pass。量化节点使用 CANN 内置的 ONNX 解析器。
+一阶段显式启用 `Conv2DFixPipeToExtendConv2DFusionPass`；
+二阶段使用 [canndev PR 82567](https://gitcode.com/cann/canndev/pull/82567/diffs)
+的 `ExtendConv2DPairToFusedMultiConv2DFusionPass`，编译时显式打开对应开关。
+
+`om` 步骤包含两次编译，以区分两个阶段：
+
+1. 关闭二阶段 Pass 编译同一份源 ONNX，导出 OM JSON，要求恰好两个 ExtendConv2D，且 y0 直接连接下一节点的 x。这份诊断 OM 留在独立目录，不上传执行。
+2. 开启二阶段 Pass，再编译同一份源 ONNX，要求最终只有一个 FusedMultiConv2d，不残留原卷积、量化或 ReLU 计算节点。最终模型放在原有 `om/` 目录。
+3. 捕获第二次编译的官方 native tiling 返回值，核对真实几何、bias、ReLU、blockDim，以及 fp16/A16W8 实际使用的定标值。私有属性由 CANN 产生，harness 不注入或覆盖。
+4. 全部通过后才写 schema **4** 的绑定，保存 case/OM、源 ONNX、两个阶段图 JSON 和 tiling 的哈希。任一步失败，都不会留下可被上传或执行的绑定。
+
+每次编译在 case 目录创建独立的 `fusion_*` 证据目录，保存两个开关文件、ATC 日志、
+图 JSON、原始 tiling 和 `fusion_verification.json`。旧 schema 1/2/3 的直接构图模型必须重编。
+case ABI 仍为 **8**，原有数据生成、golden、精度阈值及 profiling 步骤保持不变。
+
+先使用专门的零 padding 小用例检查当前 CANN 包：
+
+```bash
+python3 run_profile.py profile.json --cases fusion_cases.json \
+  --only fusion_int8 --steps check,case,om
+python3 run_profile.py profile.json --cases fusion_cases.json \
+  --steps check,case,om,push,prof --no-msprof --keep-going
+```
+
+本地不具备新 CANN 时，仍可运行 `python3 -m unittest discover -s tests -v` 以及
+`python3 fc2d.py fusion_cases.json --steps check,case`；真实两阶段 OM 和实板结果需要在 A/B 验证。
+测试中的 synthetic OM 和 ACL 桩只验证框架链路，不能作为融合或设备精度证据。
+
+**原始 PR 的约束需要由真实编译确认。** 已提供的 PR 82567 diff 只接受零 padding，
+A16W8 还要求两张 filter 的生产节点都是原始 `RearrangeA16W8WeightFzOp`；这些节点必须由
+CANN 的上游处理生成。该 diff 没有向 FusedMultiConv2d 传递 `fixed_shift_value`，因此原型
+默认 `[0,0]` 不能满足历史 fp16 `42/42`、A16W8 首项 `29` 的契约，tiling 检查会明确失败。
+`fusion_cases.json` 的这两条仍保留非零工作点，用来检查实际安装包是否解决了定标传递。
+纯 fp16 未带 ReLU 的层也可能无法命中一阶段 Fixpipe 融合。harness 保留原用例的语义，
+不修改 padding、定标、ReLU，不伪造权重重排节点，也不退回直接构造融合目标。
+
 ## 上板 + profiling：run_profile.py
 
 `fc2d.py` 假设你在同一台机器上出 `.om` 又跑。真实情况常常是两台：一台有 CANN 和
@@ -50,7 +101,7 @@ python3 run_profile.py profile.json
 | :-- | :-- | :-- |
 | `check` | 本地 | 形状预检 |
 | `case` | 本地 | 生成 `case.bin` |
-| `om` | 本地 | 从 ABI 8 case 生成含常量 filters 的 ONNX，跑 `atc --framework=5`，写 OM/case SHA256 binding |
+| `om` | 本地 | 生成双 Conv ONNX，验证两阶段融合和 native tiling，写 schema-4 binding |
 | `push` | 本地 -> 远端 | 每条 case 一个干净目录,拷 `case.bin`、`.om`、`.om.fc2d.json`、`run_fused_multi_conv2d.py` |
 | `prof` | 远端 | `$MSPROF bash <runner wrapper>`，分别记录 runner 与 profiler 返回码，并找出**本次**新生成的 `PROF_*`。`$MSPROF` 是 `profile.msprof` 给死的绝对路径(缺省 `/var/msprof`),**不搜 PATH** —— 远端那个 ssh 是非交互 shell,读不到 `~/.bashrc` 里 source 的 `set_env.sh`,搜 PATH 会说「没有 msprof」而其实装着。指向 msprof 那个可执行文件本身。 |
 | `pull` | 远端 -> 本地 | 把那个 `PROF_*` 拉回 `prof_out/<json 名>/<case 名>/` |
@@ -61,9 +112,9 @@ python3 run_profile.py profile.json
 
 - **`run_fused_multi_conv2d.py` 每次都重新拷过去。** 它和 `case.bin` 的格式是配套的,
   远端留着一份旧的会报「case 文件版本 N,本脚本认 M」,而那时人往往已经在查算子了。
-- **图模型有 7 个运行输入。** 顺序为 x、bias1、bias2、scale1、scale2、
-  relu_weight1、relu_weight2。scale2 按 dtype 使用 quant_scale2 或 dequant_scale2；
-  未使用的辅助值补零。两个 filters 固定在 OM 内，算子节点仍有 9 个输入实例。
+- **图模型有 1、3 或 5 个运行输入。** x 必有；启用 bias 时增加 bias1/bias2；
+  量化通路增加 scale1/scale2。scale2 按 dtype 使用 quant_scale2 或 dequant_scale2。
+  未使用的 list 实例由原始融合 Pass 创建为 Const，不需要外部零缓冲。两个 filters 固定在 OM 内，目标算子仍有 9 个输入实例。
 - **上传和执行前都校验完整 case/OM SHA256。** prof-only 也会核对远端产物是否
   等于本地选中的 binding；旧模型或修改过的 case 必须重新编译 OM。
 - **每条 case 在远端使用独立目录。** 上传 case、唯一 OM、sidecar 和配套 runner。
@@ -102,14 +153,14 @@ python3 run_profile.py profile.json
 
 ## 为什么是一个 json 而不是三处
 
-case.bin 保存逻辑输入、golden 和属性 spec。ONNX 从这份 spec 读取公开属性与
-私有定标值，两张逻辑 NCHW filter 作为常量进入编译，GE 在编译期转成 FRACTAL_Z。
-模型只接收 7 个运行输入，属性已经写入 OM。运行器在加载 ACL 前校验
-`<model.om>.fc2d.json`，以完整 case 与 OM 的 SHA256 防止错配。
+case.bin 保存逻辑输入、golden 和属性 spec。ONNX 从它派生两个 Conv 的计算、
+逻辑 NCHW 常量权重和必要的 bias/scale 输入。GE 负责布局转换和两阶段融合，
+harness 在写绑定前核对最终图和真实 tiling。运行器在加载 ACL 前校验 schema-4
+`<model.om>.fc2d.json` 中完整 case 与 OM 的 SHA256 以及融合证据摘要。
 
 ```text
-case 配置 -> gen_case -> ABI 8 case.bin -> ONNX -> ATC -> OM + binding
-                                                        -> 上传 -> runner
+case 配置 -> gen_case -> ABI 8 case.bin -> 双 Conv ONNX
+  -> ATC 原始两阶段融合 -> 最终 OM + 验证证据 + binding -> 上传 -> runner
 ```
 
 修改 case 的形状、dtype、weights、golden 或属性后都要重新生成 ONNX/OM/binding。
@@ -174,7 +225,7 @@ PROF 或 binding 不匹配时明确失败。`export/parse` 不连接远端。重
 只有前者过、后者不过，说明卷积算对了但定点模型猜错了 —— 是两件不同的事。
 
 `fixed_shift_value` 为统一的私有 ListInt，默认 `[0,0]`；原型不公开该属性。
-ONNX 插件或融合阶段将其写入 GE，tiling 校验后下发。全 fp16 两项范围 `[0,58]`，
+由 CANN 融合及编译阶段产生，harness 只验证 native tiling，不通过 ONNX 属性传入。全 fp16 两项范围 `[0,58]`，
 A16W8 第一项范围 `[0,29]`、第二项不参与计算。旧 `fixed_shift`、`a16w8_shift` 名称不再接受。
 历史数值用例显式保留原有工作点；原型默认零需要按实际输入进行标定，不能直接代替原工作点。
 
@@ -213,6 +264,9 @@ python3 run_fused_multi_conv2d.py out/base_fp16/case.bin FusedMultiConv2d 0 out/
 | `profile.json` | **你要改的就是这个**：dtype、形状、可选属性、远端信息 |
 | `run_profile.py` | 总驱动，八步 |
 | `fc2d.py` | 被 `run_profile.py` import；也能单独跑单机流程 |
+| `fc2d_onnx.py` | 从 case 构造双 Conv 源图、常量 filters 与必要输入 |
+| `fc2d_fusion.py` | 核对源图及两个阶段的编译图，不实现融合 |
+| `fusion_cases.json` | 两阶段融合的四 dtype 零 padding 小用例 |
 | `gen_case.cpp` | 编成 `gen_case`，按形状生成 `case.bin`（输入 + golden）|
 | `fused_multi_conv2d_golden.h` | 两条通路的 CPU golden，被 `gen_case.cpp` include |
 | `fc2d_geom.cpp` | 编成 `fc2d_geom`，形状预检 |
@@ -289,7 +343,7 @@ python3 fc2d.py contract_cases.json --steps om --soc <soc_version>
 bash tests/stub_ascendcl/run_stub_test.sh --out-root out/contract_cases
 ```
 
-`contract_cases.json` 覆盖四 dtype、缺省几何、对称 pads、两层不同非方核、真实 Cout2=2、
+`fusion_cases.json` 用于两阶段融合入口检查；`contract_cases.json` 保留算子契约覆盖，包含四 dtype、缺省几何、对称 pads、两层不同非方核、真实 Cout2=2、
 私有 shift 与独立 bias/relu。测试中的 synthetic ATC/OM 只验证框架控制流；ACL 桩复制
 golden 到输出，不代表设备计算正确或性能结果。真实精度和 profiling 按
 HARDWARE_VALIDATION_WORKFLOW.md 在服务器 A/B 执行。
@@ -302,20 +356,21 @@ The ONNX builder embeds both tensors as initializers. GE folds them to FRACTAL_Z
 at compilation and preserves their origin shape/format; kernel dimensions and
 true Cout2 are inferred from that metadata. kernel_size is removed.
 
-The operator retains nine input ports. Its compiled graph has seven runtime
-inputs: x and two instances each of bias, scale and relu_weight. Both filters
-are fixed in the OM. This path avoids the unavailable runtime NCHW-to-FRACTAL_Z
-TransData engine in the locally validated MC62 SDK. ATC uses input_format=NCHW;
-bias/scale/relu_weight remain one-dimensional ND inputs.
+The target operator retains nine input ports. The source graph exposes x and
+only consumed bias/scale tensors (1/3/5 runtime inputs). Unused instances become
+internal Const nodes created by the production pass. The two filters are embedded
+as logical NCHW initializers and GE handles FRACTAL_Z conversion. The frontend
+uses built-in Conv and Ascend quantization ONNX parsers, with input_format=NCHW.
+It contains neither ExtendConv2D nor FusedMultiConv2d.
 
 Regenerate ABI 6 cases with the matching gen_case (ABI 8) and rebuild ONNX/OM
-with the new operator package. Both case readers reject old versions. Cout2=2
+with the CANN package containing both original fusion stages. Both case readers reject old versions. Cout2=2
 stays two logical output channels while internal FRACTAL_Z weights pad to 16.
 Measure performance again using freshly compiled models.
 
 The OM step writes `<model.om>.fc2d.json` with SHA256 hashes of the OM and complete
 case.bin. The runner checks both hashes before loading ACL and rejects old
-nine-input models. Copy case.bin, the OM, binding file and runner together;
+direct-graph model bindings. Copy case.bin, the OM, binding file and runner together;
 run_profile.py uploads all four. Changing weights, attributes, geometry or any
 case data requires a new case/ONNX/OM/binding.
 
@@ -335,10 +390,10 @@ The three attributes now use two-entry ListInt values, defaulting to [0,0]:
 Each entry belongs to one convolution. Only zero is implemented; other defined codes,
 including NOTSET=5, are reserved and rejected. Unknown codes, scalar strings/integers,
 and lists whose length is not two are rejected. JSON case configuration accepts these
-three keys as [0,0]; the generated ONNX encodes them as INTS.
+three keys as [0,0]; they describe the expected fused IR. The source uses standard ONNX Conv geometry.
 
 Case ABI remains 8 because geometry and tensor payloads are unchanged. Model binding
-schema is now 3 and records `op_type: FusedMultiConv2d`; older bindings and OMs must be regenerated.
+schema is now 4 and records `op_type: FusedMultiConv2d`, the actual input names, both fusion stages and native tiling evidence; older bindings and OMs must be regenerated.
 The operator directory is `conv/fused_multi_conv2d`, the kernel entry is `fused_multi_conv2d`,
 and the generated ACLNN prefix is `aclnnFusedMultiConv2d`.
 Existing ABI-8 cases may be used as compilation input, but regenerate ONNX, OM and binding
@@ -362,7 +417,7 @@ python3 tools/verify_fc2d_atc_tiling.py out/profile/base_fp16/case.bin \
 ```
 
 输出目录必须是新目录。工具复制 case、生成 fresh ONNX/OM，并在本次 ATC
-进程内记录官方 `do_op_tiling` 的原始返回值，核对 312 字节 tiling 中的实际 shift、
+进程内记录官方 `do_op_tiling` 的原始返回值，核对 312 字节 tiling 中实际使用的 shift、
 bias/relu 和 launch blockDim；不修改 SDK 文件。原始捕获与
 `tiling_verification.json` 一起保存。没有捕获、旧属性错位或不同 case 的数据会失败，
 对应 OM 的 binding 会删除，阻止它通过现有上传/运行检查。

@@ -55,10 +55,13 @@ def check_tiling(spec, record):
     if all(key in spec for key in geometry_fields) and words[6:16] != tuple(spec[key] for key in geometry_fields):
         raise ValueError('native tiling geometry differs from case kernel/stride/padding')
     tail = dict(zip(TAIL_FIELDS, words[-7:]))
-    expected = {'fixedShift1': spec['shift1'],
-                'fixedShift2': spec['shift2'], 'hasBias1': int(bool(spec['bias'])),
+    expected = {'hasBias1': int(bool(spec['bias'])),
                 'hasBias2': int(bool(spec['bias'])), 'relu1': int(bool(spec['relu1'])),
                 'relu2': int(bool(spec['relu2']))}
+    if spec['dtype_mode'] == 0:
+        expected.update(fixedShift1=spec['shift1'], fixedShift2=spec['shift2'])
+    elif spec['dtype_mode'] == 3:
+        expected.update(fixedShift1=spec['shift1'])
     for key, value in expected.items():
         if tail[key] != value:
             raise ValueError('native tiling %s=%d, expected %d; rebuild/install the corrected operator package'

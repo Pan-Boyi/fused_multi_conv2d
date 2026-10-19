@@ -5,9 +5,8 @@
 —— 桩要是自己另算一套，就会把运行器里那段「模型要的字节数 vs case.bin 给的字节
 数」核对测成假通过。
 
-Constant-weight graphs have seven runtime inputs. Filters are retained in case.bin
-for reference generation but are compiled into OM, so the stub models only x,
-bias/scale/relu_weight and their placeholders.
+Graphs expose x plus consumed bias/scale tensors (1/3/5 inputs).
+The production pass creates unused list instances as internal Const nodes.
 """
 import io
 import os
@@ -25,23 +24,10 @@ y_bytes = y_elems * (1 if info["outInt8"] else 2)
 
 
 def slot_bytes(name):
-    """这个槽在 om 里是多少字节。
-
-    不在 case.bin 里的是恒长占位，按 fc2d_onnx.tensor_plan 给它们声明的形状算：
-      * scale 的两个实例  uint64，一个通道一项 -> cout * 8
-      * relu_weight 的两个实例  float32 -> cout * 4
-    """
-    if name in tensors:
-        return len(tensors[name][2])
-    if name == "quant_scale1":
-        return int(info["cout1"]) * 8
-    if name in ("quant_scale2", "dequant_scale2"):
-        return int(info["cout2"]) * 8
-    if name == "relu_weight1":
-        return int(info["cout1"]) * 4
-    if name == "relu_weight2":
-        return int(info["cout2"]) * 4
-    raise SystemExit("不认识的槽 %s，而且 case.bin 里也没有" % name)
+    """Every exposed source input has actual data in the case."""
+    if name not in tensors:
+        raise SystemExit("case is missing runtime input " + name)
+    return len(tensors[name][2])
 
 
 os.makedirs(outdir, exist_ok=True)
@@ -52,8 +38,7 @@ with io.open(os.path.join(outdir, "stub.conf"), "w") as f:
 with open(os.path.join(outdir, "golden.bin"), "wb") as f:
     f.write(tensors["y_expect"][2])
 
-print("模型输入表（%d 个 = x + 三个 DYNAMIC list x 每层一个实例）:" % len(present))
+print("模型输入表（%d 个，x 与实际使用的 bias/scale）:" % len(present))
 for n in present:
-    tag = "" if n in tensors else "   <- 恒长占位，case.bin 里没有"
-    print("  %-16s %9d 字节%s" % (n, slot_bytes(n), tag))
+    print("  %-16s %9d 字节" % (n, slot_bytes(n)))
 print("输出 %d 字节" % y_bytes)

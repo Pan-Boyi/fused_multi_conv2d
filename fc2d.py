@@ -96,11 +96,24 @@ def step(msg):
     sys.stdout.flush()
 
 
-def run(argv):
-    """跑一个子进程。先 flush —— 输出被重定向到文件时 Python 这边是块缓冲的，
-    不 flush 的话子进程的输出会插到不相干的地方，日志读起来像另一条 case 的。"""
+def run(argv, log_path=None):
+    """Stream subprocess output and optionally retain the same output on disk."""
     sys.stdout.flush()
-    return subprocess.call(argv)
+    if log_path is None:
+        return subprocess.call(argv)
+    with open(log_path, "w") as log:
+        process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, errors="replace", bufsize=1)
+        try:
+            for line in process.stdout:
+                print(line, end="", flush=True)
+                log.write(line)
+            return process.wait()
+        finally:
+            process.stdout.close()
+            if process.poll() is None:
+                process.terminate()
+                process.wait()
 
 
 # ---------------------------------------------------------------- json -> case
@@ -297,118 +310,97 @@ def do_case(c, paths):
 
 
 def do_om(c, paths, soc):
+    """Compile the unfused source and verify both installed production passes."""
     if not shutil.which("atc"):
         die("找不到 atc。先 source <CANN>/set_env.sh")
     if not soc:
-        die("没给 soc_version。用 --soc <名字> 或设 FC2D_SOC；\n"
-            "    合法的名字就是 $ASCEND_HOME_PATH/compiler/data/platform_config 下每个 .ini 的文件名")
+        die("没给 soc_version。用 --soc 或 FC2D_SOC")
     if not os.path.isfile(paths["bin"]):
         die("%s 还没生成 —— 先跑 --steps case" % paths["bin"])
-    import run_fused_multi_conv2d as runner
-    frozen_case_sha256 = runner._file_sha256(paths["bin"])
-    read_spec(paths["bin"])
-    os.makedirs(paths["omdir"], exist_ok=True)
-
-    # 走 onnx，不走 singleop。
-    #
-    # 原因不是偏好：filters 是 DYNAMIC list，要两个实例（conv1 的核 + conv2 的核），
-    # 而 `atc --singleop` 给 DYNAMIC 输入只实例化**一个**。两轮实验、2 个算子、
-    # 3 个 SoC、4 种 json 键写法都是同一个结论：1 个实例能过 FE，>=2 个过不去。
-    # atc 的另一条前端（--framework）走完整 GE 图流水线，能表达多实例；而
-    # --mode 只有 1/5/6 三个**输出**方向的转换（model->json、ge dump->json、
-    # 显示信息），没有 json->om 的入口，所以 onnx 是 atc 这条路上唯一的选择。
-    #
-    # 这一步额外要求本机装了 onnx + protobuf 的 python 包，见文件头的依赖说明。
-    # 预检：onnx 解析插件在不在。
-    #
-    # 这是这条路最容易踩、而报错最不指向原因的一步。缺插件时 atc 报的是
-    #     E10501: IR for Op ... with optype FusedMultiConv2d is not registered
-    # 或者干脆说不认识这个节点 —— 两种都不会提「你的算子包里没有 framework/onnx」。
-    # 插件要进 vendor 包，ops-nn 侧需要 variables.cmake 里有
-    # ONNX_PLUGIN_LIB_INSTALL_DIR、且 gen_cust_symbol() 调了 gen_onnx_plugin_symbol()
-    # —— 这两处原来都缺。所以这里只警告不致命：包可能是别人编的，形态未必一样。
-    # 两种装法都要认：
-    #   * 算子**编进 CANN 内置算子库**（线上编包走这条）-> 插件在
-    #     $ASCEND_OPP_PATH/built-in/framework/onnx/，不需要 ASCEND_CUSTOM_OPP_PATH。
-    #   * 本机 `build.sh --ops=fused_multi_conv2d` 编的 **vendor 包** -> 插件在
-    #     $ASCEND_CUSTOM_OPP_PATH/framework/onnx/。
-    # 判据是**有没有插件 .so 并且里面有 FusedMultiConv2d**，不是有没有设某个环境变量 ——
-    # 按环境变量判会在内置装法上误报。
-    def _find_plugins(root):
-        hits = []
-        if not root or not os.path.isdir(root):
-            return hits
-        for d, _dirs, files in os.walk(root):
-            if os.path.basename(d) == "onnx" and "framework" in d:
-                hits += [os.path.join(d, f) for f in files
-                         if f.startswith("liboponnx_plugin") and f.endswith(".so")]
-        return hits
-
-    roots = []
-    for var in ("ASCEND_CUSTOM_OPP_PATH", "ASCEND_OPP_PATH"):
-        v = os.environ.get(var, "")
-        if v:
-            roots.append((var, v))
-    if not roots:
-        home = os.environ.get("ASCEND_HOME_PATH", "")
-        if home:
-            roots.append(("ASCEND_HOME_PATH/opp", os.path.join(home, "opp")))
-    carriers = []
-    for var, root in roots:
-        for so in _find_plugins(root):
-            try:
-                with open(so, "rb") as f:
-                    if b"FusedMultiConv2d" in f.read():
-                        carriers.append((var, so))
-            except OSError:
-                pass
-    if carriers:
-        for var, so in carriers:
-            print("  onnx 解析插件（经 %s）: %s" % (var, so))
-    elif not roots:
-        print("  [!] ASCEND_CUSTOM_OPP_PATH / ASCEND_OPP_PATH / ASCEND_HOME_PATH 一个都没设，"
-              "查不了 onnx 解析插件在不在。先 source <CANN>/set_env.sh。")
-    else:
-        print("  [!] 这些路径下找不到带 FusedMultiConv2d 的 framework/onnx/liboponnx_plugin*.so: %s"
-              % ", ".join("%s=%s" % (v, r) for v, r in roots))
-        print("      atc 多半会报 E10501「IR for Op ... is not registered」或者说不认识这个节点。")
-        print("      内置装法要确认编包时带上了 conv/fused_multi_conv2d/framework/；")
-        print("      vendor 装法要确认 ASCEND_CUSTOM_OPP_PATH 指到 <装到哪>/vendors/<name>_nn。")
-
+    import tempfile
+    from pathlib import Path
     import fc2d_onnx
-    plan, checker = fc2d_onnx.write_onnx(paths["bin"], paths["onnx"])
-    if runner._file_sha256(paths["bin"]) != frozen_case_sha256:
-        die("case SHA256 changed while generating ONNX; regenerate case and OM")
-    print("  onnx: %s（checker: %s）" % (paths["onnx"], checker))
-    # 先清空旧 .om，免得 atc 失败时目录里留着上一次形状的产物被当成这次的结果。
-    for fn in os.listdir(paths["omdir"]):
-        if fn.endswith(".om"):
-            os.remove(os.path.join(paths["omdir"], fn))
-    # ABI 8 retains logical weights in case.bin. ONNX stores them as constants;
-    # GE folds them to FRACTAL_Z, so the compiled graph has seven runtime inputs.
-    # --framework=5 下 --output 是**文件前缀**而不是目录，atc 自己补 .om。
-    out_prefix = os.path.join(paths["omdir"], c["name"])
-    cmd = ["atc", "--model=" + paths["onnx"], "--framework=5",
-           "--soc_version=" + soc, "--input_format=NCHW",
-           "--input_shape=" + fc2d_onnx.input_shape_arg(plan),
-           "--output=" + out_prefix, "--log=error"]
-    print("  " + " ".join(cmd))
-    rc = run(cmd)
-    if rc != 0:
-        die("atc 返回 %d（%s）。常见原因：\n"
-            "    * 算子包没装、或 ASCEND_CUSTOM_OPP_PATH 没指到 <装到哪>/vendors/<name>_nn\n"
-            "    * 包里没有 onnx 解析插件。内置装法查 $ASCEND_OPP_PATH/built-in/framework/onnx/，\n"
-            "      vendor 装法查 $ASCEND_CUSTOM_OPP_PATH/framework/onnx/，文件名 liboponnx_plugin_*.so。\n"
-            "      没有的话 atc 会报 E10501「IR for Op ... is not registered」或者说不认识这个节点\n"
-            "    * soc_version 不对\n"
-            "    * 这个形状被 tiling 拒了（看 ~/ascend/log/ 里的 OP_LOGE）" % (rc, c["name"]))
-    oms = [fn for fn in os.listdir(paths["omdir"]) if fn.endswith(".om")]
-    if len(oms) != 1:
-        die("atc must generate exactly one fresh OM, found %d" % len(oms))
-    binding = runner.write_model_binding(paths["bin"], os.path.join(paths["omdir"], oms[0]),
-                                         expected_case_sha256=frozen_case_sha256)
-    print("  case/OM binding: %s" % binding)
-    print("  产出: %s" % ", ".join(oms))
+    import fc2d_fusion as fusion
+    import run_fused_multi_conv2d as runner
+    from tools.verify_fc2d_atc_tiling import compilation_environment, check_capture
+    frozen = runner._file_sha256(paths["bin"])
+    spec = read_spec(paths["bin"])
+    source_sha = None
+    omdir = Path(paths["omdir"])
+    omdir.mkdir(parents=True, exist_ok=True)
+    # Invalidate previous runnable artifacts even if source generation later fails.
+    for pattern in ("*.om.fc2d.json", "*.om"):
+        for old in omdir.glob(pattern):
+            old.unlink()
+    audit = Path(tempfile.mkdtemp(prefix="fusion_", dir=str(omdir.parent)))
+
+    def unchanged():
+        if runner._file_sha256(paths["bin"]) != frozen:
+            die("case SHA256 changed during compilation; regenerate case and OM")
+        if source_sha is not None and runner._file_sha256(paths["onnx"]) != source_sha:
+            die("source ONNX SHA256 changed during compilation; regenerate OM")
+
+    def invoke(command, log):
+        # Keep run() as the orchestration seam used by workflow tests.
+        print("  " + " ".join(command), flush=True)
+        rc = run(command, log_path=str(log))
+        unchanged()
+        if rc != 0:
+            die("ATC 返回 %d；检查已安装 CANN 的两阶段融合 Pass、SoC 及算子注册。产物: %s" % (rc, audit))
+
+    def dump(model, destination):
+        invoke(["atc", "--mode=1", "--om=" + str(model), "--json=" + str(destination)], destination.with_suffix(".log"))
+        if not destination.is_file():
+            raise ValueError("ATC did not export the compiled graph JSON: %s" % destination)
+        return json.loads(destination.read_text())
+
+    try:
+        plan, checker = fc2d_onnx.write_onnx(paths["bin"], paths["onnx"])
+        unchanged()
+        source_sha = runner._file_sha256(paths["onnx"])
+        names = [name for name, _, _ in fc2d_onnx.runtime_slots(plan)]
+        if names != runner.model_input_slots(spec):
+            raise ValueError("frontend and runner input contracts differ")
+        print("  source: %s (%s); Conv -> ExtendConv2D -> FusedMultiConv2d" % (paths["onnx"], checker))
+        base = ["atc", "--model=" + paths["onnx"], "--framework=5",
+                "--soc_version=" + soc, "--input_format=NCHW",
+                "--input_shape=" + fc2d_onnx.input_shape_arg(plan),
+                "--op_compiler_cache_mode=disable", "--log=error"]
+        # A diagnostic compilation with stage 2 disabled proves stage 1 produces
+        # a real ExtendConv2D pair. It is never uploaded or executed.
+        stage1_switch, final_switch = audit / "stage1_switch.json", audit / "fusion_switch.json"
+        for path, state in ((stage1_switch, "off"), (final_switch, "on")):
+            path.write_text(json.dumps({"Switch": {"GraphFusion": {fusion.FIRST_PASS_NAME: "on", fusion.PASS_NAME: state}}}, indent=2) + "\n")
+        stage1 = audit / "stage1"
+        invoke(base + ["--fusion_switch_file=" + str(stage1_switch), "--output=" + str(stage1)], audit / "stage1.log")
+        stage1_graph = audit / "stage1_graph.json"
+        first = fusion.check_stage1_graph(dump(stage1.with_suffix(".om"), stage1_graph), names)
+        output = omdir / c["name"]
+        capture = Path(os.environ.get("FC2D_ATC_TILING_CAPTURE", str(audit / "tiling_capture")))
+        cache = audit / "cache"
+        capture.mkdir(parents=True, exist_ok=True)
+        cache.mkdir()
+        with compilation_environment(capture, cache):
+            # Recompile the same two-Conv source with the original second pass on.
+            invoke(base + ["--fusion_switch_file=" + str(final_switch), "--output=" + str(output)], audit / "atc.log")
+        models = list(omdir.glob("*.om"))
+        if len(models) != 1:
+            raise ValueError("ATC must generate exactly one fresh final OM")
+        model_graph = audit / "model_graph.json"
+        proof = fusion.check_compiled_graph(dump(models[0], model_graph), names)
+        tiling = check_capture(spec, capture)
+        proof.update(first, stage1_pass_name=fusion.FIRST_PASS_NAME, pass_name=fusion.PASS_NAME, pass_source=fusion.PR_URL,
+                     source_conv_count=2, source_graph_sha256=source_sha,
+                     stage1_graph_sha256=runner._file_sha256(stage1_graph),
+                     model_graph_sha256=runner._file_sha256(model_graph), native_tiling=tiling)
+        unchanged()
+        (audit / "fusion_verification.json").write_text(json.dumps(proof, indent=2) + "\n")
+        binding = runner.write_model_binding(paths["bin"], str(models[0]),
+                    expected_case_sha256=frozen, fusion_report=proof)
+        print("  两阶段融合及真实 tiling 已验证；case/OM binding: %s" % binding)
+        print("  融合证据: %s" % audit)
+    except (OSError, ValueError) as exc:
+        die("融合验证失败: %s。未生成可执行绑定；诊断目录: %s" % (exc, audit))
 
 
 def do_run(c, paths, device, extra):

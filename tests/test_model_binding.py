@@ -14,6 +14,7 @@ import shutil
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import run_fused_multi_conv2d as runner
+from fusion_test_support import write_test_binding
 import run_profile
 import fc2d
 import fc2d_onnx
@@ -42,7 +43,7 @@ class ModelBinding(unittest.TestCase):
     def make_model(self):
         om = self.work / (self._testMethodName + '.om')
         om.write_bytes(b'unit-test fake model; no device execution')
-        sidecar = runner.write_model_binding(str(self.case), str(om))
+        sidecar = write_test_binding(str(self.case), str(om))
         return om, Path(sidecar)
 
     def assert_rejected(self, case, model):
@@ -52,7 +53,7 @@ class ModelBinding(unittest.TestCase):
     def test_binding_matches_full_case_and_model(self):
         model, sidecar = self.make_model()
         binding = runner.validate_model_binding(str(self.case), str(model))
-        self.assertEqual(binding['model_input_count'], 7)
+        self.assertEqual(binding['model_input_count'], 5)
         self.assertEqual(binding['weight_mode'], 'constant')
         self.assertEqual(binding, json.loads(sidecar.read_text()))
 
@@ -67,7 +68,7 @@ class ModelBinding(unittest.TestCase):
         model, sidecar = self.make_model()
         binding = json.loads(sidecar.read_text())
         self.assertEqual(binding['op_type'], 'FusedMultiConv2d')
-        for old_schema in (1, 2):
+        for old_schema in (1, 2, 3):
             previous = dict(binding, schema_version=old_schema)
             previous.pop('op_type')
             sidecar.write_text(json.dumps(previous))
@@ -124,7 +125,7 @@ class ModelBinding(unittest.TestCase):
         self.assertEqual(remote.commands, [])
         self.assertEqual(remote.uploads, [])
 
-    def test_old_nine_input_model_is_rejected_by_acl_stub(self):
+    def test_direct_graph_input_signature_is_rejected_by_acl_stub(self):
         model, _ = self.make_model()
         stub = self.work / 'acl_stub'
         stub.mkdir()
@@ -142,7 +143,7 @@ class ModelBinding(unittest.TestCase):
                                  str(self.case), 'FusedMultiConv2d', '0', str(model)],
                                 env=env, cwd=str(stub), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('model has 9 inputs', result.stdout)
+        self.assertIn('model has 7 inputs', result.stdout)
 
 
     def test_case_changed_during_atc_is_not_bound_to_old_weights(self):
@@ -150,16 +151,14 @@ class ModelBinding(unittest.TestCase):
         shutil.copyfile(self.case, case)
         paths = {"bin": str(case), "onnx": str(self.work / "compile_race.onnx"),
                  "omdir": str(self.work / "compile_race_om")}
-        plan = fc2d_onnx.tensor_plan(fc2d.read_spec(str(case)))
 
-        def mutate_during_atc(command):
+        def mutate_during_atc(command, **kwargs):
             prefix = next(arg.split("=", 1)[1] for arg in command if arg.startswith("--output="))
             Path(prefix + ".om").write_bytes(b"compiled old weights")
             case.write_bytes(case.read_bytes() + b"new case during compilation")
             return 0
 
-        with mock.patch.object(fc2d_onnx, "write_onnx", return_value=(plan, "mock")), \
-                mock.patch.object(fc2d, "run", side_effect=mutate_during_atc) as atc_run, \
+        with mock.patch.object(fc2d, "run", side_effect=mutate_during_atc) as atc_run, \
                 mock.patch.object(fc2d.shutil, "which", return_value="/mock/atc"), \
                 contextlib.redirect_stdout(io.StringIO()) as output, self.assertRaises(SystemExit):
             fc2d.do_om({"name": "compile_race"}, paths, "MC62CM12AA")
