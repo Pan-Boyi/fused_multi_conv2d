@@ -23,6 +23,40 @@ sys.path.insert(0, str(ROOT / 'tests/stub_ascendcl'))
 import run_stub_test as stub_test
 
 
+class ShapeHeaderSync(unittest.TestCase):
+    def test_split_headers_form_a_standalone_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'op_host/op_tiling/fused_multi_conv2d_tiling_geometry.h'
+            common = root / 'op_kernel/arch35/fused_multi_conv2d_geometry_common.h'
+            source.parent.mkdir(parents=True)
+            common.parent.mkdir(parents=True)
+            common.write_text('constexpr int shared_value = 7;\n')
+            source.write_text('#include "../../op_kernel/arch35/fused_multi_conv2d_geometry_common.h"\n'
+                              'constexpr int host_value = shared_value;\n')
+            destination = root / 'fused_multi_conv2d_shape.h'
+            destination.write_text('// old copy\n')
+            with mock.patch.object(fc2d, 'HERE', directory), \
+                    mock.patch.object(sys, 'argv', ['fc2d.py', '--sync-shape-header', str(source)]), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(fc2d.main(), 0)
+            self.assertEqual(destination.read_text(),
+                             'constexpr int shared_value = 7;\n\nconstexpr int host_value = shared_value;\n')
+
+    def test_standalone_header_remains_supported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source.h'
+            source.write_text('constexpr int host_value = 7;\n')
+            destination = root / 'fused_multi_conv2d_shape.h'
+            destination.write_text('// old copy\n')
+            with mock.patch.object(fc2d, 'HERE', directory), \
+                    mock.patch.object(sys, 'argv', ['fc2d.py', '--sync-shape-header', str(source)]), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(fc2d.main(), 0)
+            self.assertEqual(destination.read_text(), source.read_text())
+
+
 class LocalTransport:
     """Use only temporary local directories; never connect to a machine."""
     target = 'local-test-only'

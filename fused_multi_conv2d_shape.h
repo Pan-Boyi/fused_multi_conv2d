@@ -1,65 +1,41 @@
 // ===========================================================================
-// 这是 ops-nn 仓里 conv/fused_multi_conv2d/op_kernel/fused_multi_conv2d_shape.h 的**副本**。
+// 这是 ops-nn 仓里 conv/fused_multi_conv2d/op_host/op_tiling/fused_multi_conv2d_tiling_geometry.h 的**副本**。
 //
 // 放一份在 harness 里，只为了 fc2d.py 能在生成 case 之前就回答「这个形状能不能
 // 跑」—— 否则要等到 atc 失败，而那条原因只在 ~/ascend/log/ 里。
 //
 // **算子那边改了就要重拷。** 一条命令：
-//     python3 fc2d.py --sync-shape-header <ops-nn>/conv/fused_multi_conv2d/op_kernel/fused_multi_conv2d_shape.h
+//     python3 fc2d.py --sync-shape-header <ops-nn>/conv/fused_multi_conv2d/op_host/op_tiling/fused_multi_conv2d_tiling_geometry.h
 //
 // 它是顾问性质的：真正说了算的永远是算子的 tiling。两边不一致时 fc2d.py 的预检会
 // 和 atc 的结论不同，那本身就是「该重拷了」的信号。
 // ===========================================================================
-/*
- * fused_multi_conv2d 的**运行期几何** —— host 和 device 共用的唯一出处。
- *
- * 这个文件存在的理由是一次真实的事故：改 kernel 几何时把 FC2D_HB 从 18 改成 6，
- * 却漏了 op_host/op_tiling/fused_multi_conv2d_tiling.cpp 里那份同名的 HB = 18。
- * tiling 于是告诉 kernel「一共 8 个 chunk、每核 1 个」，而 kernel 按自己的
- * NCHUNK = 24 分带 —— 每个核只算了 1 个 chunk，输出正好只写了 1/3，上板才发现。
- * 更糟的是 tiling UT 里断言的是 chunkTotal == 8，把错误的期望一起编码进去了。
- *
- * 所以：**凡是 host 和 device 都要知道的数，只能从这里算出来。**
- * 现在这条纪律比以前更要紧 —— 形状不再是编译期常量，两边算的是同一个
- * DeriveWithHb()，谁也不许在自己那边另推一份。
- *
- * ---------------------------------------------------------------------------
- * 这一版做了什么
- * ---------------------------------------------------------------------------
- * 上一版所有形状（CI/HI/WI/COUT1/COUT2/HB/...）都是 constexpr，一个二进制只服务
- * 一个 shape。这一版把它们全变成运行期参数：
- *
- *     Params      调用方给的形状 + 卷积超参 + 元素宽度
- *     Geometry    由 Params 和一个 hb 推出来的全部派生量（L1 地址表、分块表、
- *                 K 切分、L0B 折叠、chunk 数……）
- *     Band        某一个 chunk 的运行期窗口（pad、行数、两张分块表）
- *
- * host 的 tiling 调 PickHb() 选带高，再把 Params + hb 下发；kernel 拿到之后调
- * 同一个 DeriveWithHb() 复原整套几何。两边不可能分家 —— 这正是上面那次事故的
- * 结构性修复。
- *
- * 约束：这个头会被 host 编译器编（op_host/op_tiling），所以里面不能出现
- * __aicore__、half、或任何 AscendC 的东西 —— 只有纯 C++。
- * 先例：conv3d_transpose_v2 的 tiling.cpp 也是这样 include op_kernel 下的头的。
- * 也不能用 <algorithm> / <cmath>：device 侧那边没有。
+/**
+ * Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
  */
-#ifndef FUSED_MULTI_CONV2D_SHAPE_H
-#define FUSED_MULTI_CONV2D_SHAPE_H
 
-// ---------------------------------------------------------------------------
-// host 和 device 共用一份函数体，但两边对函数的要求不一样。
-//
-// device 侧（ccec）要求被 kernel 调用的函数带 [aicore] 属性 —— 不带属性的函数被
-// 当成 **host 函数**，根本不生成 device 代码，于是链接期报
-//     ld.lld: error: undefined symbol: FusedMultiConv2dShape::DeriveWithHb(...)
-// 这条错误完全不提「少了个属性」，只说符号不见了。
-//
-// host 侧（普通 g++ 编 op_tiling）当然没有这个属性，写上去编不过。
-//
-// __NPU_ARCH__ 只有 kernel 那条编译链会定义（geometry.h 顶上就是靠它做 5102 门禁），
-// host 那条不会 —— 所以用它分。kernel 那条里 CANN 的头总是先于本头被包含，
-// __aicore__ 一定已经可用。
-// ---------------------------------------------------------------------------
+#ifndef FUSED_MULTI_CONV2D_TILING_GEOMETRY_H
+#define FUSED_MULTI_CONV2D_TILING_GEOMETRY_H
+
+/**
+ * Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
+
+#ifndef FUSED_MULTI_CONV2D_GEOMETRY_COMMON_H
+#define FUSED_MULTI_CONV2D_GEOMETRY_COMMON_H
+
 #if defined(__NPU_ARCH__)
 #define FC2D_GEOM_FN __aicore__ inline
 #define FC2D_GEOM_CE __aicore__ constexpr
@@ -70,203 +46,30 @@
 
 namespace FusedMultiConv2dShape {
 
-// ---------------------------------------------------------------------------
-// 几何的修订号。**每次改动几何的判据或 L1/L0 布局都要 +1，并在下面记一行。**
-//
-// 它存在的理由是一次真实的返工：tileK 受 L0B 限那一笔（7c3ff143）和权重按段滚动
-// 那一笔（a56527ee）都是**纯 tiling 改动**，而运行时没有任何办法知道加载进来的
-// tiling 是哪一版 —— 报出来的只有 RejectText 那句话，和三个月前的版本一模一样。
-// 于是「代码推了、也重编了，但编的是另一棵树」这件事，靠看日志完全分辨不出来，
-// 白花了一整轮来回。现在这个号打在 tiling 的成功**和拒绝**两条日志里。
-//
-//   1  运行期形状（65f32342）以来的基线
-//   2  M 切到行内、cout2 放开 16 对齐（bbc30c42）
-//   3  按 W 分核，chunk = 行带 x 列段（44743d33）
-//   4  L0B 里一段 K 的跨距是 align16(Cout)（fe3f86ca）
-//   5  conv1 的 L0C 双缓冲，多一个 l0cStride 字段（821f2dea）
-//   6  tileK 必须被 L0B 压住（7c3ff143）
-//   7  权重可按 L0B 段在 L1 里滚动，多 w1Stage / w2Stage 两个字段（a56527ee）
-//   8  PickHb 的代价函数算上权重重灌的真实倍数（W 分核会乘 hb）
-//   9  PickHb 的代价函数换成「最忙核上 cube/MTE1/MTE2 取大」，并且「行方向
-//      喂满核」的判据从「chunk 够核数那么多」改成「chunk 能被核数整除」
-//  10  代价函数补上 fixpipe 和权重的 GM 读，并且从「取大」改成「求和」
-//      —— geom9 在 bb_Conv_22.0_Conv_27.0 上把 45.36us 推到了 54.40us，
-//      因为「取大」会被漏掉的那一项骗过去
-//  11  滚动权重在 MTE2 里按「消费它的 M 子块数」算（不再一刀切 x2）；
-//      PickHb 第二趟加两条护栏：2% 近似并列带用确定性键裁决、切列要 20% 保证金
-//  12  两层的 kernel 大小分开：kh1/kw1 和 kh2/kw2。以前两层共用一个 kh/kw，
-//      1x1 接 3x3 这种组合根本表达不出来
-//  13  L0B 按**半个**挑段，腾出第二个槽 —— 权重的 L1->L0B 灌载从此能压在上一段的
-//      mmad 底下。geom12 里 L0B 是整个 kernel 唯一一个单缓冲的级（l0bFree/
-//      l0bReady 是 SEvent，L0NZ2NZ 的目标没有槽号），每个段边界都是
-//      「MMA 退休 -> 灌 64KB -> MMA 发射」的硬串行
-// **只能是宏。** 不要写成 constexpr const char* —— ccec 把字符串字面量放在 __gm__
-// 地址空间里，`const __gm__ char[N]` 转不成 `const char*`，device 那条编译链直接挂。
-// 这也是 RejectText() 被 #if !defined(__NPU_ARCH__) 包起来的同一个理由。
-// 宏只是一个 token，谁需要谁自己用，两条编译链都安全。
-#define FC2D_GEOM_REV "geom13"
-
-// ---------------------------------------------------------------------------
-// 5102 的片上容量。**只有这一组仍然是编译期常量** —— 它们是芯片属性，不是形状。
-// L1 是例外：真机 1 MB，而 CPU 仿真把它截在 512 KB
-// （kernel_utils_mode_cpu.h:283），所以 L1 预算是 PickHb() 的入参，由调用方给。
-// ---------------------------------------------------------------------------
 constexpr int L0A_BYTES = 64 * 1024;
-constexpr int L0A_SLOT_BYTES = L0A_BYTES / 2; // 双缓冲，一槽 32,768
-constexpr int L0B_BYTES = 64 * 1024;
-// L0B 也双缓冲，一槽 32,768。**但它是软的** —— 和 L0A_SLOT_BYTES 不同，这里只是
-// PickL0bChunks 的首选预算；装不下就退回整个 L0B、单缓冲（geom12 的行为），
-// 靠 l0bPP1 / l0bPP2 告诉 kernel 走哪条路。理由：ping-pong 是性能优化，不该让
-// 任何一个本来能过的形状被拒。
-constexpr int L0B_SLOT_BYTES = L0B_BYTES / 2;
-constexpr int L0C_BYTES = 256 * 1024;
-constexpr int L0C_ELEMS = L0C_BYTES / 4; // int32 累加器
+constexpr int L0A_SLOT_BYTES = L0A_BYTES / 2;
 constexpr int BT_BYTES = 4 * 1024;
-constexpr int BT_SLOT_ELEMS = 512;    // 一个 bias 槽最多几个通道
+constexpr int BT_SLOT_ELEMS = 512;
 constexpr int BT_SLOT1_BYTE_OFF = 2048;
-constexpr int L1_SEG_ALIGN = 512;     // fixpipe 的 L1->FB 取数要求每段 512 对齐
-constexpr int MMAD_M0 = 16;           // cube 的 M 粒度；N 粒度也是 16
-
-// ---------------------------------------------------------------------------
-// 各条管线的速率。和 L0A_BYTES 一样是芯片属性，不是形状 —— 全部由 20 个真机形状
-// 的六管实测反推（cube 时钟 1.37 GHz，标定见下面 CoreCostCycles 的注释）。
-//
-// **这一组在 geom10 重标过。** geom9 用的 MTE1 = 108 B/cyc 对小形状高估了约 1.8
-// 倍（bb_Conv_179_Conv_184 预测 17.7us、实测 9.08us），而且当时完全没有 fixpipe。
-//
-//   MTE1        190 B/cyc            L1 -> L0A / L0B
-//   MTE2        120 B/cyc            GM -> L1，整块搬
-//   MTE2 慢路   每次请求 8 周期 + 上面那个带宽
-//               切了列之后 currentBand.wIn != wi，LoadFmChannels 落到逐行那一支：每行每
-//               通道一次跨步读。bb_Conv_454_Conv_456 上是 21x128 = 2688 次 30 字节
-//               花 16.7us；bb_Conv_22.0_Conv_27.0 上是 15x128 = 1920 次 84 字节
-//               花 10.2us。**按请求数算，不是按字节算** —— geom9 按字节定价，
-//               在后者上低估了一倍。
-//   fixpipe L1  290 B/cyc            conv1 的 fixpipe 写 mid 到 L1，连续
-//   fixpipe GM  每次请求 19/2 周期 + 105 B/cyc
-//               conv2 的 fixpipe 写 y 到 GM。**y 是 NCHW，所以一条 run 要对每个
-//               输出通道各发一次写**，每次只有 mRun * yBytes 字节连续。切列让
-//               rowsPerRun 变 1、nRun 变 hb，请求数就乘 hb。
-//   scalar      每个 M 子块 420 周期 + 每次 launch 4000 周期
-// ---------------------------------------------------------------------------
-constexpr int MTE1_BYTES_PER_CYC = 190;
-constexpr int MTE2_BYTES_PER_CYC = 120;
-constexpr int MTE2_ROW_REQ_CYC = 8;
-constexpr int FIX_L1_BYTES_PER_CYC = 290;
-constexpr int FIX_GM_BYTES_PER_CYC = 105;
-constexpr int FIX_GM_REQ_CYC_X2 = 19;  // 9.5 周期，翻倍存以免用浮点
-constexpr int SCALAR_TILE_CYC = 420;
-constexpr int SCALAR_BASE_CYC = 4000;
-
-// M 方向最多切几块。分块表是定长数组，超了就拒 —— 与其在 device 上越界，不如在
-// tiling 阶段说「这个形状我服务不了」。
+constexpr int MMAD_M0 = 16;
 constexpr int MAX_M_TILES = 64;
-
-// 定点定标 S 的合法区间（A16W16）。见 conv/common/op_kernel/arch35/conv_util.h:153。
 constexpr int FIX_SHIFT_LEN_A16W16 = 58;
 
-// ---------------------------------------------------------------------------
-// 小工具。<algorithm> 在 device 侧不能用，所以自己写。
-// ---------------------------------------------------------------------------
-// 全部 constexpr：geometry.h 里有几条 static_assert 要在编译期调它们。
 FC2D_GEOM_CE int MinI(int a, int b) { return a < b ? a : b; }
 FC2D_GEOM_CE int MaxI(int a, int b) { return a > b ? a : b; }
 FC2D_GEOM_CE int CeilDiv(int a, int b) { return (a + b - 1) / b; }
 FC2D_GEOM_CE int Align(int a, int m) { return (a + m - 1) / m * m; }
 
-// 两个 bias 段在 L1 里各占一段，长度按**真实的 bias 宽度**补齐到 512 的整数倍。
-// 写死 512 是错的：int8 通路的 bias 是 int32，cout=256 就要 1024 字节，写死之后
-// bias2 会踩到 bias1 后面 512 字节之外的地方 —— 而那里正好是 L1 的末尾，越界。
-// fp16 通路的 bias 是 half，512 字节够 256 个通道，所以这个坑只有 int8 大通道
-// 才够得着。
-FC2D_GEOM_CE int BiasElemBytes(int elemBytes) { return elemBytes == 2 ? 2 : 4; }
-
-// ---------------------------------------------------------------------------
-// 调用方给的东西。elemBytes 保留为 x 的元素宽度和旧三条同 dtype 通路的兼容入口；
-// weightElemBytes / midElemBytes / biasElemBytes 为 0 时继承旧语义。A16W8 显式给出
-// fp16 x、int8 filter、int8 mid、int32 bias。每类张量的 C0 都按自己的元素宽度计算，
-// 一个 C0 始终是 32 字节。
-// ---------------------------------------------------------------------------
-struct Params {
-    int n;         // batch
-    int ci;        // 输入通道
-    int hi;
-    int wi;
-    int cout1;     // conv1 输出通道 == conv2 输入通道
-    int cout2;     // conv2 输出通道 == y 的通道
-    // **conv1 的 kernel。conv2 的是下面的 kh2 / kw2。** 两层不必一样大 ——
-    // 1x1 降维接 3x3 是最常见的一种，而且它对这个算子特别划算：conv1 的窗口只有
-    // 一行一列，band 之间就没有 halo，重复计算全部来自 conv2。
-    int kh1;
-    int kw1;
-    int stride1;
-    int stride2;
-    // pad 分 H / W 两个方向，每个方向上下（左右）对称。非方核必须能分开给 ——
-    // 比如 1x3 的 separable conv 要 padH = 0、padW = 1，一个标量表达不了。
-    int padH1, padW1;
-    int padH2, padW2;
-    int elemBytes; // x element bytes: 2 = fp16, 1 = int8
-    // conv2 出口带不带 per-channel 反量化表（int8 进 / fp16 出那条通路）。
-    // 它只影响 L1 —— 表要常驻 L1 给 fixpipe 取，所以必须在这里，不能只当成
-    // 一个运行期开关。0 / 1。
-    int hasDeqScale2 = 0;
-    // The original three paths use one dtype for x/filter/mid, so old aggregate
-    // initializers intentionally leave these fields at zero.  Zero means
-    // "inherit the legacy value derived from elemBytes".  A16W8 sets them
-    // explicitly: fp16 x, int8 filters, int8 mid, int32 bias.
-    int weightElemBytes = 0;
-    int midElemBytes = 0;
-    int biasElemBytes = 0;
-    int hasQuantScale1 = 0; // per-channel VREQ8 table for conv1 -> int8 mid
-    int hasQuantScale2 = 0; // per-channel VREQ8 table for conv2 -> int8 y
-    // conv2 的 kernel 大小。**0 表示沿用 conv1 的 kh1 / kw1** —— 和上面
-    // weightElemBytes 那一组是同一条约定，所以既有的按位置初始化一个字都不用改，
-    // 也不会因为漏填而静默拿到 0。想要两层不同大小时按名字赋这两个字段。
-    //
-    // 读它们只能通过 Kh2() / Kw2()，**不要直接读 p.kh2** —— 直接读会在「继承」
-    // 的那一路拿到 0。
-    int kh2 = 0;
-    int kw2 = 0;
-};
-
-FC2D_GEOM_CE int WeightElemBytes(const Params& p)
-{
-    return p.weightElemBytes == 0 ? p.elemBytes : p.weightElemBytes;
-}
-FC2D_GEOM_CE int MidElemBytes(const Params& p)
-{
-    return p.midElemBytes == 0 ? p.elemBytes : p.midElemBytes;
-}
-FC2D_GEOM_CE int ParamBiasElemBytes(const Params& p)
-{
-    return p.biasElemBytes == 0 ? BiasElemBytes(p.elemBytes) : p.biasElemBytes;
-}
-// conv2 的 kernel 大小，0 = 沿用 conv1。**这一层之后的代码一律只用这两个函数**，
-// 不直接读 p.kh2 / p.kw2。
-FC2D_GEOM_CE int Kh2(const Params& p) { return p.kh2 == 0 ? p.kh1 : p.kh2; }
-FC2D_GEOM_CE int Kw2(const Params& p) { return p.kw2 == 0 ? p.kw1 : p.kw2; }
-
-// M 方向的分块。**整个算子只有这一条分块公式**：把 total 行按 gran 切成 units 个
-// 单位，均分成 n 块，余数摊给靠前的块。
-//   maxRows  一块最多几行 —— 由 L0A 一槽和 L0C 共同定
-//   gran     行数粒度 —— rows*Wo 必须 16 对齐，所以 gran = 16 / gcd(Wo, 16)
-//
-// 上一版把它展开成一张 129 个 int 的定长表（TileTable）在 host 和 device 之间传，
-// 而且**每个 band 现搭两张**。上板量出来这条路很贵：MakeTiles 每次要清 128 个 int、
-// 按值返回又是 516 字节的拷贝，几何推导整体把 scalar 从 3.8us 抬到 18.9us。
-// 现在 device 侧只拿三个标量（n / base / extra），第 i 块的行数和起点用两次乘法
-// 现算 —— 表只在 host 和 UT 里展开，那边多花几百条指令无所谓。
 struct TileSpec {
-    int n;     // 分几块。**0 表示这个组合不成立**，调用方必须判
-    int base;  // 每块至少几个单位
-    int extra; // 前 extra 块各多一个单位
-    int gran;  // 一个单位几行
+    int n;
+    int base;
+    int extra;
+    int gran;
 };
 
+// 将 total 个位置均匀划分，单块不超过 maxRows，块长按 gran 对齐。
 FC2D_GEOM_CE TileSpec MakeTileSpec(int total, int maxRows, int gran)
 {
-    // 聚合初始化，不是先声明再赋值：constexpr 函数里默认初始化的局部量
-    // 「永远产生不了常量表达式」，clang 直接把整个函数判成非法的 constexpr。
     TileSpec s = {0, 0, 0, gran};
     if (total <= 0 || gran <= 0 || maxRows < gran || (total % gran) != 0) {
         return s;
@@ -283,178 +86,368 @@ FC2D_GEOM_CE TileSpec MakeTileSpec(int total, int maxRows, int gran)
     return s;
 }
 
-// 第 i 块有几行 / 从第几行开始。device 侧就用这两个，不建表。
 FC2D_GEOM_CE int TileRows(const TileSpec& s, int i) { return (s.base + (i < s.extra ? 1 : 0)) * s.gran; }
 FC2D_GEOM_CE int TileRow0(const TileSpec& s, int i) { return (s.base * i + MinI(i, s.extra)) * s.gran; }
 
-// 展开的表。**只有 host 和 UT 用**（tiling 的逐 band 校验、golden 对账）。
-// 它必须和 TileRows/TileRow0 逐项相等 —— 这一条由 UT 钉住，不靠人看。
-struct TileTable {
-    int n;
-    int rows[MAX_M_TILES];
-    int row0[MAX_M_TILES];
-};
-
-FC2D_GEOM_FN TileTable MakeTiles(int total, int maxRows, int gran)
-{
-    const TileSpec s = MakeTileSpec(total, maxRows, gran);
-    TileTable t;
-    t.n = s.n;
-    for (int i = 0; i < MAX_M_TILES; ++i) {
-        t.rows[i] = (i < s.n) ? TileRows(s, i) : 0;
-        t.row0[i] = (i < s.n) ? TileRow0(s, i) : 0;
-    }
-    return t;
-}
-
-// Split the fmap MTE2 transaction along its channel/K dimension without
-// changing conv1's M tiles.  Input channels are innermost in K, so the first
-// tileK1 channels are precisely what the first img2col/MMAD consumes.  The
-// remaining channels can arrive while that original full-M MMAD is running.
 struct FmLoadSpec {
     int n;
     int firstC;
 };
 
-FC2D_GEOM_CE FmLoadSpec MakeFmLoadSpec(int ci, int c0, int tileK1, int l0bChunks1, int nwseg,
-                                      int conv1MTiles)
+// 选择输入通道分段搬运方式及首段通道数。
+FC2D_GEOM_CE FmLoadSpec MakeFmLoadSpec(int ci, int c0, int tileK1, int l0bChunks1, int nwseg, int conv1MTiles)
 {
     FmLoadSpec s = {1, ci};
-    if (nwseg > 1 && l0bChunks1 == 1 && conv1MTiles == 1 && tileK1 >= c0 && tileK1 < ci &&
-        (tileK1 % c0) == 0) {
+    if (nwseg > 1 && l0bChunks1 == 1 && conv1MTiles == 1 && tileK1 >= c0 && tileK1 < ci && (tileK1 % c0) == 0) {
         s.n = 2;
         s.firstC = tileK1;
     }
     return s;
 }
 
-// ---------------------------------------------------------------------------
-// 拒绝的原因。tiling 把它打进日志 —— 「GRAPH_FAILED」本身什么也不说明。
-//
-// 前缀是 RJ_ 而不是更自然的 R_：POSIX 的 <unistd.h> 把 R_OK / W_OK / X_OK / F_OK
-// 定义成**宏**（访问权限位），host 侧的 tiling 一路 include 下去必然带进来，
-// 于是 `R_OK = 0` 展开成 `4 = 0`，报的是「expected identifier before numeric
-// constant」，和枚举本身看不出关系。
-// ---------------------------------------------------------------------------
-enum Reject {
-    RJ_OK = 0,
-    RJ_ELEM_BYTES,     // elemBytes 只能是 1 或 2
-    RJ_SHAPE_POSITIVE, // 有维度 <= 0
-    RJ_CHANNEL_C0,     // ci 或 cout1 不是 C0 的整数倍
-    RJ_OUT_EMPTY,      // 卷出来是空的
-    RJ_HB_DIVIDE,      // hb 不整除 ho2
-    RJ_MIDROWS,        // 一个 band 的 conv1 行数超过了 ho1
-    RJ_TILE_K,         // 找不到合法的 K 切分
-    RJ_M_TILES,        // M 方向切出来的块数超过 MAX_M_TILES
-    RJ_L0C,            // 一个 M 子块装不进 L0C
-    RJ_L0B,            // 权重按 K 折之后仍然装不进 L0B
-    RJ_BT,             // bias 放不进一个 BT 槽
-    RJ_L1,             // L1 装不下
-    RJ_U16,            // 某个指令字段是 16 位的，这个形状超了
-    RJ_NO_HB,          // 所有 hb 都不成立
-    RJ_WSEG,           // 列分段数不合法（<= 0 或 > wo2）
+struct FlatGeom {
+    int n, ci, hi, wi, cout1, cout2, kh1, kw1, kh2, kw2, stride1, stride2;
+    int padH1, padW1, padH2, padW2, elemBytes;
+    int weightElemBytes, midElemBytes, biasElemBytes;
+
+    int c0, weightC0, midC0, ho1, wo1, ho2, wo2, k1, k2;
+    int hb, nchunk, chunkTotal, chunksPerCore;
+    int wseg, nwseg;
+    int midRows;
+    int mMax1, mMax2;
+    int tileK1, tileK2;
+    int l0bChunks1, l0bChunkK1, tilesPerChunk1;
+    int l0bChunks2, l0bChunkK2, tilesPerChunk2;
+    int l0bPP1, l0bPP2;
+    int l0bSlot1Elems, l0bSlot2Elems;
+    int l0bElems, l0cElems, l0cStride;
+    int w1Stage, w2Stage;
+
+    int fmAddr, fmElems, midAddr, midElems, w1Addr, w1Elems, w2Addr, w2Elems, b1Addr, b2Addr;
+    int dq2Addr;
+    int q1Addr;
+    int q2Addr;
+
+    int xPlane, yPlane, yPlaneM;
 };
 
-// **只在 host 和 CPU 仿真上存在。**
-// ccec 把字符串字面量放在 __gm__ 地址空间里，`const __gm__ char[N]` 转不成
-// `const char*`，所以这个函数在真机编译链上根本编不过。它也没必要存在于那里：
-// 唯一的消费者是 host 的 tiling 日志和 kernel 里那条 ASCENDC_CPU_DEBUG 的 printf。
-#if !defined(__NPU_ARCH__) || (defined(ASCENDC_CPU_DEBUG) && ASCENDC_CPU_DEBUG == 1)
-FC2D_GEOM_FN const char* RejectText(int r)
+#define FC2D_FLAT_FIELDS(X)             \
+    X(n, batch)                         \
+    X(ci, cin)                          \
+    X(hi, hin)                          \
+    X(wi, win)                          \
+    X(cout1, cout1)                     \
+    X(cout2, cout2)                     \
+    X(kh1, kh1)                         \
+    X(kw1, kw1)                         \
+    X(kh2, kh2)                         \
+    X(kw2, kw2)                         \
+    X(stride1, stride1)                 \
+    X(stride2, stride2)                 \
+    X(padH1, padH1)                     \
+    X(padW1, padW1)                     \
+    X(padH2, padH2)                     \
+    X(padW2, padW2)                     \
+    X(elemBytes, elemBytes)             \
+    X(weightElemBytes, weightElemBytes) \
+    X(midElemBytes, midElemBytes)       \
+    X(biasElemBytes, biasElemBytes)     \
+    X(c0, c0)                           \
+    X(weightC0, weightC0)               \
+    X(midC0, midC0)                     \
+    X(ho1, ho1)                         \
+    X(wo1, wo1)                         \
+    X(ho2, ho2)                         \
+    X(wo2, wo2)                         \
+    X(k1, k1)                           \
+    X(k2, k2)                           \
+    X(hb, hb)                           \
+    X(nchunk, nchunk)                   \
+    X(wseg, wseg)                       \
+    X(nwseg, nwseg)                     \
+    X(chunkTotal, chunkTotal)           \
+    X(chunksPerCore, chunksPerCore)     \
+    X(midRows, midRows)                 \
+    X(mMax1, mMax1)                     \
+    X(mMax2, mMax2)                     \
+    X(tileK1, tileK1)                   \
+    X(tileK2, tileK2)                   \
+    X(l0bChunks1, l0bChunks1)           \
+    X(l0bChunkK1, l0bChunkK1)           \
+    X(tilesPerChunk1, tilesPerChunk1)   \
+    X(l0bChunks2, l0bChunks2)           \
+    X(l0bChunkK2, l0bChunkK2)           \
+    X(tilesPerChunk2, tilesPerChunk2)   \
+    X(l0bPP1, l0bPP1)                   \
+    X(l0bPP2, l0bPP2)                   \
+    X(l0bSlot1Elems, l0bSlot1Elems)     \
+    X(l0bSlot2Elems, l0bSlot2Elems)     \
+    X(l0bElems, l0bElems)               \
+    X(l0cElems, l0cElems)               \
+    X(l0cStride, l0cStride)             \
+    X(w1Stage, w1Stage)                 \
+    X(w2Stage, w2Stage)                 \
+    X(fmAddr, fmAddr)                   \
+    X(fmElems, fmElems)                 \
+    X(midAddr, midAddr)                 \
+    X(midElems, midElems)               \
+    X(w1Addr, w1Addr)                   \
+    X(w1Elems, w1Elems)                 \
+    X(w2Addr, w2Addr)                   \
+    X(w2Elems, w2Elems)                 \
+    X(b1Addr, b1Addr)                   \
+    X(b2Addr, b2Addr)                   \
+    X(dq2Addr, dq2Addr)                 \
+    X(q1Addr, q1Addr)                   \
+    X(q2Addr, q2Addr)                   \
+    X(xPlane, xPlane)                   \
+    X(yPlane, yPlane)                   \
+    X(yPlaneM, yPlaneM)
+
+struct BandLite {
+    int aMid;
+    int midReal;
+    int padT2, padB2;
+    int xRow0, xRows, padT1, padB1;
+    int outRow0;
+
+    int outCol0, outCols;
+    int midCol0, wSub;
+    int padL2, padR2;
+    int xCol0, wIn;
+    int padL1, padR1;
+    int conv1MPerBand;
+
+    int rowsPerRun, mRun, nRun;
+    TileSpec conv1Tile;
+    TileSpec conv2Tile;
+};
+
+// 根据行带和列段索引计算当前输入窗口及补边。
+FC2D_GEOM_FN void MakeBandLite(const FlatGeom& f, int band, int woSegIdx, BandLite& b)
+{
+    b.outRow0 = band * f.hb;
+
+    const int raw = f.stride2 * f.hb * band - f.padH2;
+    b.aMid = MaxI(0, raw);
+    b.padT2 = b.aMid - raw;
+    const int wantRows = f.midRows - b.padT2;
+    b.midReal = MinI(wantRows, f.ho1 - b.aMid);
+    b.padB2 = f.midRows - b.padT2 - b.midReal;
+
+    const int xRaw = f.stride1 * b.aMid - f.padH1;
+    const int xSpan = f.stride1 * (b.midReal - 1) + f.kh1;
+    b.xRow0 = MaxI(0, xRaw);
+    b.padT1 = b.xRow0 - xRaw;
+    const int xEnd = MinI(f.hi, xRaw + xSpan);
+    b.xRows = xEnd - b.xRow0;
+    b.padB1 = xRaw + xSpan - xEnd;
+
+    b.outCol0 = woSegIdx * f.wseg;
+    b.outCols = MinI(f.wseg, f.wo2 - b.outCol0);
+
+    const int mcRaw0 = b.outCol0 * f.stride2 - f.padW2;
+    const int mcRaw1 = (b.outCol0 + b.outCols - 1) * f.stride2 - f.padW2 + f.kw2;
+    b.midCol0 = MaxI(0, mcRaw0);
+    const int mcEnd = MinI(f.wo1, mcRaw1);
+    b.padL2 = b.midCol0 - mcRaw0;
+    b.padR2 = mcRaw1 - mcEnd;
+    b.wSub = mcEnd - b.midCol0;
+
+    const int icRaw0 = b.midCol0 * f.stride1 - f.padW1;
+    const int icRaw1 = (mcEnd - 1) * f.stride1 - f.padW1 + f.kw1;
+    b.xCol0 = MaxI(0, icRaw0);
+    const int icEnd = MinI(f.wi, icRaw1);
+    b.padL1 = b.xCol0 - icRaw0;
+    b.padR1 = icRaw1 - icEnd;
+    b.wIn = icEnd - b.xCol0;
+
+    b.conv1MPerBand = b.midReal * b.wSub;
+    b.conv1Tile = MakeTileSpec(b.conv1MPerBand, f.mMax1, 1);
+
+    b.rowsPerRun = (b.outCols == f.wo2) ? f.hb : 1;
+    b.mRun = b.rowsPerRun * b.outCols;
+    b.nRun = f.hb / b.rowsPerRun;
+    b.conv2Tile = MakeTileSpec(b.mRun, f.mMax2, 1);
+}
+
+} // namespace FusedMultiConv2dShape
+
+#endif
+
+
+namespace FusedMultiConv2dShape {
+
+#define FC2D_GEOM_REV "geom13"
+
+constexpr int L0B_BYTES = 64 * 1024;
+constexpr int L0B_SLOT_BYTES = L0B_BYTES / 2;
+constexpr int L0C_BYTES = 256 * 1024;
+constexpr int L0C_ELEMS = L0C_BYTES / 4;
+constexpr int L1_SEG_ALIGN = 512;
+constexpr int MTE1_BYTES_PER_CYC = 190;
+constexpr int MTE2_BYTES_PER_CYC = 120;
+constexpr int MTE2_ROW_REQ_CYC = 8;
+constexpr int FIX_L1_BYTES_PER_CYC = 290;
+constexpr int FIX_GM_BYTES_PER_CYC = 105;
+constexpr int FIX_GM_REQ_CYC_X2 = 19;
+constexpr int SCALAR_TILE_CYC = 420;
+constexpr int SCALAR_BASE_CYC = 4000;
+
+constexpr int BiasElemBytes(int elemBytes) { return elemBytes == 2 ? 2 : 4; }
+
+struct Params {
+    int n;
+    int ci;
+    int hi;
+    int wi;
+    int cout1;
+    int cout2;
+
+    int kh1;
+    int kw1;
+    int stride1;
+    int stride2;
+
+    int padH1, padW1;
+    int padH2, padW2;
+    int elemBytes;
+
+    int hasDeqScale2 = 0;
+
+    int weightElemBytes = 0;
+    int midElemBytes = 0;
+    int biasElemBytes = 0;
+    int hasQuantScale1 = 0;
+    int hasQuantScale2 = 0;
+
+    int kh2 = 0;
+    int kw2 = 0;
+};
+
+constexpr int WeightElemBytes(const Params& p) { return p.weightElemBytes == 0 ? p.elemBytes : p.weightElemBytes; }
+constexpr int MidElemBytes(const Params& p) { return p.midElemBytes == 0 ? p.elemBytes : p.midElemBytes; }
+constexpr int ParamBiasElemBytes(const Params& p)
+{
+    return p.biasElemBytes == 0 ? BiasElemBytes(p.elemBytes) : p.biasElemBytes;
+}
+
+constexpr int Kh2(const Params& p) { return p.kh2 == 0 ? p.kh1 : p.kh2; }
+constexpr int Kw2(const Params& p) { return p.kw2 == 0 ? p.kw1 : p.kw2; }
+
+enum Reject {
+    RJ_OK = 0,
+    RJ_ELEM_BYTES,
+    RJ_SHAPE_POSITIVE,
+    RJ_CHANNEL_C0,
+    RJ_OUT_EMPTY,
+    RJ_HB_DIVIDE,
+    RJ_MIDROWS,
+    RJ_TILE_K,
+    RJ_M_TILES,
+    RJ_L0C,
+    RJ_L0B,
+    RJ_BT,
+    RJ_L1,
+    RJ_U16,
+    RJ_NO_HB,
+    RJ_WSEG,
+};
+
+// 将几何校验返回码转换为错误说明。
+inline const char* RejectText(int r)
 {
     switch (r) {
-        case RJ_OK: return "ok";
-        case RJ_ELEM_BYTES: return "elemBytes 只能是 1(int8) 或 2(fp16)";
-        case RJ_SHAPE_POSITIVE: return "形状里有非正数";
-        case RJ_CHANNEL_C0: return "ci 和 cout1 必须是 C0 的整数倍（C0 = 32/elemBytes）";
-        case RJ_OUT_EMPTY: return "卷积输出为空（kernel 比补零后的输入还大）";
-        case RJ_HB_DIVIDE: return "band 高度不整除 ho2";
-        case RJ_MIDROWS: return "一个 band 需要的 conv1 行数超过了 ho1";
-        case RJ_TILE_K: return "找不到既整除 K 又装得进 L0A 的 K 切分";
-        case RJ_M_TILES: return "M 方向的块数超过 MAX_M_TILES";
-        case RJ_L0C: return "一个 M 子块装不进 L0C";
-        case RJ_L0B: return "权重按 K 折之后仍然装不进 L0B";
-        case RJ_BT: return "bias 的通道数超过一个 BT 槽（512）";
-        case RJ_L1: return "L1 装不下 fm + mid + w1 + w2";
-        case RJ_U16: return "指令字段只有 16 位：m1Max（min(midRows,ho1)*wSubMax）或 staging 的位置数（xRows*wInMax）超过 65535";
-        case RJ_NO_HB: return "没有任何 band 高度能同时满足全部约束";
-        case RJ_WSEG: return "列分段数不合法（必须在 1..wo2 之间）";
-        default: return "未知";
+        case RJ_OK:
+            return "ok";
+        case RJ_ELEM_BYTES:
+            return "elemBytes 只能是 1(int8) 或 2(fp16)";
+        case RJ_SHAPE_POSITIVE:
+            return "形状里有非正数";
+        case RJ_CHANNEL_C0:
+            return "ci 和 cout1 必须是 C0 的整数倍（C0 = 32/elemBytes）";
+        case RJ_OUT_EMPTY:
+            return "卷积输出为空（kernel 比补零后的输入还大）";
+        case RJ_HB_DIVIDE:
+            return "band 高度不整除 ho2";
+        case RJ_MIDROWS:
+            return "一个 band 需要的 conv1 行数超过了 ho1";
+        case RJ_TILE_K:
+            return "找不到既整除 K 又装得进 L0A 的 K 切分";
+        case RJ_M_TILES:
+            return "M 方向的块数超过 MAX_M_TILES";
+        case RJ_L0C:
+            return "一个 M 子块装不进 L0C";
+        case RJ_L0B:
+            return "权重按 K 折之后仍然装不进 L0B";
+        case RJ_BT:
+            return "bias 的通道数超过一个 BT 槽（512）";
+        case RJ_L1:
+            return "L1 装不下 fm + mid + w1 + w2";
+        case RJ_U16:
+            return "指令字段只有 16 位：m1Max（min(midRows,ho1)*wSubMax）或 staging 的位置数（xRows*wInMax）超过 65535";
+        case RJ_NO_HB:
+            return "没有任何 band 高度能同时满足全部约束";
+        case RJ_WSEG:
+            return "列分段数不合法（必须在 1..wo2 之间）";
+        default:
+            return "未知";
     }
 }
-#endif // RejectText 只在 host / CPU 仿真上存在
 
-// ---------------------------------------------------------------------------
-// 由 Params + 一个 band 高度推出来的全部派生量。
-// ---------------------------------------------------------------------------
 struct Geometry {
     Params p;
 
     int c0, weightC0, midC0, c1, midC1;
     int ho1, wo1, ho2, wo2;
-    int k1, k2;          // 两个卷积的矩阵乘 K：k1 = Ci*kh1*kw1，k2 = Cout1*kh2*kw2
+    int k1, k2;
 
-    int hb, nchunk;      // 每个 band 出多少行 conv2 输出 / 一张图几个 band
-    // 列方向的分核。一个 chunk = 一个 band x 一个列段，所以
-    //   chunkTotal = n * nchunk * nwseg
-    // Ho2 只有一行的形状（比如 5x1790 那个）在行方向一点并行度都没有，
-    // 不切列就只有一个核在干活。
-    int wseg, nwseg;     // 一个列段出多少列 conv2 输出 / 一张图几个列段
-    int wSubMax, wInMax; // 一个列段最多要算多少列 mid / 要灌多少列 x（L1 按它排）
-    int chunkTotal;      // n * nchunk * nwseg
+    int hb, nchunk;
 
-    int midRows;         // 一个 band 的 conv1 输出行数上限（= 窗口跨度）
-    int xRows;           // 一个 band 要灌进 L1 的 x 行数上限
-    int m1Max;           // midRows * wSubMax，mid 的 NZ M 上限
+    int wseg, nwseg;
+    int wSubMax, wInMax;
+    int chunkTotal;
 
-    int tileK1, tileK2;              // 每条 img2col 灌多少 K
-    int mMax1, mMax2;                // 一个 M 子块最多几个位置（不是行）
-    int l0bChunks1, l0bChunkK1, tilesPerChunk1;  // 权重按 K 折几段
+    int midRows;
+    int xRows;
+    int m1Max;
+
+    int tileK1, tileK2;
+    int mMax1, mMax2;
+    int l0bChunks1, l0bChunkK1, tilesPerChunk1;
     int l0bChunks2, l0bChunkK2, tilesPerChunk2;
-    int l0bPP1, l0bPP2;              // 该层的段能不能 ping-pong（1=两个槽，0=单缓冲）
-    int l0bSlot1Elems, l0bSlot2Elems;   // 一个槽的元素数；单缓冲时是 0（两个槽号同址）
+    int l0bPP1, l0bPP2;
+    int l0bSlot1Elems, l0bSlot2Elems;
 
-    int l0bElems;        // L0B 要多少元素（两个卷积取大）
-    int l0cElems;        // 共享 L0C 的元素数（int32）
-    // L0C 两个槽的元素跨距。**0 表示单缓冲**（一个槽），此时指令流和双缓冲之前
-    // 逐字相同。见下面 DeriveWith 里算它的那一段。
+    int l0bElems;
+    int l0cElems;
+
     int l0cStride;
 
-    // 权重在 L1 里的摆法。0 = 整套常驻（老行为），1 = 按 L0B 段滚动（两个槽）。
-    // 见 DeriveWith 里那个 modes[4] 的循环（全驻 / 只滚大的 / 只滚小的 / 都滚）。
     int w1Stage, w2Stage;
-    // L1 常驻段，字节地址（每段 512 对齐）
+
     int fmElems, midElems, w1Elems, w2Elems;
     int fmAddr, midAddr, w1Addr, w2Addr, b1Addr, b2Addr;
     int b1Bytes, b2Bytes;
-    int dq2Addr, dq2Bytes;   // conv2 的 per-channel 反量化表（不带时长度 0）
-    int q1Addr, q1Bytes;     // conv1 的 per-channel VREQ8 表（int8 mid 路径）
-    int q2Addr, q2Bytes;     // conv2 的 per-channel VREQ8 表（int8 y 路径）
+    int dq2Addr, dq2Bytes;
+    int q1Addr, q1Bytes;
+    int q2Addr, q2Bytes;
     int l1Used;
 
-    // GM 侧一张图的元素数，供 batch 偏移和 UT 对账用
     int xPlane, yPlane;
-    // FRACTAL_Z 的四个维度，tiling 拿它校验 filter 的 shape
+
     int fz1K, fz1N, fz2K, fz2N;
 };
 
-// K 切分和 M 大小是互相牵制的：tileK 越大，一个 L0A 槽装得下的 M 越小。
-// 这里对每个候选 tileK（C0 的整数倍且整除 K）算出对应的 mMax，取「M 块数最少、
-// 并列时 tileK 最大」的那个 —— M 块数直接等于 fixpipe 的轮数。
-//
-// **M 的单位是「位置」，不是「行」。** 上一版按整行切，于是一行放不进 L0C 的形状
-// （比如 wo1 = 1788、cout1 = 64：align16(1788)*64 = 114,688 > 65,536）根本无解，
-// 而且行数还得是 16/gcd(wo,16) 的整数倍。切到行内之后这两条限制都不存在了 ——
-// 依据是 tests/ut/op_kernel 里那两条探针：img2col 的 mStartPt/mExtension 和
-// fixpipe 的 mSize/strip 跨距都**不要求** 16 对齐（CPU 仿真结论，真机待确认）。
 struct KChoice {
     int tileK;
-    int mMax;    // 一个 M 子块最多几个**位置**（不是行）
+    int mMax;
     int nTiles;
     bool ok;
 };
 
-FC2D_GEOM_FN KChoice PickTileK(int k, int c0, int elemBytes, int cout, int totalM, int weightBytes)
+// 在片上容量约束内选择 K 分块和 M 上限。
+inline KChoice PickTileK(int k, int c0, int elemBytes, int cout, int totalM, int weightBytes)
 {
     KChoice best;
     best.tileK = 0;
@@ -464,24 +457,9 @@ FC2D_GEOM_FN KChoice PickTileK(int k, int c0, int elemBytes, int cout, int total
     if (k <= 0 || c0 <= 0 || cout <= 0 || totalM <= 0 || weightBytes <= 0) {
         return best;
     }
-    // L0C 的上限和 tileK 无关：align16(m) * align16(cout) <= 65,536 个 int32。
+
     const int mCapC = L0C_ELEMS / Align(cout, MMAD_M0);
-    // **L0B 的上限。** 这一条以前不在这里，后果是一整类形状被无谓拒掉：
-    // PickL0bChunks 要求折出来的每一段 chunkK 都是 tileK 的整数倍（img2col 的 K 偏移
-    // k0 = l0bLoadChunkIdx*chunkK + t*tileK 和 L0B 里的偏移必须对得上），而每一段又要装进 L0B。
-    // 于是 chunkK >= tileK 且 align16(cout)*chunkK*weightBytes <= L0B_BYTES，
-    //     => tileK <= ckMax = L0B_BYTES / (align16(cout) * weightBytes)
-    // 这条既必要也充分 —— 充分是因为 chunkK = tileK 永远合法（tileK 整除 k，所以
-    // c = k/tileK 是整数）。
-    //
-    // 不加这一条时的失败形态：M 很小的形状（比如 ci=192 的 36x14，m1Max=42、
-    // mRunMax=7）所有 tileK 都给出 nTiles=1，于是「并列取更大的 tileK」一路取到
-    // k 本身；那个 tileK 折不进 L0B，PickL0bChunks 必然失败，整个形状报 RJ_L0B ——
-    // 而同一个形状换个小一点的 tileK 是完全成立的。并列取大的**收益在 M 这么小的
-    // 时候是零**（img2col 的条数由 m*k/L0A一槽 定，和 tileK 无关），代价却是被拒。
-    //
-    // 对现有能过的形状这一行是空操作：能过 => PickL0bChunks 成功 => 存在
-    // chunkK >= tileK 装进 L0B => tileK <= ckMax => 这个 continue 不会触发。
+
     const int ckMax = L0B_BYTES / (Align(cout, MMAD_M0) * weightBytes);
     for (int tk = c0; tk <= k; tk += c0) {
         if ((k % tk) != 0) {
@@ -490,10 +468,9 @@ FC2D_GEOM_FN KChoice PickTileK(int k, int c0, int elemBytes, int cout, int total
         if (tk > ckMax) {
             continue;
         }
-        // L0A 一槽：align16(m) * tileK * elemBytes <= 32,768
+
         const int mCapA = L0A_SLOT_BYTES / (tk * elemBytes);
-        // 往下取到 16 的整数倍：容量算的是 align16(m)，m 本身不对齐时会往上补，
-        // 取整之后「m <= mMax」就等价于「align16(m) <= 容量」，不用再判一次。
+
         int mMax = MinI(mCapA, mCapC) / MMAD_M0 * MMAD_M0;
         if (mMax <= 0) {
             continue;
@@ -505,7 +482,7 @@ FC2D_GEOM_FN KChoice PickTileK(int k, int c0, int elemBytes, int cout, int total
         if (nT > MAX_M_TILES) {
             continue;
         }
-        // 并列时取更大的 tileK：一条 mmad 干更多活，指令数更少。
+
         if (!best.ok || nT < best.nTiles || (nT == best.nTiles && tk > best.tileK)) {
             best.tileK = tk;
             best.mMax = mMax;
@@ -516,10 +493,8 @@ FC2D_GEOM_FN KChoice PickTileK(int k, int c0, int elemBytes, int cout, int total
     return best;
 }
 
-// 整套权重能不能一次装进给定预算；装不下就按 K 折。折出来的每段仍要是 tileK 的
-// 整数倍，否则 img2col 的 K 偏移和 L0B 里的偏移对不上。
-FC2D_GEOM_FN bool PickL0bChunksIn(int cout, int k, int elemBytes, int tileK, int budget,
-                                  int& chunks, int& chunkK)
+// 在 budget 字节内选择整分 K 的权重段数及段长。
+inline bool PickL0bChunksIn(int cout, int k, int elemBytes, int tileK, int budget, int& chunks, int& chunkK)
 {
     const int coutA = Align(cout, MMAD_M0);
     for (int c = 1; c <= k / tileK; ++c) {
@@ -539,18 +514,8 @@ FC2D_GEOM_FN bool PickL0bChunksIn(int cout, int k, int elemBytes, int tileK, int
     return false;
 }
 
-// **先按半个 L0B 找**：每段只占一半，另一半就能同时装下一段，L0NZ2NZ 压在上一段的
-// mmad 底下（kernel 侧 l0bFree / l0bReady 随之从 SEvent 换成 DEvent，见 impl.h）。
-// 半个装不下才退回整个 —— 那就是 geom12 的单缓冲。
-//
-// **故意不动 PickTileK 的 ckMax**（它仍按整个 L0B 算）。把 ckMax 也减半会让一部分
-// 形状换 tileK：62.0_199.0 和 192_295 的 128 -> 64、460_462 的 192 -> 96，而 tileK
-// 变了 mMax 跟着变、M 子块数跟着变，等于顺手改了几何。这一笔只想动 L0B 的分段。
-// 34 个板上形状实测：hb / nwseg / chunkTotal / blockDim / chunksPerCore / 最忙核
-// tile-ops / 滚动档**全部逐字不变**，只有段数和段长变，以及 5 个形状的 l1Used 下降
-// （滚动权重缓冲跟着段长减半）。
-FC2D_GEOM_FN bool PickL0bChunks(int cout, int k, int elemBytes, int tileK, int& chunks,
-                                int& chunkK, int& pingpong)
+// 选择 L0B 权重分段，优先使用 ping/pong 缓冲。
+inline bool PickL0bChunks(int cout, int k, int elemBytes, int tileK, int& chunks, int& chunkK, int& pingpong)
 {
     if (PickL0bChunksIn(cout, k, elemBytes, tileK, L0B_SLOT_BYTES, chunks, chunkK)) {
         pingpong = 1;
@@ -560,132 +525,8 @@ FC2D_GEOM_FN bool PickL0bChunks(int cout, int k, int elemBytes, int tileK, int& 
     return PickL0bChunksIn(cout, k, elemBytes, tileK, L0B_BYTES, chunks, chunkK);
 }
 
-// ---------------------------------------------------------------------------
-// tiling 下发的**扁平几何**。
-//
-// 上一版下发的是 Params + hb，kernel 自己调 DeriveWithHb() 复原整套几何。那在
-// 「一个二进制服务所有形状」这件事上是对的，但代价上板才看得见：DeriveWithHb 里
-// 有两轮 PickTileK（各几十次试探，每次四五个整数除法）、两轮 PickL0bChunks、
-// 一遍逐 band 校验，加起来五百多个标量除法 —— scalar 耗时从 3.8us 涨到 18.9us，
-// 而这些数**对一次 launch 而言全是常量**。
-//
-// 所以现在：host 把 Geometry 里 kernel 用得到的字段全抄进这个结构体下发，kernel
-// 逐字段读成 const 局部量，一次除法都不做。
-//
-// 「host 和 device 只有一份几何」这条纪律没有松动，只是搬了个位置：算它的仍然只有
-// DeriveWithHb() 一处，kernel 不再重算，也就更不可能算出和 host 不同的答案。
-// 逐 band 那点窗口算术（四个 pad、行数、conv1 的分块）留在 device 上现算 ——
-// 它随 chunk 变，本来就不是一个常量，而且只有加减乘和三次除法。
-//
-// 下面的 FC2D_FLAT_FIELDS 是这些字段的**唯一清单**：tiling 的下发、kernel 的解包、
-// kernel UT 那份手抄的 tiling 结构体，三处都由它展开。漏一个字段或写错一个名字都
-// 编不过，不会变成「读到相邻字段的值、不报错只算错」。
-// ---------------------------------------------------------------------------
-struct FlatGeom {
-    // ---- 形状（img2col / Dn2Nz 直接要）----
-    int n, ci, hi, wi, cout1, cout2, kh1, kw1, kh2, kw2, stride1, stride2;
-    int padH1, padW1, padH2, padW2, elemBytes;
-    int weightElemBytes, midElemBytes, biasElemBytes;
-    // ---- 由形状推出来的 ----
-    int c0, weightC0, midC0, ho1, wo1, ho2, wo2, k1, k2;
-    int hb, nchunk, chunkTotal, chunksPerCore;
-    int wseg, nwseg;             // 列方向的分核，见 Geometry
-    int midRows;                 // 一个 band 的窗口跨度（含补零）
-    int mMax1, mMax2;            // 两个卷积的 M 子块上限（位置数），逐 chunk 现算用
-    int tileK1, tileK2;
-    int l0bChunks1, l0bChunkK1, tilesPerChunk1;
-    int l0bChunks2, l0bChunkK2, tilesPerChunk2;
-    int l0bPP1, l0bPP2;
-    int l0bSlot1Elems, l0bSlot2Elems;
-    int l0bElems, l0cElems, l0cStride;
-    int w1Stage, w2Stage;   // 权重在 L1 里的摆法，见 Geometry
-    // ---- L1 地址表（字节地址）----
-    int fmAddr, fmElems, midAddr, midElems, w1Addr, w1Elems, w2Addr, w2Elems, b1Addr, b2Addr;
-    int dq2Addr;   // conv2 的 per-channel 反量化表（不带时这一段长度为 0）
-    int q1Addr;    // conv1 的 per-channel VREQ8 表（不带时长度为 0）
-    int q2Addr;    // conv2 的 per-channel VREQ8 表（不带时长度为 0）
-    // ---- GM 侧 ----
-    int xPlane, yPlane, yPlaneM;
-};
-
-// FlatGeom 的字段清单：X(FlatGeom 里的名字, tiling 里的名字)。
-// 顺序就是 tiling 结构体的声明顺序 —— kernel UT 那份手抄的 packed 结构体靠它对齐
-// 布局（那边是按字节 memcpy 的，顺序错了就全错）。host tiling 和 kernel 走的是
-// 具名的 set_/成员访问，顺序对它们无所谓，但一处清单总比三处手抄可靠。
-#define FC2D_FLAT_FIELDS(X)   \
-    X(n, batch)               \
-    X(ci, cin)                \
-    X(hi, hin)                \
-    X(wi, win)                \
-    X(cout1, cout1)           \
-    X(cout2, cout2)           \
-    X(kh1, kh1)               \
-    X(kw1, kw1)               \
-    X(kh2, kh2)               \
-    X(kw2, kw2)               \
-    X(stride1, stride1)       \
-    X(stride2, stride2)       \
-    X(padH1, padH1)           \
-    X(padW1, padW1)           \
-    X(padH2, padH2)           \
-    X(padW2, padW2)           \
-    X(elemBytes, elemBytes)   \
-    X(weightElemBytes, weightElemBytes) \
-    X(midElemBytes, midElemBytes) \
-    X(biasElemBytes, biasElemBytes) \
-    X(c0, c0)                 \
-    X(weightC0, weightC0)     \
-    X(midC0, midC0)           \
-    X(ho1, ho1)               \
-    X(wo1, wo1)               \
-    X(ho2, ho2)               \
-    X(wo2, wo2)               \
-    X(k1, k1)                 \
-    X(k2, k2)                 \
-    X(hb, hb)                 \
-    X(nchunk, nchunk)         \
-    X(wseg, wseg)             \
-    X(nwseg, nwseg)           \
-    X(chunkTotal, chunkTotal) \
-    X(chunksPerCore, chunksPerCore) \
-    X(midRows, midRows)       \
-    X(mMax1, mMax1)           \
-    X(mMax2, mMax2)           \
-    X(tileK1, tileK1)         \
-    X(tileK2, tileK2)         \
-    X(l0bChunks1, l0bChunks1) \
-    X(l0bChunkK1, l0bChunkK1) \
-    X(tilesPerChunk1, tilesPerChunk1) \
-    X(l0bChunks2, l0bChunks2) \
-    X(l0bChunkK2, l0bChunkK2) \
-    X(tilesPerChunk2, tilesPerChunk2) \
-    X(l0bPP1, l0bPP1)         \
-    X(l0bPP2, l0bPP2)         \
-    X(l0bSlot1Elems, l0bSlot1Elems) \
-    X(l0bSlot2Elems, l0bSlot2Elems) \
-    X(l0bElems, l0bElems)     \
-    X(l0cElems, l0cElems)     \
-    X(l0cStride, l0cStride)   \
-    X(w1Stage, w1Stage)       \
-    X(w2Stage, w2Stage)       \
-    X(fmAddr, fmAddr)         \
-    X(fmElems, fmElems)       \
-    X(midAddr, midAddr)       \
-    X(midElems, midElems)     \
-    X(w1Addr, w1Addr)         \
-    X(w1Elems, w1Elems)       \
-    X(w2Addr, w2Addr)         \
-    X(w2Elems, w2Elems)       \
-    X(b1Addr, b1Addr)         \
-    X(b2Addr, b2Addr)         \
-    X(dq2Addr, dq2Addr)       \
-    X(q1Addr, q1Addr)         \
-    X(q2Addr, q2Addr)         \
-    X(xPlane, xPlane)         \
-    X(yPlane, yPlane)         \
-    X(yPlaneM, yPlaneM)
-
-FC2D_GEOM_FN void Flatten(const Geometry& g, int chunksPerCore, FlatGeom& f)
+// 将几何和每核分块数写入 tiling 共用的扁平结构。
+inline void Flatten(const Geometry& g, int chunksPerCore, FlatGeom& f)
 {
     f.n = g.p.n;
     f.ci = g.p.ci;
@@ -765,176 +606,8 @@ FC2D_GEOM_FN void Flatten(const Geometry& g, int chunksPerCore, FlatGeom& f)
     f.yPlaneM = g.ho2 * g.wo2;
 }
 
-// ---------------------------------------------------------------------------
-// 某一个 band 的运行期窗口。**device 侧每个 chunk 算一次的就是这个**，全部是
-// 加减乘和三次除法（MakeTileSpec 里的），没有数组、没有大结构体拷贝。
-//
-// 分带算术：
-//   band b 出 conv2 的输出行 [b*hb, (b+1)*hb)
-//   这些行的窗口覆盖 conv1 的输出行 [aMid, aMid + midRows)，raw = stride2*hb*b - pad2
-//   其中真实存在的是和 [0, ho1) 的交集 —— 头尾两端各有可能被钳
-//
-// mid 在 L1 里只放这个 band 真实存在的那些行（midReal 行），所以
-//   conv1 的 fixpipe   dst_M = midReal * wo1
-//   conv2 的 img2col   l1H   = midReal，上下用 padT2 / padB2 补回 midRows
-// 两者必须同时改 —— 这是「融合点的布局恒等式」，写偏一个 strip 就全错位。
-// ---------------------------------------------------------------------------
-struct BandLite {
-    int aMid;     // 这个 band 的第一行 conv1 输出（全局行号）
-    int midReal;  // 这个 band 真正算出来的 conv1 行数
-    int padT2, padB2;
-    int xRow0, xRows, padT1, padB1;
-    int outRow0;  // 这个 chunk 的第一行 conv2 输出（图内行号）
-    // ---- 列方向的窗口。和上面的行方向是同一套钳位算术，只是换成 W ----
-    int outCol0, outCols;   // 这个 chunk 出哪些列 conv2 输出
-    int midCol0, wSub;      // 要算的 mid 列区间（conv1 在这一段里的输出宽度）
-    int padL2, padR2;       // conv2 在这一段两侧的补零（内部段是 0，边缘段才有）
-    int xCol0, wIn;         // 要灌进 L1 的 x 列区间
-    int padL1, padR1;
-    int conv1MPerBand;       // midReal * wSub
-    // conv2 的输出在 GM(NCHW) 里按行连续。整幅宽度时一个 run 覆盖整个 band（和
-    // 不切列时完全一样）；切了列之后一个 run 只能是一行 —— fixpipe 的一段连续
-    // 写要是跨了行，就会写到下一行的开头去。
-    int rowsPerRun, mRun, nRun;
-    TileSpec conv1Tile;  // conv1 的 M 分块（对 midReal x wSub 的全部位置）
-    TileSpec conv2Tile;  // conv2 的 M 分块（对一个 run 的全部位置）
-};
-
-FC2D_GEOM_FN void MakeBandLite(const FlatGeom& f, int band, int woSegIdx, BandLite& b)
-{
-    b.outRow0 = band * f.hb;
-
-    const int raw = f.stride2 * f.hb * band - f.padH2;
-    b.aMid = MaxI(0, raw);
-    b.padT2 = b.aMid - raw;
-    const int wantRows = f.midRows - b.padT2;          // 窗口里还需要几行真实的 conv1 输出
-    b.midReal = MinI(wantRows, f.ho1 - b.aMid);
-    b.padB2 = f.midRows - b.padT2 - b.midReal;
-
-    // conv1 侧：产出 mid 行 [aMid, aMid+midReal) 需要的 x 行区间，两头都可能被钳。
-    const int xRaw = f.stride1 * b.aMid - f.padH1;
-    const int xSpan = f.stride1 * (b.midReal - 1) + f.kh1;
-    b.xRow0 = MaxI(0, xRaw);
-    b.padT1 = b.xRow0 - xRaw;
-    const int xEnd = MinI(f.hi, xRaw + xSpan);
-    b.xRows = xEnd - b.xRow0;
-    b.padB1 = xRaw + xSpan - xEnd;
-
-    // ---- 列方向 ----------------------------------------------------------
-    // 出 conv2 的列 [outCol0, outCol0+outCols) 需要 mid 的列
-    //   [outCol0*s2 - padW2, (outCol0+outCols-1)*s2 - padW2 + kw2)
-    // 和 [0, wo1) 求交，交不到的部分就是这一段自己的左右补零。恒等式：
-    //   (wSub + padL2 + padR2 - kw2)/s2 + 1 == outCols
-    // conv1 那一层同理，出 wSub 列需要 x 的哪一段。
-    b.outCol0 = woSegIdx * f.wseg;
-    b.outCols = MinI(f.wseg, f.wo2 - b.outCol0);
-
-    const int mcRaw0 = b.outCol0 * f.stride2 - f.padW2;
-    const int mcRaw1 = (b.outCol0 + b.outCols - 1) * f.stride2 - f.padW2 + f.kw2;
-    b.midCol0 = MaxI(0, mcRaw0);
-    const int mcEnd = MinI(f.wo1, mcRaw1);
-    b.padL2 = b.midCol0 - mcRaw0;
-    b.padR2 = mcRaw1 - mcEnd;
-    b.wSub = mcEnd - b.midCol0;
-
-    const int icRaw0 = b.midCol0 * f.stride1 - f.padW1;
-    const int icRaw1 = (mcEnd - 1) * f.stride1 - f.padW1 + f.kw1;
-    b.xCol0 = MaxI(0, icRaw0);
-    const int icEnd = MinI(f.wi, icRaw1);
-    b.padL1 = b.xCol0 - icRaw0;
-    b.padR1 = icRaw1 - icEnd;
-    b.wIn = icEnd - b.xCol0;
-
-    // conv1 的 M 空间：midReal 行 x wSub 列的**全部位置**，可以切到行内 —— mid 在
-    // L1 里就是这么连续排的（行距 wSub），所以扁平区间直接对应一块矩形。
-    b.conv1MPerBand = b.midReal * b.wSub;
-    b.conv1Tile = MakeTileSpec(b.conv1MPerBand, f.mMax1, 1);
-
-    b.rowsPerRun = (b.outCols == f.wo2) ? f.hb : 1;
-    b.mRun = b.rowsPerRun * b.outCols;
-    b.nRun = f.hb / b.rowsPerRun;
-    b.conv2Tile = MakeTileSpec(b.mRun, f.mMax2, 1);
-}
-
-// ---------------------------------------------------------------------------
-// 某一个 chunk 的运行期窗口。**host 和 device 都调这个**，band 的 pad / 行数 /
-// 分块表只有这一份定义。
-//
-// 分带算术：
-//   band b 出 conv2 的输出行 [b*hb, (b+1)*hb)
-//   这些行的窗口覆盖 conv1 的输出行 [aRaw, aRaw + midRows)，aRaw = stride2*hb*b - pad2
-//   其中真实存在的是和 [0, ho1) 的交集 —— 头尾两端各有可能被钳
-//
-// mid 在 L1 里只放这个 band 真实存在的那些行（midReal 行），所以
-//   conv1 的 fixpipe   dst_M = midReal * wo1
-//   conv2 的 img2col   l1H   = midReal，上下用 padT2 / padB2 补回 midRows
-// 两者必须同时改 —— 这是「融合点的布局恒等式」，写偏一个 strip 就全错位。
-// ---------------------------------------------------------------------------
-struct Band {
-    int img;      // batch 里的第几张图
-    int aMid;     // 这个 band 的第一行 conv1 输出（全局行号）
-    int midReal;  // 这个 band 真正算出来的 conv1 行数
-    int padT2, padB2;
-    int xRow0, xRows, padT1, padB1;
-    int outRow0;  // 这个 chunk 的第一行 conv2 输出（图内行号）
-    int outCol0, outCols, wSub, padL2, padR2, xCol0, wIn, padL1, padR1;
-    int rowsPerRun, mRun, nRun;
-    int conv1MPerBand;       // midReal * wSub
-    TileTable conv1Tile; // conv1 的 M 分块
-    TileTable conv2Tile; // conv2 的 M 分块（对一个 run）
-};
-
-FC2D_GEOM_FN Band MakeBand(const Geometry& g, int chunk)
-{
-    FlatGeom f;
-    Flatten(g, 1, f);
-    // chunk 的拆法：列段跑得最快，其次是 band，最后是图。kernel 侧那个自增
-    // （woSegIdx -> band -> img）必须和这里一致。
-    const int perImg = g.nchunk * g.nwseg;
-    const int img = chunk / perImg;
-    const int rem = chunk - img * perImg;
-    const int band = rem / g.nwseg;
-    const int woSegIdx = rem - band * g.nwseg;
-    BandLite lb;
-    MakeBandLite(f, band, woSegIdx, lb);
-
-    Band b;
-    b.img = img;
-    b.aMid = lb.aMid;
-    b.midReal = lb.midReal;
-    b.padT2 = lb.padT2;
-    b.padB2 = lb.padB2;
-    b.xRow0 = lb.xRow0;
-    b.xRows = lb.xRows;
-    b.padT1 = lb.padT1;
-    b.padB1 = lb.padB1;
-    b.outRow0 = lb.outRow0;
-    b.outCol0 = lb.outCol0;
-    b.outCols = lb.outCols;
-    b.wSub = lb.wSub;
-    b.padL2 = lb.padL2;
-    b.padR2 = lb.padR2;
-    b.xCol0 = lb.xCol0;
-    b.wIn = lb.wIn;
-    b.padL1 = lb.padL1;
-    b.padR1 = lb.padR1;
-    b.rowsPerRun = lb.rowsPerRun;
-    b.mRun = lb.mRun;
-    b.nRun = lb.nRun;
-    b.conv1MPerBand = lb.conv1MPerBand;
-    b.conv1Tile = MakeTiles(lb.conv1MPerBand, g.mMax1, 1);
-    b.conv2Tile = MakeTiles(lb.mRun, g.mMax2, 1);
-    return b;
-}
-
-// ---------------------------------------------------------------------------
-// 核心：Params + hb + 列段数 -> Geometry。返回 0 表示成立，否则是 Reject 码。
-// l1Budget 是这次允许用多少 L1（真机 1 MB，CPU 仿真 512 KB）。
-// ---------------------------------------------------------------------------
-// L1 的地址表。从 DeriveWith 里抽出来，因为权重的两种摆法要各排一遍。
-// 每段 512 对齐 —— fixpipe 的 L1->FB 取数要求。
-FC2D_GEOM_FN void LayOutL1(const Params& p, Geometry& g, int xBytes, int midBytes, int weightBytes,
-                           int biasBytes)
+// 按元素宽度和权重驻留方式分配 L1 缓冲地址。
+inline void LayOutL1(const Params& p, Geometry& g, int xBytes, int midBytes, int weightBytes, int biasBytes)
 {
     g.fmAddr = 0;
     g.midAddr = Align(g.fmAddr + g.fmElems * xBytes, L1_SEG_ALIGN);
@@ -944,9 +617,7 @@ FC2D_GEOM_FN void LayOutL1(const Params& p, Geometry& g, int xBytes, int midByte
     g.b1Bytes = Align(p.cout1 * biasBytes, L1_SEG_ALIGN);
     g.b2Addr = g.b1Addr + g.b1Bytes;
     g.b2Bytes = Align(p.cout2 * biasBytes, L1_SEG_ALIGN);
-    // per-channel 反量化表：一个通道一个 uint64。fixpipe 取的是 L1 地址，所以它
-    // 得常驻。不带这条通路时长度 0，一个字节都不占 —— 否则每个形状都要为一个
-    // 用不上的段让出 4 KB，本来放得下的会被拒掉。
+
     g.dq2Addr = g.b2Addr + g.b2Bytes;
     g.dq2Bytes = (p.hasDeqScale2 != 0) ? Align(p.cout2 * (int)sizeof(long long), L1_SEG_ALIGN) : 0;
     g.q1Addr = g.dq2Addr + g.dq2Bytes;
@@ -956,24 +627,20 @@ FC2D_GEOM_FN void LayOutL1(const Params& p, Geometry& g, int xBytes, int midByte
     g.l1Used = g.q2Addr + g.q2Bytes;
 }
 
-// l1Budget 不只是一道「收不收」的门禁 —— 它会改变权重在 L1 里的**摆法**
-// （整套常驻 / 按段滚动，见下面 w1Stage 那段），于是 w2Addr / b2Addr / l1Used 都
-// 随它变。**同一个形状必须始终用同一个预算去推几何**，否则算出来的是两份不同的
-// L1 地址表。生产路径上这个预算只有一个来源（tiling 从平台读 L1 大小），
-// UT 里由 L1_BUDGET_SIM 统一。<= 0 表示不限。
-FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Geometry& g)
+// 由行带高 hb、列段数 nwseg 和 L1 字节预算计算几何。
+inline int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Geometry& g)
 {
     const int xBytes = p.elemBytes;
     const int weightBytes = WeightElemBytes(p);
     const int midBytes = MidElemBytes(p);
     const int biasBytes = ParamBiasElemBytes(p);
-    if ((xBytes != 1 && xBytes != 2) || (weightBytes != 1 && weightBytes != 2) ||
-        (midBytes != 1 && midBytes != 2) || (biasBytes != 2 && biasBytes != 4)) {
+    if ((xBytes != 1 && xBytes != 2) || (weightBytes != 1 && weightBytes != 2) || (midBytes != 1 && midBytes != 2) ||
+        (biasBytes != 2 && biasBytes != 4)) {
         return RJ_ELEM_BYTES;
     }
-    if (p.n <= 0 || p.ci <= 0 || p.hi <= 0 || p.wi <= 0 || p.cout1 <= 0 || p.cout2 <= 0 ||
-        p.kh1 <= 0 || p.kw1 <= 0 || Kh2(p) <= 0 || Kw2(p) <= 0 || p.stride1 <= 0 || p.stride2 <= 0 ||
-        p.padH1 < 0 || p.padW1 < 0 || p.padH2 < 0 || p.padW2 < 0 || hb <= 0) {
+    if (p.n <= 0 || p.ci <= 0 || p.hi <= 0 || p.wi <= 0 || p.cout1 <= 0 || p.cout2 <= 0 || p.kh1 <= 0 || p.kw1 <= 0 ||
+        Kh2(p) <= 0 || Kw2(p) <= 0 || p.stride1 <= 0 || p.stride2 <= 0 || p.padH1 < 0 || p.padW1 < 0 || p.padH2 < 0 ||
+        p.padW2 < 0 || hb <= 0) {
         return RJ_SHAPE_POSITIVE;
     }
 
@@ -981,20 +648,11 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
     g.c0 = 32 / xBytes;
     g.weightC0 = 32 / weightBytes;
     g.midC0 = 32 / midBytes;
-    // conv1's fmap and filter may use different K0 values on A16W8.  The
-    // logical channels must be representable by both layouts; the fused mid
-    // must in turn match conv2's int8 fmap layout and its filter K0.
-    if ((p.ci % g.c0) != 0 || (p.ci % g.weightC0) != 0 ||
-        (p.cout1 % g.midC0) != 0 || (p.cout1 % g.weightC0) != 0) {
+
+    if ((p.ci % g.c0) != 0 || (p.ci % g.weightC0) != 0 || (p.cout1 % g.midC0) != 0 || (p.cout1 % g.weightC0) != 0) {
         return RJ_CHANNEL_C0;
     }
-    // cout1 要 16 对齐（其实更严：下面 ci/cout1 还要是 C0 的整数倍）—— mid 要被
-    // conv2 当 NC1HWC0 读，通道必须整分成 C0 一组。
-    //
-    // **cout2 不需要。** 它只出现在 conv2 的出口，fixpipe 按 COLUMN_MAJOR 直接写
-    // 到 GM，nSize 给多少写多少；L0B / L0C 那边用的是 align16(cout2)。上一版把它
-    // 和 cout1 一起卡了 16，于是 cout2 = 2 这种（FRACTAL_Z 里补齐成 [.., 1, 16, C0]）
-    // 直接被拒 —— 而 filter 的 shape 根本分不出 cout2 是 1 还是 16，得从 y 去取。
+
     g.c1 = p.ci / g.weightC0;
     g.midC1 = p.cout1 / g.weightC0;
 
@@ -1029,44 +687,28 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
     }
     g.hb = hb;
     g.nchunk = g.ho2 / hb;
-    // 段宽先定，段数再由它反推 —— wo2 不被 nwseg 整除时最后一段短一点，
-    // 段数也可能比请求的少（比如 wo2=10 要 6 段，wseg=2 只能分出 5 段）。
+
     g.wseg = CeilDiv(g.wo2, nwseg);
     g.nwseg = CeilDiv(g.wo2, g.wseg);
     g.chunkTotal = p.n * g.nchunk * g.nwseg;
 
-    // 一个 band 的 conv2 输出行覆盖 midRows 行 conv1 输出（含上下补零）。
-    // 这里是 **conv2** 的窗口高度，所以用 kh2。
     g.midRows = p.stride2 * (hb - 1) + kh2;
-    // L1 按**实际可能出现的最大值**排，不按窗口跨度排：任何一个 band 真正算出来的
-    // conv1 行数都不会超过 ho1（超出的部分是 conv2 的补零，不是数据），staging 的
-    // x 行数同理不会超过 hi。按跨度排会白占 L1，还会把本来放得下的形状拒掉。
+
     const int midRowsCap = MinI(g.midRows, g.ho1);
-    // 列方向同理，按**最宽的那个段**排 L1。内部段两侧都没有补零，所以它最宽；
-    // 边缘段的一部分窗口落在补零里，真实列数只会更少。
-    // 顺带一个副作用：不切列（nwseg = 1）时 wSubMax 也可能小于 wo1 —— stride2
-    // 大于 kw2 时 conv2 根本读不到 conv1 最后那几列，以前是白算的。
-    //
-    // 两层各用自己的核：mid 的宽度由 conv2 的窗口定（kw2），x 的宽度由 conv1 的
-    // 窗口定（kw1）。行方向同理，xRows 用 kh1。
+
     g.wSubMax = MinI(g.wo1, (g.wseg - 1) * p.stride2 + kw2);
     g.wInMax = MinI(p.wi, (g.wSubMax - 1) * p.stride1 + kw1);
     g.m1Max = midRowsCap * g.wSubMax;
     g.xRows = MinI(p.stride1 * (midRowsCap - 1) + kh1, p.hi);
-    // 两个 16 位字段：img2col 的 mStartPt（最大到 m1Max）和 Dn2Nz 的 nValue /
-    // dstNzC0Stride（都等于 xRows*wi）。超了会静默截断成完全不相干的地址。
+
     if (g.m1Max > 65535 || (long long)g.xRows * g.wInMax > 65535) {
         return RJ_U16;
     }
 
-    // K 切分 + M 分块。conv1 对一个 chunk 的 midReal x wSub，conv2 对一个 run。
-    // 不切列时一个 run 就是整个 band（hb 行 x wo2 列），和以前一模一样。
     const int mRunMax = (g.nwseg == 1) ? (hb * g.wo2) : g.wseg;
     const int kBlock1 = MaxI(g.c0, g.weightC0);
     const int kBlock2 = MaxI(g.midC0, g.weightC0);
-    // 一段 K 最短就是 kBlock（K 的分形宽度），连它都装不进 L0B 的话没有任何 tileK
-    // 能成立。先在这里判掉，是为了把**真正的原因**报出来 —— 否则 PickTileK 的候选
-    // 集为空，报的是 RJ_TILE_K（「找不到 K 切分」），指向错误的方向。
+
     if (Align(p.cout1, MMAD_M0) * kBlock1 * weightBytes > L0B_BYTES ||
         Align(p.cout2, MMAD_M0) * kBlock2 * weightBytes > L0B_BYTES) {
         return RJ_L0B;
@@ -1081,24 +723,11 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
     g.tileK2 = kc2.tileK;
     g.mMax2 = kc2.mMax;
 
-    if (!PickL0bChunks(p.cout1, g.k1, weightBytes, g.tileK1, g.l0bChunks1, g.l0bChunkK1,
-                       g.l0bPP1) ||
-        !PickL0bChunks(p.cout2, g.k2, weightBytes, g.tileK2, g.l0bChunks2, g.l0bChunkK2,
-                       g.l0bPP2)) {
+    if (!PickL0bChunks(p.cout1, g.k1, weightBytes, g.tileK1, g.l0bChunks1, g.l0bChunkK1, g.l0bPP1) ||
+        !PickL0bChunks(p.cout2, g.k2, weightBytes, g.tileK2, g.l0bChunks2, g.l0bChunkK2, g.l0bPP2)) {
         return RJ_L0B;
     }
-    // **给通道流式加载让路。** MakeFmLoadSpec 把 conv1 的那一笔 fm MTE2 拆成
-    // 「前 tileK1 个通道」和「其余」，让后半段压在第一条全 M 的 mmad 底下 —— 它的
-    // 前提之一是 l0bChunks1 == 1。L0B ping-pong 会把 conv1 的权重折成两段，
-    // 这个前提就没了。两者只能要一个：
-    //   流式加载省的是**一整笔 fm 的 GM 读**（wide1790 上 ci=64、nwseg=8，
-    //     那是整个 band 的特征图）
-    //   ping-pong 省的是一次 L1->L0B（几十 KB，而且走的是 MTE1 不是 MTE2）
-    // 前者大一个量级，所以让路。
-    //
-    // 只有 nwseg > 1 才可能走到这里 —— MakeFmLoadSpec 的第一个条件就是它。
-    // 34 个板上形状**全是 nwseg == 1**，一个都不受影响；受影响的是
-    // wide1790 那一类靠切列才放得进 L1 的极宽形状。
+
     if (nwseg > 1 && g.l0bPP1 != 0) {
         int c1 = 0, ck1 = 0;
         if (PickL0bChunksIn(p.cout1, g.k1, weightBytes, g.tileK1, L0B_BYTES, c1, ck1) && c1 == 1) {
@@ -1106,8 +735,7 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
             g.l0bChunkK1 = ck1;
         }
     }
-    // 只有一段时 ping-pong 没有意义（没有"下一段"可以预灌），而且 w*Resident 那条
-    // 路整套权重一次灌完、根本不进段环。统一在这里压平，kernel 侧就只看这一个标志。
+
     if (g.l0bChunks1 == 1) {
         g.l0bPP1 = 0;
     }
@@ -1117,8 +745,6 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
     g.tilesPerChunk1 = g.l0bChunkK1 / g.tileK1;
     g.tilesPerChunk2 = g.l0bChunkK2 / g.tileK2;
 
-    // 每个 band 的 conv1 行数都必须让 rows*wo1 保持 16 对齐，且分得出块。
-    // 只有三种取值（首、中、尾），但直接全扫一遍最省心 —— nchunk 至多几百。
     for (int c = 0; c < g.nchunk; ++c) {
         const int raw = p.stride2 * hb * c - p.padH2;
         const int a = MaxI(0, raw);
@@ -1135,15 +761,12 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
         return RJ_M_TILES;
     }
 
-    // 片上缓冲。L0A 按最大的那个子块分，两个卷积取大。
     const int l0a1 = Align(g.mMax1, MMAD_M0) * g.tileK1 * xBytes;
     const int l0a2 = Align(g.mMax2, MMAD_M0) * g.tileK2 * midBytes;
     if (l0a1 > L0A_SLOT_BYTES || l0a2 > L0A_SLOT_BYTES) {
         return RJ_TILE_K;
     }
 
-    // 一段的字节数，以及该层在 L0B 里的总占用（ping-pong 时两个槽）。两层不同时
-    // 在用 L0B（conv1 整个跑完才轮到 conv2），所以取大而不是求和。
     const int l0b1 = Align(p.cout1, MMAD_M0) * g.l0bChunkK1 * weightBytes;
     const int l0b2 = Align(p.cout2, MMAD_M0) * g.l0bChunkK2 * weightBytes;
     const int use1 = l0b1 * (g.l0bPP1 != 0 ? 2 : 1);
@@ -1153,31 +776,17 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
         return RJ_L0B;
     }
     g.l0bElems = l0bMax / weightBytes;
-    // 槽间距。单缓冲时是 0 —— 两个槽号指向同一块，和 geom12 逐字等价。
+
     g.l0bSlot1Elems = (g.l0bPP1 != 0) ? l0b1 / weightBytes : 0;
     g.l0bSlot2Elems = (g.l0bPP2 != 0) ? l0b2 / weightBytes : 0;
 
     const int l0c1 = Align(g.mMax1, MMAD_M0) * Align(p.cout1, MMAD_M0);
     const int l0c2 = Align(g.mMax2, MMAD_M0) * Align(p.cout2, MMAD_M0);
-    // 拒绝的判据不变：**一个**子块装不进 L0C 才拒。下面的双缓冲只在还有余量时开，
-    // 所以这条改动一个形状都不会新拒。
+
     if (MaxI(l0c1, l0c2) > L0C_ELEMS) {
         return RJ_L0C;
     }
-    // L0C 双缓冲。conv1 的 M 子块在两个槽之间乒乓，一个子块的 fixpipe 于是能和
-    // **下一个**子块的 mmad 同时在飞。今天这两者完全串行（fixFree 只有一个信用），
-    // a16w8_target 上量出来 fixpipe 那条管 9.14us 里一点都没被盖住。
-    //
-    // **只有装得下才开，装不下一个字节都不改。** conv1 的 M 上限同时受 L0A 一槽和
-    // L0C 两头限制（PickTileK 里的 mCapA / mCapC）；A16W8 的 A 侧是 fp16，一槽只
-    // 装得下 512 个位置，于是 L0C 那头根本没用满 —— 512*64 = 32,768，正好是 L0C 的
-    // 一半。这条路对它因此是**免费**的：mMax 不动、分块数不动、一条指令都不多。
-    // 同形状的 int8 通路 mMax1 = 1024、l0c1 刚好占满 L0C，那就退回单缓冲。
-    //
-    // conv2 不乒乓。它的 l0c2 可以比一个槽更宽（a16w8_target 是 40,960 > 32,768），
-    // 乒乓会让它盖掉另一个槽。所以 conv2 仍然坐在槽 0、一次占掉**全部**槽的信用
-    // （impl.h 里 l0cSlots 那段）。它每个 chunk 只有一两条 fixpipe，9.14us 里占
-    // 约 1.3us，不值得为它再多一种情形。
+
     g.l0cStride = (2 * l0c1 <= L0C_ELEMS) ? l0c1 : 0;
     g.l0cElems = MaxI(g.l0cStride + l0c1, l0c2);
 
@@ -1185,50 +794,23 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
         return RJ_BT;
     }
 
-    // ---- 权重在 L1 里怎么摆 --------------------------------------------------
-    // 两种摆法：
-    //   全驻（老行为）  w1Elems = align16(cout1)*k1，前缀一次灌完，之后只读
-    //   按段滚动（新）  w1Elems = 2 * align16(cout1)*l0bChunkK1 —— L1 里只放
-    //                   **两个 L0B 段**，用到哪段搬哪段，下一段在算的时候预取
-    //
-    // 为什么需要它：这个算子原来假定「权重比特征图小」。a16w8_target 上权重只占
-    // L1 的 5%，全驻是免费的。但上报的两个形状（ci=192 的 36x14，cout 192/256 和
-    // 256/256，3x3）把比例倒过来了 —— 光两套权重就是 774 KiB 和 1,032 KiB，后者
-    // 是 1 MiB L1 的 98%，剩给 fm + mid + bias + 量化表的只有 16 KiB，而 fm 最省
-    // 也要 18 KiB。全驻结构性放不下，而 L0B 早就把权重折成 6~9 段了，同一时刻只有
-    // 一段在 L0B 里 —— 整套留在 L1 对这类形状是纯浪费。
-    //
-    // **先试全驻，装不下才退到滚动。** 所以今天所有能过的形状一个字节都不变 ——
-    // 和 l0cStride、tileK 那两笔同样的风险面：只能把「拒」变成「过」。
-    //
-    // 滚动只在 l0bChunks > 1 时有意义：l0bChunks == 1 时「一段」就是整套，装不下
-    // 整套等于装不下一段。
-    //
-    // 代价：权重要从 GM 重读，次数 = 消费它的 M 子块数（conv1 的 conv1Tile.n、conv2 的
-    // nRun*conv2Tile.n）—— 因为 l0bLoadChunkIdx 循环嵌在 M 子块循环**里面**。要把 l0bLoadChunkIdx 提到外面就得给
-    // 每个 M 子块各留一块 L0C，多数形状放不下（impl.h 里 conv2 那段注释记的就是
-    // 这件事）。M 很小的形状（这两个用例的 conv1Tile.n 都是 1）重读次数就是 1，和全驻的
-    // 前缀一次灌完等价；M 大的形状会翻 conv1Tile.n 倍。PickHb 因此**优先选不滚动的候选**，
-    // 见下面那段。
     g.fmElems = g.xRows * g.wInMax * p.ci;
     g.midElems = g.m1Max * p.cout1;
     const int w1Full = Align(p.cout1, MMAD_M0) * g.k1;
     const int w2Full = Align(p.cout2, MMAD_M0) * g.k2;
-    // 滚动时的段大小 x 2（乒乓两个槽）。段本身就是 L0B 的一段，所以必然 <= L0B。
+
     const int w1Ring = 2 * Align(p.cout1, MMAD_M0) * g.l0bChunkK1;
     const int w2Ring = 2 * Align(p.cout2, MMAD_M0) * g.l0bChunkK2;
     const bool w1CanStage = (g.l0bChunks1 > 1) && (w1Ring < w1Full);
     const bool w2CanStage = (g.l0bChunks2 > 1) && (w2Ring < w2Full);
-    // 试的顺序：全驻 -> 只滚大的那套 -> 只滚小的那套 -> 都滚。
-    // 先滚大的是因为它腾出的空间多；两个都能单独装下时选它更可能一次就成。
+
     const bool w2Bigger = (w2Full - w2Ring) >= (w1Full - w1Ring);
     int modes[4];
     modes[0] = 0;
     modes[1] = w2Bigger ? 2 : 1;
     modes[2] = w2Bigger ? 1 : 2;
     modes[3] = 3;
-    // l1Budget <= 0 是「不限」—— 老代码里那条 if (l1Budget > 0 && ...) 的语义，
-    // 离线扫盘会这么调。
+
     const int budget = (l1Budget > 0) ? l1Budget : 0x7fffffff;
     int used = -1;
     for (int mi = 0; mi < 4; ++mi) {
@@ -1257,64 +839,8 @@ FC2D_GEOM_FN int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Ge
     return RJ_OK;
 }
 
-// 老签名的壳：不切列。UT 和离线扫盘还按 hb 单独取几何。
-FC2D_GEOM_FN int DeriveWithHb(const Params& p, int hb, int l1Budget, Geometry& g)
-{
-    return DeriveWith(p, hb, 1, l1Budget, g);
-}
-
-// ---------------------------------------------------------------------------
-// 一个几何在**最忙那个核**上的代价（周期）—— 五条管线**求和**。
-// 这就是 PickHb 的目标函数。
-//
-// ===========================================================================
-// 为什么是求和，不是取大 —— 这一条是花了一次真机回退换来的
-// ===========================================================================
-// geom9 用的是 max(cube, MTE1, MTE2)。它在 bb_Conv_22.0_Conv_27.0 上选了
-// hb=11 nwseg=2，把实测从 45.36us 推到了 **54.40us**。事后六管对照：
-//
-//                geom8 (hb=4 nw=1)   geom9 (hb=11 nw=2)
-//        mac         33.276              22.546      <- geom9 确实省了 10.7us
-//        fixpipe      3.887              11.206      <- geom9 完全没有这一项
-//        mte2         5.016              12.034      <- geom9 低估一倍
-//        mte1        13.037              15.064
-//        scalar       5.680               7.380      <- geom9 也没有这一项
-//        total       45.360              54.400
-//
-// max 的毛病就在这里：**漏掉一项，它就被骗过去**。geom9 只看见 cube 从 33.6 降到
-// 22.5，就选了后者。而求和对每一条管线单调，漏项只会让代价偏低一个常数，不会让
-// 排序翻过来 —— 实测 19 个点里，sum(五管) 排序全对，而 max 排错。
-//
-// 求和当然高估了重叠：实测 total / sum(五管) 在 0.47 到 0.83 之间（重叠好的大形状
-// 在低端）。但**这是排序函数，不是时间预测器** —— 一个一致的倍率偏差不影响选择。
-// 真要预测绝对时间的话，19 个点上 sum 的相对误差是 +12% ~ +69%。
-//
-// ===========================================================================
-// 各项的来历
-// ===========================================================================
-// cube  一条 mmad 吃多少 K 取决于 **A 侧**的宽度：fp16 是 16x16x16、int8 是
-//       16x16x32，两条都是一周期一条。所以 A16W8 的 conv1（A 是 fp16 的 x）只有
-//       一半的 MAC 吞吐，比同形状的 int8 卷积贵一倍 —— 这不是实现选择，是 cube
-//       的属性，融不融合都一样。conv2 的 A 是 int8 的 mid，走 32 那一支。
-//       时钟标定：bb_Conv_179_Conv_184 单跑的两个 int8 卷积一共 221,184 条
-//       tile-op，8 核均分 27,648 条，实测 mac 20.179us —— 正好 1.370 GHz。
-//
-// MTE1  两条 img2col + 两套权重进 L0B。权重重灌的次数不是 1：l0bChunks > 1 时是
-//       每个 M 子块把每一段各灌一遍，而 W 分核会让 conv2 的 nRun 变成 hb。
-//
-// MTE2  fm 进 L1，**加上整套权重从 GM 读进来**。geom9 只算了 fm，而 19 个实测点
-//       里有 14 个是**权重主导**的 —— bb_Conv_460_Conv_462 的权重 1008 KB 对 fm
-//       58 KB。加上权重之后这 14 个点落在实测的 0.94 ~ 1.20 倍之内。
-//       权重是**每个核读一次**（内核前导里的 GM2L1，w*Stage == 0 时整套常驻 L1），
-//       所以它不乘 chunksPerCore；滚动时要重读，按两倍粗估。
-//
-// fix   conv1 写 L1（连续，纯带宽）和 conv2 写 GM 要分开定价，见上面常量那一段。
-//
-// scalar 按 M 子块数算。它在 nRun 大的时候也涨（22.0_27.0 上 5.68 -> 7.38）。
-//
-// **只有 host 走这条。** 选完把 hb / nwseg 下发，kernel 只调 DeriveWith。
-// ---------------------------------------------------------------------------
-FC2D_GEOM_FN long long CoreCostCycles(const Geometry& g, int chunksPerCore)
+// 估算最忙核心的计算和搬运周期。
+inline long long CoreCostCycles(const Geometry& g, int chunksPerCore)
 {
     FlatGeom f;
     Flatten(g, chunksPerCore, f);
@@ -1323,13 +849,11 @@ FC2D_GEOM_FN long long CoreCostCycles(const Geometry& g, int chunksPerCore)
     const int xBytes = g.p.elemBytes;
     const int midBytes = MidElemBytes(g.p);
     const int wBytes = WeightElemBytes(g.p);
-    // y 的元素宽度：带反量化表的出口是 fp16，否则和 mid 同宽。
+
     const int yBytes = g.p.hasDeqScale2 ? 2 : midBytes;
     const int kPerMmad1 = (xBytes == 2) ? 16 : 32;
     const int kPerMmad2 = (midBytes == 2) ? 16 : 32;
-    // 中间的 band 彼此逐字相同，只有首尾两个的 pad 不一样；列段同理。所以取
-    // {首, 中, 尾} x {首, 中, 尾} 就覆盖了极值，不必把 nchunk x nwseg 全走一遍 ——
-    // ho2 上千的形状那是上百万次 MakeBandLite，白花在 tiling 上。
+
     int bands[3] = {0, g.nchunk / 2, g.nchunk - 1};
     int wsegs[3] = {0, g.nwseg / 2, g.nwseg - 1};
     long long wCube = 0, wMte1 = 0, wMte2 = 0, wFix = 0, wScalar = 0;
@@ -1344,44 +868,34 @@ FC2D_GEOM_FN long long CoreCostCycles(const Geometry& g, int chunksPerCore)
             MakeBandLite(f, band, woSegIdx, b);
             long long cube = 0;
             for (int i = 0; i < b.conv1Tile.n; ++i) {
-                cube += (long long)(Align(TileRows(b.conv1Tile, i), MMAD_M0) / MMAD_M0) *
-                        (cout1A / MMAD_M0) * (g.k1 / kPerMmad1);
+                cube += (long long)(Align(TileRows(b.conv1Tile, i), MMAD_M0) / MMAD_M0) * (cout1A / MMAD_M0) *
+                        (g.k1 / kPerMmad1);
             }
             for (int r = 0; r < b.nRun; ++r) {
                 for (int q = 0; q < b.conv2Tile.n; ++q) {
-                    cube += (long long)(Align(TileRows(b.conv2Tile, q), MMAD_M0) / MMAD_M0) *
-                            (cout2A / MMAD_M0) * (g.k2 / kPerMmad2);
+                    cube += (long long)(Align(TileRows(b.conv2Tile, q), MMAD_M0) / MMAD_M0) * (cout2A / MMAD_M0) *
+                            (g.k2 / kPerMmad2);
                 }
             }
             long long mte1Bytes = (long long)b.conv1MPerBand * g.k1 * xBytes +
                                   (long long)b.nRun * b.mRun * g.k2 * midBytes;
-            mte1Bytes += (g.l0bChunks1 == 1) ? (long long)cout1A * g.k1 * wBytes
-                                             : (long long)b.conv1Tile.n * cout1A * g.k1 * wBytes;
-            mte1Bytes += (g.l0bChunks2 == 1)
-                             ? (long long)cout2A * g.k2 * wBytes
-                             : (long long)b.nRun * b.conv2Tile.n * cout2A * g.k2 * wBytes;
+            mte1Bytes += (g.l0bChunks1 == 1) ? (long long)cout1A * g.k1 * wBytes :
+                                               (long long)b.conv1Tile.n * cout1A * g.k1 * wBytes;
+            mte1Bytes += (g.l0bChunks2 == 1) ? (long long)cout2A * g.k2 * wBytes :
+                                               (long long)b.nRun * b.conv2Tile.n * cout2A * g.k2 * wBytes;
             const long long mte1 = mte1Bytes / MTE1_BYTES_PER_CYC;
-            // fm 进 L1。整宽走整块快路；切了列就是逐行，按**请求数**算。
+
             const long long fmBytes = (long long)b.xRows * b.wIn * g.p.ci * xBytes;
             long long mte2 = fmBytes / MTE2_BYTES_PER_CYC;
             if (b.wIn != g.p.wi) {
                 mte2 += (long long)b.xRows * g.p.ci * MTE2_ROW_REQ_CYC;
             }
-            // fixpipe：conv1 -> L1 连续；conv2 -> GM 每个输出通道一次写。
+
             long long fix = (long long)b.conv1MPerBand * cout1A * 4 / FIX_L1_BYTES_PER_CYC;
             const long long gmReq = (long long)b.nRun * b.conv2Tile.n * cout2A;
             const long long gmBytes = (long long)b.nRun * b.mRun * cout2A * yBytes;
             fix += gmReq * FIX_GM_REQ_CYC_X2 / 2 + gmBytes / FIX_GM_BYTES_PER_CYC;
-            // 滚动权重的重读也走 MTE2。次数 = 消费它的 M 子块数 —— 和上面 MTE1
-            // 里那个倍数是**同一条规则**（l0bLoadChunkIdx 循环嵌在 M 子块循环里面，见 impl.h 的
-            // w1SegTotal / w2SegTotal）。geom10 在函数末尾按「一刀切 x2」记，在
-            // conv1Tile.n == nRun * conv2Tile.n == 1 的形状上高估一倍：bb_Conv_179_Conv_184
-            // 预测 15.098us 对实测 8.647，bb_Conv_460_Conv_462 预测 12.916 对
-            // 实测 6.964。21 个配对点上 MTE2 这一管的相对误差 RMS 从 29.9% 降到
-            // 15.9%，而且**不改变任何一个形状的选择**。
-            //
-            // 注意它不是一律降价：conv1Tile.n 或 nRun*conv2Tile.n > 2 时反而涨 —— 切列让 nRun
-            // 变成 hb，这一笔正好加在切列那一侧，方向是对的。
+
             long long wRing = 0;
             if (g.w1Stage != 0) {
                 wRing += (long long)b.conv1Tile.n * cout1A * g.k1 * wBytes;
@@ -1391,16 +905,24 @@ FC2D_GEOM_FN long long CoreCostCycles(const Geometry& g, int chunksPerCore)
             }
             mte2 += wRing / MTE2_BYTES_PER_CYC;
             const long long scalar = (long long)(b.conv1Tile.n + b.nRun * b.conv2Tile.n) * SCALAR_TILE_CYC;
-            if (cube > wCube) { wCube = cube; }
-            if (mte1 > wMte1) { wMte1 = mte1; }
-            if (mte2 > wMte2) { wMte2 = mte2; }
-            if (fix > wFix) { wFix = fix; }
-            if (scalar > wScalar) { wScalar = scalar; }
+            if (cube > wCube) {
+                wCube = cube;
+            }
+            if (mte1 > wMte1) {
+                wMte1 = mte1;
+            }
+            if (mte2 > wMte2) {
+                wMte2 = mte2;
+            }
+            if (fix > wFix) {
+                wFix = fix;
+            }
+            if (scalar > wScalar) {
+                wScalar = scalar;
+            }
         }
     }
-    // **常驻**的那一份权重：内核前导里一次 GM2L1（w*Stage == 0 那一支），
-    // 每个核一次，不乘 chunksPerCore。滚动的那一份已经在 band 循环里按重读次数
-    // 算过了，这里只留常驻。
+
     long long wtBytes = 0;
     if (g.w1Stage == 0) {
         wtBytes += (long long)cout1A * g.k1 * wBytes;
@@ -1408,29 +930,24 @@ FC2D_GEOM_FN long long CoreCostCycles(const Geometry& g, int chunksPerCore)
     if (g.w2Stage == 0) {
         wtBytes += (long long)cout2A * g.k2 * wBytes;
     }
-    return (long long)chunksPerCore * (wCube + wMte1 + wMte2 + wFix + wScalar) +
-           wtBytes / MTE2_BYTES_PER_CYC + SCALAR_BASE_CYC;
+    return (long long)chunksPerCore * (wCube + wMte1 + wMte2 + wFix + wScalar) + wtBytes / MTE2_BYTES_PER_CYC +
+           SCALAR_BASE_CYC;
 }
 
-// ---------------------------------------------------------------------------
-// band 高度的选择。**只有 host 走这条**，选完把 hb 下发，kernel 只调 DeriveWithHb。
-// 代价函数是上面的 CoreCostCycles，那里写了为什么是五条管线**求和**而不是取大
-// —— 那一条是 geom9 在真机上退了 9us 换来的。
-// ---------------------------------------------------------------------------
-FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
+// 搜索行带高和列段数，选择估算周期最小的有效几何。
+inline int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
 {
     if (aicNum <= 0) {
         aicNum = 1;
     }
     Geometry probe;
-    // 先算一次 ho2，才知道候选集。用 hb = 1 探一次；它可能因为别的原因被拒，
-    // 但 ho2 在被拒之前就已经算出来了，所以单独把这两行摊开算。
+
     if (p.elemBytes != 1 && p.elemBytes != 2) {
         return RJ_ELEM_BYTES;
     }
-    if (p.n <= 0 || p.ci <= 0 || p.hi <= 0 || p.wi <= 0 || p.cout1 <= 0 || p.cout2 <= 0 ||
-        p.kh1 <= 0 || p.kw1 <= 0 || Kh2(p) <= 0 || Kw2(p) <= 0 || p.stride1 <= 0 || p.stride2 <= 0 ||
-        p.padH1 < 0 || p.padW1 < 0 || p.padH2 < 0 || p.padW2 < 0) {
+    if (p.n <= 0 || p.ci <= 0 || p.hi <= 0 || p.wi <= 0 || p.cout1 <= 0 || p.cout2 <= 0 || p.kh1 <= 0 || p.kw1 <= 0 ||
+        Kh2(p) <= 0 || Kw2(p) <= 0 || p.stride1 <= 0 || p.stride2 <= 0 || p.padH1 < 0 || p.padW1 < 0 || p.padH2 < 0 ||
+        p.padW2 < 0) {
         return RJ_SHAPE_POSITIVE;
     }
     const int ho1 = (p.hi + 2 * p.padH1 - p.kh1) / p.stride1 + 1;
@@ -1451,10 +968,6 @@ FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
         return RJ_OUT_EMPTY;
     }
 
-    // ---- 第一趟：不切列。这一趟和加 W 分核之前**逐字相同** ------------------
-    // 报哪一条拒绝原因是有讲究的：整除性（RJ_HB_DIVIDE）对绝大多数候选
-    // hb 都成立，报它等于什么也没说。留住第一条**别的**原因 —— 那才是这个形状真正
-    // 卡在哪里。一条都没有就说「没有任何 band 高度成立」。
     int bestHb = 0;
     long long bestCost = 0;
     int bestStage = 3;
@@ -1472,31 +985,16 @@ FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
         }
         const long long rounds = CeilDiv(probe.chunkTotal, aicNum);
         const long long cost = rounds * (long long)probe.midRows;
-        // **不滚动的候选一律优于滚动的。** 滚动要把权重从 GM 重读 conv1Tile.n 次（l0bLoadChunkIdx 循环
-        // 嵌在 M 子块循环里面），代价和 midRows 不是一个量纲，硬塞进 cost 里会把
-        // 现有形状的 hb 选择也搅动。分两级比较就干净了 —— 而且今天所有能过的形状
-        // 都是不滚动的，所以这一段对它们逐字不变。
+
         const int stg = probe.w1Stage + probe.w2Stage;
-        if (bestHb == 0 || stg < bestStage || (stg == bestStage && (cost < bestCost ||
-                                               (cost == bestCost && hb > bestHb)))) {
+        if (bestHb == 0 || stg < bestStage ||
+            (stg == bestStage && (cost < bestCost || (cost == bestCost && hb > bestHb)))) {
             bestHb = hb;
             bestCost = cost;
             bestStage = stg;
         }
     }
-    // bestHb == 0 不在这里返回 —— 切列还能把 L1 救回来（每段的 fm / mid 都窄一截），
-    // 所以一条 hb 都不成立时也要往下走第二趟。
-    //
-    // **「行方向已经喂满核」的判据是整除，不是「够核数那么多个」。**
-    // 原来写的是 chunkTotal >= aicNum。于是 ho2 = 44 的形状在第一趟选出 hb = 4、
-    // chunkTotal = 11，然后就地返回 —— 而 11 个 chunk 放 8 个核上是 6 个核各干
-    // 2 个、2 个核全程闲着：最忙的核干了 2 / (11/8) = 1.45 倍的活，同时只有 6/8 的
-    // 核在跑。真机上两个形状都栽在这里：
-    //   bb_Conv_22.0_Conv_27.0  cube 33.6us，换成 hb=11 nwseg=2（chunkTotal 正好 8）
-    //                           只要 24.7us
-    //   bb_Conv_32.0_Conv_37.0  cube 42.0us -> 35.6us
-    // 整除时才就地返回，不整除就交给第二趟去权衡 —— 那里的代价函数看得见占用率，
-    // 也看得见切列在 MTE2 上的代价，不会为了凑满核而乱切。
+
     if (bestHb != 0) {
         const long long ct1 = (long long)p.n * (ho2 / bestHb);
         if (ct1 >= (long long)aicNum && (ct1 % (long long)aicNum) == 0) {
@@ -1504,29 +1002,10 @@ FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
         }
     }
 
-    // ---- 第二趟：行方向填不满核，才把 W 也拿出来切 --------------------------
-    // =======================================================================
-    // 第二趟。**两趟枚举**：先统计每个滚动档里的最低代价，再在「近似并列带」里
-    // 用确定性键裁决。两条护栏都在这里，它们**没有数据支持，只降风险**。
-    //
-    // 为什么需要护栏 —— 这个代价函数自己的可信度有多低：
-    //
-    //   * 它在 20 个形状上的 meas/pred 跨度是 **1.38 倍**。而 22_27 上前两名
-    //     （hb=2 和 hb=4）只差 **0.36%**。拿一个 ±30% 的模型去分 0.36% 的差，
-    //     正是 geom9 翻车的同一类局面。
-    //   * 反切列的壁垒是**联合承重**的，两根柱子都很薄：把 fixpipe 项整个删掉，
-    //     22_27 的 hb=4 只赢 1.8%；再把 MTE2_ROW_REQ_CYC 从 8 降到板上反推的
-    //     6.55，hb=11 nwseg=2 反而赢 1.9% —— **回退重演**。而 fixpipe 的三个
-    //     系数是**不可辨识**的（两个独立最小二乘解出 GM 字节项符号相反）。
-    //   * 全部 21 个实测点里只有**一个** nwseg > 1，而且它输了 20%。给切列定价
-    //     的两项（fixpipe 写 GM、MTE2 慢路）各自只有 <= 2 个板上点撑着。
-    //
-    // 所以：B2 的保证金是唯一一条**不依赖那两个定不住的常数**的壁垒。
-    // =======================================================================
     int bestHb2 = 0;
     int bestNw = 1;
     const int nwMax = MinI(aicNum, wo2);
-    // ---- A 趟：按滚动档统计最低代价，nwseg==1 和 nwseg>1 分开记 -------------
+
     long long bn1[4] = {-1, -1, -1, -1};
     long long bng[4] = {-1, -1, -1, -1};
     for (int hb = 1; hb <= ho2; ++hb) {
@@ -1536,8 +1015,7 @@ FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
         for (int nw = 1; nw <= nwMax; ++nw) {
             const int rc = DeriveWith(p, hb, nw, l1Budget, probe);
             if (rc != RJ_OK) {
-                if (firstReal == RJ_NO_HB && rc != RJ_HB_DIVIDE &&
-                    rc != RJ_WSEG) {
+                if (firstReal == RJ_NO_HB && rc != RJ_HB_DIVIDE && rc != RJ_WSEG) {
                     firstReal = rc;
                 }
                 continue;
@@ -1557,7 +1035,7 @@ FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
             }
         }
     }
-    // 不滚动的一律优先 —— 和之前一样，滚动档是第一级键。
+
     int useStage = -1;
     for (int st = 0; st < 4; ++st) {
         if (bn1[st] >= 0 || bng[st] >= 0) {
@@ -1568,15 +1046,7 @@ FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
     if (useStage >= 0) {
         const long long nw1Best = bn1[useStage];
         const long long nwgBest = bng[useStage];
-        // ---- B2 切列保证金 ------------------------------------------------
-        // nwseg > 1 必须比最好的 nwseg == 1 便宜 >= 20% 才进候选。
-        // 20% 的来历（诚实版）：唯一那个能量 A/B 的形状上，模型说 nw=2 比 hb=4
-        // 贵 13.6%，板上贵 19.9% —— **模型低估切列惩罚 6.3 个百分点**。20% 约是
-        // 这个低估的三倍余量。它不是拟合出来的，是按唯一一个观测定的。
-        //
-        // **没有合法的 nwseg == 1 时无条件放行。** 那是 L1 的救命通道
-        // （wide1790 的 ho2 = 1；以及 nw=1 时只剩 hb=1 / midRows=kh2 的那一类，
-        // 那些形状上切列能便宜 80%），不是性能选择。
+
         const bool nwgOk = (nwgBest >= 0) && (nw1Best < 0 || nwgBest * 5 <= nw1Best * 4);
         long long adminMin = -1;
         if (nw1Best >= 0) {
@@ -1585,14 +1055,9 @@ FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
         if (nwgOk && (adminMin < 0 || nwgBest < adminMin)) {
             adminMin = nwgBest;
         }
-        // ---- B1 近似并列带 --------------------------------------------------
-        const long long cutoff = adminMin + adminMin / 50;   // 2%
-        // 带内按 (chunksPerCore 小, nw 小, hb 大) 裁决。
-        // **chunksPerCore 小优先**：模型里唯一剩下的结构性歧义 —— 常驻权重到底是每核读一次
-        // 还是每 chunk 读一次 —— 在 chunksPerCore 上单调，而现在取的是对高 chunksPerCore 有利的那一支
-        // （源码语义是每核一次，见上面 wtBytes 那一段）。L0B 权重重灌、scalar 前导、
-        // fixpipe 每指令地板、L0C 排空也都随 chunksPerCore 线性重复，方向一致。并列时取低
-        // chunksPerCore，等于选那个「在两种假设下都成立」的候选。
+
+        const long long cutoff = adminMin + adminMin / 50;
+
         int keyChunksPerCore = 0, keyNw = 0, keyHb = 0;
         for (int hb = 1; hb <= ho2; ++hb) {
             if ((ho2 % hb) != 0) {
@@ -1635,4 +1100,4 @@ FC2D_GEOM_FN int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
 
 } // namespace FusedMultiConv2dShape
 
-#endif // FUSED_MULTI_CONV2D_SHAPE_H
+#endif

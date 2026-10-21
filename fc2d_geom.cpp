@@ -83,7 +83,7 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "    （这份 fused_multi_conv2d_shape.h 是算子那份的副本。"
                              "如果算子那边比 %s 更新，先跑 "
                              "python3 fc2d.py --sync-shape-header <ops-nn>/conv/fused_multi_conv2d/"
-                             "op_kernel/fused_multi_conv2d_shape.h）\n", FC2D_GEOM_REV);
+                             "op_host/op_tiling/fused_multi_conv2d_tiling_geometry.h）\n", FC2D_GEOM_REV);
         return 1;
     }
     std::printf("    [%s] ", FC2D_GEOM_REV);
