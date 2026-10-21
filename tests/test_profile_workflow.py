@@ -28,11 +28,11 @@ class ShapeHeaderSync(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / 'op_host/op_tiling/fused_multi_conv2d_tiling_geometry.h'
-            common = root / 'op_kernel/arch35/fused_multi_conv2d_geometry_common.h'
+            common = root / 'op_kernel/arch35/fused_multi_conv2d_geometry.h'
             source.parent.mkdir(parents=True)
             common.parent.mkdir(parents=True)
             common.write_text('constexpr int shared_value = 7;\n')
-            source.write_text('#include "../../op_kernel/arch35/fused_multi_conv2d_geometry_common.h"\n'
+            source.write_text('#include "../../op_kernel/arch35/fused_multi_conv2d_geometry.h"\n'
                               'constexpr int host_value = shared_value;\n')
             destination = root / 'fused_multi_conv2d_shape.h'
             destination.write_text('// old copy\n')

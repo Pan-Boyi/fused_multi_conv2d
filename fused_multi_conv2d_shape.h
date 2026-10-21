@@ -33,8 +33,8 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#ifndef FUSED_MULTI_CONV2D_GEOMETRY_COMMON_H
-#define FUSED_MULTI_CONV2D_GEOMETRY_COMMON_H
+#ifndef FUSED_MULTI_CONV2D_GEOMETRY_H
+#define FUSED_MULTI_CONV2D_GEOMETRY_H
 
 #if defined(__NPU_ARCH__)
 #define FC2D_GEOM_FN __aicore__ inline

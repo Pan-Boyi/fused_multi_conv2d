@@ -455,7 +455,7 @@ def main():
         banner = old[:end + len(marker) + 1] if end > 0 else ""
         with open(src) as f:
             body = f.read()
-        common_header = "../../op_kernel/arch35/fused_multi_conv2d_geometry_common.h"
+        common_header = "../../op_kernel/arch35/fused_multi_conv2d_geometry.h"
         common_include = '#include "%s"' % common_header
         if common_include in body:
             common_path = os.path.join(os.path.dirname(src), common_header)

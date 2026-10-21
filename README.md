@@ -292,7 +292,7 @@ g++ -std=c++17 -O2                   fc2d_geom.cpp -o fc2d_geom -I.
 python3 fc2d.py --sync-shape-header <ops-nn>/conv/fused_multi_conv2d/op_host/op_tiling/fused_multi_conv2d_tiling_geometry.h
 ```
 
-同步时会合并 host 规划头及其引用的 `arch35/fused_multi_conv2d_geometry_common.h`，生成可独立编译的副本。
+同步时会合并 host 规划头及其引用的 `arch35/fused_multi_conv2d_geometry.h`，生成可独立编译的副本。
 
 重拷之后不用管重编 —— 头变新了，下次用到 `fc2d_geom` 时会自动重来。它是顾问性质的：
 真正说了算的永远是算子的 tiling，两边不一致时预检的结论会和 `atc` 不同，那本身就是
