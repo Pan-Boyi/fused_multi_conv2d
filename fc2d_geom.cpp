@@ -4,7 +4,7 @@
  *   ./fc2d_geom --dtype fp16|int8|s8f16|a16w8 --ci 32 --hi 288 --wi 112
  *                --cout1 64 --cout2 96 [--l1 1048576]
  *
- * 用的是算子共用几何头的一份副本（fused_multi_conv2d_shape.h）。**顾问性质**：真正说了
+ * 用的是从算子 tiling.cpp 提取的几何副本（fused_multi_conv2d_shape.h）。**顾问性质**：真正说了
  * 算的是算子的 tiling。不过两边调的是同一个 DeriveWithHb / PickHb，只要副本没过期
  * 结论就一致。
  *
@@ -83,7 +83,7 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "    （这份 fused_multi_conv2d_shape.h 是算子那份的副本。"
                              "如果算子那边比 %s 更新，先跑 "
                              "python3 fc2d.py --sync-shape-header <ops-nn>/conv/fused_multi_conv2d/"
-                             "op_host/op_tiling/fused_multi_conv2d_tiling_geometry.h）\n", FC2D_GEOM_REV);
+                             "op_host/op_tiling/fused_multi_conv2d_tiling.cpp）\n", FC2D_GEOM_REV);
         return 1;
     }
     std::printf("    [%s] ", FC2D_GEOM_REV);

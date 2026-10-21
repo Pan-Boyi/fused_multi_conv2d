@@ -270,7 +270,7 @@ python3 run_fused_multi_conv2d.py out/base_fp16/case.bin FusedMultiConv2d 0 out/
 | `gen_case.cpp` | 编成 `gen_case`，按形状生成 `case.bin`（输入 + golden）|
 | `fused_multi_conv2d_golden.h` | 两条通路的 CPU golden，被 `gen_case.cpp` include |
 | `fc2d_geom.cpp` | 编成 `fc2d_geom`，形状预检 |
-| `fused_multi_conv2d_shape.h` | 算子共用几何头的**副本**，被 `fc2d_geom.cpp` include |
+| `fused_multi_conv2d_shape.h` | 算子几何规划的预检副本，被 `fc2d_geom.cpp` include |
 | `run_fused_multi_conv2d.py` | 在板子上执行的那一端，由 `run_profile.py` 自动拷过去 |
 | `cases.json` | 可选。历史功能算例清单，使用显式 stride/pad。它只有形状、没有 remote 段，所以要这样接进来：<br>`python3 run_profile.py profile.json --cases cases.json --no-msprof` |
 
@@ -289,10 +289,10 @@ g++ -std=c++17 -O2                   fc2d_geom.cpp -o fc2d_geom -I.
 `fused_multi_conv2d_shape.h` 是算子那份的副本。**算子那边改了几何就要重拷**：
 
 ```bash
-python3 fc2d.py --sync-shape-header <ops-nn>/conv/fused_multi_conv2d/op_host/op_tiling/fused_multi_conv2d_tiling_geometry.h
+python3 fc2d.py --sync-shape-header <ops-nn>/conv/fused_multi_conv2d/op_host/op_tiling/fused_multi_conv2d_tiling.cpp
 ```
 
-同步时会合并 host 规划头及其引用的 `arch35/fused_multi_conv2d_geometry.h`，生成可独立编译的副本。
+同步工具从 `tiling.cpp` 提取几何规划代码，并合并其引用的 `arch35/fused_multi_conv2d_geometry.h`，生成可独立编译的预检副本。适配逻辑仅位于 harness。
 
 重拷之后不用管重编 —— 头变新了，下次用到 `fc2d_geom` 时会自动重来。它是顾问性质的：
 真正说了算的永远是算子的 tiling，两边不一致时预检的结论会和 `atc` 不同，那本身就是

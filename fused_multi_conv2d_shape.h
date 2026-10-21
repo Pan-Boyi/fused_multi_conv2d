@@ -1,27 +1,17 @@
 // ===========================================================================
-// 这是 ops-nn 仓里 conv/fused_multi_conv2d/op_host/op_tiling/fused_multi_conv2d_tiling_geometry.h 的**副本**。
+// 这是从 ops-nn 仓里 conv/fused_multi_conv2d/op_host/op_tiling/fused_multi_conv2d_tiling.cpp 提取的几何预检副本。
 //
 // 放一份在 harness 里，只为了 fc2d.py 能在生成 case 之前就回答「这个形状能不能
 // 跑」—— 否则要等到 atc 失败，而那条原因只在 ~/ascend/log/ 里。
 //
 // **算子那边改了就要重拷。** 一条命令：
-//     python3 fc2d.py --sync-shape-header <ops-nn>/conv/fused_multi_conv2d/op_host/op_tiling/fused_multi_conv2d_tiling_geometry.h
+//     python3 fc2d.py --sync-shape-header <ops-nn>/conv/fused_multi_conv2d/op_host/op_tiling/fused_multi_conv2d_tiling.cpp
 //
 // 它是顾问性质的：真正说了算的永远是算子的 tiling。两边不一致时 fc2d.py 的预检会
 // 和 atc 的结论不同，那本身就是「该重拷了」的信号。
 // ===========================================================================
-/**
- * Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
- */
-
-#ifndef FUSED_MULTI_CONV2D_TILING_GEOMETRY_H
-#define FUSED_MULTI_CONV2D_TILING_GEOMETRY_H
+#ifndef FUSED_MULTI_CONV2D_SHAPE_H
+#define FUSED_MULTI_CONV2D_SHAPE_H
 
 /**
  * Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.

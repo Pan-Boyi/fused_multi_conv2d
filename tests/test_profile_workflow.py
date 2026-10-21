@@ -24,16 +24,20 @@ import run_stub_test as stub_test
 
 
 class ShapeHeaderSync(unittest.TestCase):
-    def test_split_headers_form_a_standalone_copy(self):
+    def test_tiling_source_forms_a_standalone_copy(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            source = root / 'op_host/op_tiling/fused_multi_conv2d_tiling_geometry.h'
+            source = root / 'op_host/op_tiling/fused_multi_conv2d_tiling.cpp'
             common = root / 'op_kernel/arch35/fused_multi_conv2d_geometry.h'
             source.parent.mkdir(parents=True)
             common.parent.mkdir(parents=True)
             common.write_text('constexpr int shared_value = 7;\n')
-            source.write_text('#include "../../op_kernel/arch35/fused_multi_conv2d_geometry.h"\n'
-                              'constexpr int host_value = shared_value;\n')
+            source.write_text('#include "cann_runtime.h"\n'
+                              '#include "../../op_kernel/arch35/fused_multi_conv2d_geometry.h"\n'
+                              'namespace FusedMultiConv2dShape {\n'
+                              'constexpr int host_value = shared_value;\n'
+                              '} // namespace FusedMultiConv2dShape\n'
+                              'namespace optiling { void RegisterTiling(); }\n')
             destination = root / 'fused_multi_conv2d_shape.h'
             destination.write_text('// old copy\n')
             with mock.patch.object(fc2d, 'HERE', directory), \
@@ -41,7 +45,24 @@ class ShapeHeaderSync(unittest.TestCase):
                     contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(fc2d.main(), 0)
             self.assertEqual(destination.read_text(),
-                             'constexpr int shared_value = 7;\n\nconstexpr int host_value = shared_value;\n')
+                             '#ifndef FUSED_MULTI_CONV2D_SHAPE_H\n#define FUSED_MULTI_CONV2D_SHAPE_H\n\n'
+                             'constexpr int shared_value = 7;\n\n\n'
+                             'namespace FusedMultiConv2dShape {\n'
+                             'constexpr int host_value = shared_value;\n'
+                             '} // namespace FusedMultiConv2dShape\n\n#endif\n')
+
+    def test_invalid_tiling_source_preserves_existing_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source.cpp'
+            source.write_text('namespace optiling { void RegisterTiling(); }\n')
+            destination = root / 'fused_multi_conv2d_shape.h'
+            destination.write_text('// old copy\n')
+            with mock.patch.object(fc2d, 'HERE', directory), \
+                    mock.patch.object(sys, 'argv', ['fc2d.py', '--sync-shape-header', str(source)]), \
+                    contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+                fc2d.main()
+            self.assertEqual(destination.read_text(), '// old copy\n')
 
     def test_standalone_header_remains_supported(self):
         with tempfile.TemporaryDirectory() as directory:

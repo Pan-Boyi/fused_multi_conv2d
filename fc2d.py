@@ -432,7 +432,7 @@ def main():
     ap.add_argument("--outdir", default=None, help="产物目录，默认 <json 所在目录>/out")
     ap.add_argument("--list", action="store_true", help="只列出会做哪些")
     ap.add_argument("--sync-shape-header", metavar="PATH", default=None,
-                    help="从 ops-nn 重拷一份 fused_multi_conv2d_shape.h（形状预检用的副本）。"
+                    help="从 ops-nn 源码提取 fused_multi_conv2d_shape.h（形状预检用的副本）。"
                          "算子那边改了几何就跑一次，否则预检的结论会和 atc 不一致。")
     ap.add_argument("--keep-going", action="store_true",
                     help="某条失败了继续做下一条（默认第一条失败就停）")
@@ -457,6 +457,13 @@ def main():
             body = f.read()
         common_header = "../../op_kernel/arch35/fused_multi_conv2d_geometry.h"
         common_include = '#include "%s"' % common_header
+        if src.endswith(".cpp"):
+            match = re.search(r"^namespace FusedMultiConv2dShape \{.*?^\} // namespace FusedMultiConv2dShape",
+                              body, re.MULTILINE | re.DOTALL)
+            if match is None or common_include not in body:
+                die("找不到 tiling 几何实现或共享几何头：%s" % src)
+            body = ("#ifndef FUSED_MULTI_CONV2D_SHAPE_H\n#define FUSED_MULTI_CONV2D_SHAPE_H\n\n"
+                    + common_include + "\n\n" + match.group() + "\n\n#endif\n")
         if common_include in body:
             common_path = os.path.join(os.path.dirname(src), common_header)
             with open(common_path) as f:
