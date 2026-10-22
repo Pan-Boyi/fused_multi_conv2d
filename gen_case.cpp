@@ -207,7 +207,7 @@ int main(int argc, char** argv)
     c.cout1 = ArgInt(argc, argv, "--cout1", c.cout1);
     c.cout2 = ArgInt(argc, argv, "--cout2", c.cout2);
     // --kh/--kw 是 conv1 的（也是 conv2 的缺省）；--kh2/--kw2 只在两层不同核时给。
-    // 0 = 沿用 conv1，和 Case::Kh2() / S::Params::kh2 是同一条约定。
+    // 0 = 沿用 conv1，和 Case::Kh2() / S::ConvTilingInputs::kernelHeight2 是同一条约定。
     c.kh1 = ArgInt(argc, argv, "--kh", c.kh1);
     c.kw1 = ArgInt(argc, argv, "--kw", c.kw1);
     c.kh1 = ArgInt(argc, argv, "--kh1", c.kh1);

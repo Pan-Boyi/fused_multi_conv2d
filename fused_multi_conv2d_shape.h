@@ -45,80 +45,143 @@ constexpr int MMAD_M0 = 16;
 constexpr int MAX_M_TILES = 64;
 constexpr int FIX_SHIFT_LEN_A16W16 = 58;
 
-FC2D_GEOM_CE int MinI(int a, int b) { return a < b ? a : b; }
-FC2D_GEOM_CE int MaxI(int a, int b) { return a > b ? a : b; }
-FC2D_GEOM_CE int CeilDiv(int a, int b) { return (a + b - 1) / b; }
-FC2D_GEOM_CE int Align(int a, int m) { return (a + m - 1) / m * m; }
+// 返回较小值；left/right 为比较值。
+FC2D_GEOM_CE int MinI(int left, int right) { return left < right ? left : right; }
+// 返回较大值；left/right 为比较值。
+FC2D_GEOM_CE int MaxI(int left, int right) { return left > right ? left : right; }
+// 向上取整除法；value 为被除数，divisor 为除数。
+FC2D_GEOM_CE int CeilDiv(int value, int divisor) { return (value + divisor - 1) / divisor; }
+// 向上对齐；value 为原值，alignment 为对齐粒度。
+FC2D_GEOM_CE int Align(int value, int alignment) { return (value + alignment - 1) / alignment * alignment; }
 
 struct TileSpec {
-    int n;
-    int base;
-    int extra;
-    int gran;
+    int n;     // M 块总数。
+    int base;  // 每块基础粒度数。
+    int extra; // 额外分配一个粒度的前部块数。
+    int gran;  // 每个粒度包含的空间位置数。
 };
 
-// 将 total 个位置均匀划分，单块不超过 maxRows，块长按 gran 对齐。
+// 均衡划分 M 轴；total 为位置总数，maxRows 为单块位置上限，gran 为块长粒度。
 FC2D_GEOM_CE TileSpec MakeTileSpec(int total, int maxRows, int gran)
 {
-    TileSpec s = {0, 0, 0, gran};
+    TileSpec tiles = {0, 0, 0, gran};
     if (total <= 0 || gran <= 0 || maxRows < gran || (total % gran) != 0) {
-        return s;
+        return tiles;
     }
-    const int units = total / gran;
-    const int maxUnits = maxRows / gran;
-    const int n = CeilDiv(units, maxUnits);
-    if (n > MAX_M_TILES) {
-        return s;
+    const int totalUnits = total / gran;
+    const int maxTileUnits = maxRows / gran;
+    const int tileCount = CeilDiv(totalUnits, maxTileUnits);
+    if (tileCount > MAX_M_TILES) {
+        return tiles;
     }
-    s.n = n;
-    s.base = units / n;
-    s.extra = units % n;
-    return s;
+    tiles.n = tileCount;
+    tiles.base = totalUnits / tileCount;
+    tiles.extra = totalUnits % tileCount;
+    return tiles;
 }
 
-FC2D_GEOM_CE int TileRows(const TileSpec& s, int i) { return (s.base + (i < s.extra ? 1 : 0)) * s.gran; }
-FC2D_GEOM_CE int TileRow0(const TileSpec& s, int i) { return (s.base * i + MinI(i, s.extra)) * s.gran; }
+// 返回指定块的长度；tiles 为均衡划分，index 为块索引。
+FC2D_GEOM_CE int TileRows(const TileSpec& tiles, int index)
+{
+    return (tiles.base + (index < tiles.extra ? 1 : 0)) * tiles.gran;
+}
+// 返回指定块的起点；tiles 为均衡划分，index 为块索引。
+FC2D_GEOM_CE int TileRow0(const TileSpec& tiles, int index)
+{
+    return (tiles.base * index + MinI(index, tiles.extra)) * tiles.gran;
+}
 
 struct FmLoadSpec {
-    int n;
-    int firstC;
+    int n;      // 输入通道搬入批次数。
+    int firstC; // 首批搬入的通道数。
 };
 
-// 选择输入通道分段搬运方式及首段通道数。
-FC2D_GEOM_CE FmLoadSpec MakeFmLoadSpec(int ci, int c0, int tileK1, int l0bChunks1, int nwseg, int conv1MTiles)
+// 选择输入分批搬入；inputChannels/channelBlock 为通道数/分形，firstTileK 为首个 K 块长度，
+// firstWeightSegments 为权重段数，columnSegmentCount 为输出列段数，firstMTileCount 为第一层 M 块数。
+FC2D_GEOM_CE FmLoadSpec MakeFmLoadSpec(int inputChannels, int channelBlock, int firstTileK, int firstWeightSegments,
+                                       int columnSegmentCount, int firstMTileCount)
 {
-    FmLoadSpec s = {1, ci};
-    if (nwseg > 1 && l0bChunks1 == 1 && conv1MTiles == 1 && tileK1 >= c0 && tileK1 < ci && (tileK1 % c0) == 0) {
-        s.n = 2;
-        s.firstC = tileK1;
+    FmLoadSpec loadSpec = {1, inputChannels};
+    if (columnSegmentCount > 1 && firstWeightSegments == 1 && firstMTileCount == 1 && firstTileK >= channelBlock &&
+        firstTileK < inputChannels && (firstTileK % channelBlock) == 0) {
+        loadSpec.n = 2;
+        loadSpec.firstC = firstTileK;
     }
-    return s;
+    return loadSpec;
 }
 
 struct FlatGeom {
-    int n, ci, hi, wi, cout1, cout2, kh1, kw1, kh2, kw2, stride1, stride2;
-    int padH1, padW1, padH2, padW2, elemBytes;
-    int weightElemBytes, midElemBytes, biasElemBytes;
-
-    int c0, weightC0, midC0, ho1, wo1, ho2, wo2, k1, k2;
-    int hb, nchunk, chunkTotal, chunksPerCore;
-    int wseg, nwseg;
-    int midRows;
-    int mMax1, mMax2;
-    int tileK1, tileK2;
-    int l0bChunks1, l0bChunkK1, tilesPerChunk1;
-    int l0bChunks2, l0bChunkK2, tilesPerChunk2;
-    int l0bPP1, l0bPP2;
-    int l0bSlot1Elems, l0bSlot2Elems;
-    int l0bElems, l0cElems, l0cStride;
-    int w1Stage, w2Stage;
-
-    int fmAddr, fmElems, midAddr, midElems, w1Addr, w1Elems, w2Addr, w2Elems, b1Addr, b2Addr;
-    int dq2Addr;
-    int q1Addr;
-    int q2Addr;
-
-    int xPlane, yPlane, yPlaneM;
+    int n;               // 批次数。
+    int ci;              // 输入通道数。
+    int hi;              // 输入高度。
+    int wi;              // 输入宽度。
+    int cout1;           // 第一层输出通道数。
+    int cout2;           // 第二层输出通道数。
+    int kh1;             // 第一层卷积核高度。
+    int kw1;             // 第一层卷积核宽度。
+    int kh2;             // 第二层卷积核高度。
+    int kw2;             // 第二层卷积核宽度。
+    int stride1;         // 第一层空间步长。
+    int stride2;         // 第二层空间步长。
+    int padH1;           // 第一层上下对称补边。
+    int padW1;           // 第一层左右对称补边。
+    int padH2;           // 第二层上下对称补边。
+    int padW2;           // 第二层左右对称补边。
+    int elemBytes;       // 输入元素字节数。
+    int weightElemBytes; // 权重元素字节数。
+    int midElemBytes;    // 中间结果元素字节数。
+    int biasElemBytes;   // 偏置元素字节数。
+    int c0;              // 输入通道分形大小。
+    int weightC0;        // 权重通道分形大小。
+    int midC0;           // 中间结果通道分形大小。
+    int ho1;             // 第一层输出高度。
+    int wo1;             // 第一层输出宽度。
+    int ho2;             // 第二层输出高度。
+    int wo2;             // 第二层输出宽度。
+    int k1;              // 第一层完整归约 K 长度。
+    int k2;              // 第二层完整归约 K 长度。
+    int hb;              // 每个输出行带的行数。
+    int nchunk;          // 每个批次的行带数。
+    int chunkTotal;      // 全部输出块数。
+    int chunksPerCore;   // 每核分配的连续块数。
+    int wseg;            // 每个输出列段的宽度。
+    int nwseg;           // 每个行带的列段数。
+    int midRows;         // 最大中间窗口行数（含补边）。
+    int mMax1;           // 第一层 M 块位置数上限。
+    int mMax2;           // 第二层 M 块位置数上限。
+    int tileK1;          // 第一层单次矩阵乘 K 长度。
+    int tileK2;          // 第二层单次矩阵乘 K 长度。
+    int l0bChunks1;      // 第一层 L0B 权重段数。
+    int l0bChunkK1;      // 第一层每个 L0B 段 K 长度。
+    int tilesPerChunk1;  // 第一层每段矩阵乘次数。
+    int l0bChunks2;      // 第二层 L0B 权重段数。
+    int l0bChunkK2;      // 第二层每个 L0B 段 K 长度。
+    int tilesPerChunk2;  // 第二层每段矩阵乘次数。
+    int l0bPP1;          // 第一层是否交替使用 L0B 槽。
+    int l0bPP2;          // 第二层是否交替使用 L0B 槽。
+    int l0bSlot1Elems;   // 第一层 L0B 单槽元素数。
+    int l0bSlot2Elems;   // 第二层 L0B 单槽元素数。
+    int l0bElems;        // L0B 总元素容量。
+    int l0cElems;        // L0C 总累加元素容量。
+    int l0cStride;       // 第一层 L0C 交替槽元素跨距（0 为单槽）。
+    int w1Stage;         // 第一层权重 L1 策略（0 完整区，1 环形区）。
+    int w2Stage;         // 第二层权重 L1 策略（0 完整区，1 环形区）。
+    int fmAddr;          // 输入 L1 字节地址。
+    int fmElems;         // 输入 L1 元素容量。
+    int midAddr;         // 中间结果 L1 字节地址。
+    int midElems;        // 中间结果 L1 元素容量。
+    int w1Addr;          // 第一层权重 L1 字节地址。
+    int w1Elems;         // 第一层权重 L1 元素容量。
+    int w2Addr;          // 第二层权重 L1 字节地址。
+    int w2Elems;         // 第二层权重 L1 元素容量。
+    int b1Addr;          // 第一层偏置 L1 字节地址。
+    int b2Addr;          // 第二层偏置 L1 字节地址。
+    int dq2Addr;         // 第二层反量化表 L1 字节地址。
+    int q1Addr;          // 第一层重量化表 L1 字节地址。
+    int q2Addr;          // 第二层重量化表 L1 字节地址。
+    int xPlane;          // 输入单个批次元素跨度。
+    int yPlane;          // 输出单个批次元素跨度。
+    int yPlaneM;         // 输出单通道空间元素跨度。
 };
 
 #define FC2D_FLAT_FIELDS(X)             \
@@ -195,70 +258,82 @@ struct FlatGeom {
     X(yPlaneM, yPlaneM)
 
 struct BandLite {
-    int aMid;
-    int midReal;
-    int padT2, padB2;
-    int xRow0, xRows, padT1, padB1;
-    int outRow0;
-
-    int outCol0, outCols;
-    int midCol0, wSub;
-    int padL2, padR2;
-    int xCol0, wIn;
-    int padL1, padR1;
-    int conv1MPerBand;
-
-    int rowsPerRun, mRun, nRun;
-    TileSpec conv1Tile;
-    TileSpec conv2Tile;
+    int aMid;           // 有效中间窗口起始行。
+    int midReal;        // 有效中间窗口行数。
+    int padT2;          // 第二层窗口上补边。
+    int padB2;          // 第二层窗口下补边。
+    int xRow0;          // 原始输入窗口起始行。
+    int xRows;          // 原始输入有效行数。
+    int padT1;          // 第一层窗口上补边。
+    int padB1;          // 第一层窗口下补边。
+    int outRow0;        // 输出行带起始行。
+    int outCol0;        // 输出列段起始列。
+    int outCols;        // 输出列段有效宽度。
+    int midCol0;        // 有效中间窗口起始列。
+    int wSub;           // 有效中间窗口宽度。
+    int padL2;          // 第二层窗口左补边。
+    int padR2;          // 第二层窗口右补边。
+    int xCol0;          // 原始输入窗口起始列。
+    int wIn;            // 原始输入有效宽度。
+    int padL1;          // 第一层窗口左补边。
+    int padR1;          // 第一层窗口右补边。
+    int conv1MPerBand;  // 当前第一层展开矩阵 M 长度。
+    int rowsPerRun;     // 第二层单次连续行组行数。
+    int mRun;           // 第二层单次行组 M 长度。
+    int nRun;           // 第二层连续行组数。
+    TileSpec conv1Tile; // 第一层 M 块均衡划分。
+    TileSpec conv2Tile; // 第二层 M 块均衡划分。
 };
 
-// 根据行带和列段索引计算当前输入窗口及补边。
-FC2D_GEOM_FN void MakeBandLite(const FlatGeom& f, int band, int woSegIdx, BandLite& b)
+// 反推当前输入窗口及补边；geometry 为整体几何，rowBand/columnSegment 为输出块坐标，window 为计算结果。
+FC2D_GEOM_FN void MakeBandLite(const FlatGeom& geometry, int rowBand, int columnSegment, BandLite& window)
 {
-    b.outRow0 = band * f.hb;
+    window.outRow0 = rowBand * geometry.hb;
 
-    const int raw = f.stride2 * f.hb * band - f.padH2;
-    b.aMid = MaxI(0, raw);
-    b.padT2 = b.aMid - raw;
-    const int wantRows = f.midRows - b.padT2;
-    b.midReal = MinI(wantRows, f.ho1 - b.aMid);
-    b.padB2 = f.midRows - b.padT2 - b.midReal;
+    // 卷积反向窗口为 stride×首位置-pad，到 stride×末位置-pad+kernel；越界部分交给 Load3D 补零。
+    const int rawMidRow = geometry.stride2 * geometry.hb * rowBand - geometry.padH2;
+    window.aMid = MaxI(0, rawMidRow);
+    window.padT2 = window.aMid - rawMidRow;
+    const int requiredMidRows = geometry.midRows - window.padT2;
+    window.midReal = MinI(requiredMidRows, geometry.ho1 - window.aMid);
+    window.padB2 = geometry.midRows - window.padT2 - window.midReal;
 
-    const int xRaw = f.stride1 * b.aMid - f.padH1;
-    const int xSpan = f.stride1 * (b.midReal - 1) + f.kh1;
-    b.xRow0 = MaxI(0, xRaw);
-    b.padT1 = b.xRow0 - xRaw;
-    const int xEnd = MinI(f.hi, xRaw + xSpan);
-    b.xRows = xEnd - b.xRow0;
-    b.padB1 = xRaw + xSpan - xEnd;
+    const int rawInputRow = geometry.stride1 * window.aMid - geometry.padH1;
+    const int requiredInputRows = geometry.stride1 * (window.midReal - 1) + geometry.kh1;
+    window.xRow0 = MaxI(0, rawInputRow);
+    window.padT1 = window.xRow0 - rawInputRow;
+    const int inputRowEnd = MinI(geometry.hi, rawInputRow + requiredInputRows);
+    window.xRows = inputRowEnd - window.xRow0;
+    window.padB1 = rawInputRow + requiredInputRows - inputRowEnd;
 
-    b.outCol0 = woSegIdx * f.wseg;
-    b.outCols = MinI(f.wseg, f.wo2 - b.outCol0);
+    window.outCol0 = columnSegment * geometry.wseg;
+    window.outCols = MinI(geometry.wseg, geometry.wo2 - window.outCol0);
 
-    const int mcRaw0 = b.outCol0 * f.stride2 - f.padW2;
-    const int mcRaw1 = (b.outCol0 + b.outCols - 1) * f.stride2 - f.padW2 + f.kw2;
-    b.midCol0 = MaxI(0, mcRaw0);
-    const int mcEnd = MinI(f.wo1, mcRaw1);
-    b.padL2 = b.midCol0 - mcRaw0;
-    b.padR2 = mcRaw1 - mcEnd;
-    b.wSub = mcEnd - b.midCol0;
+    const int rawMidColumnBegin = window.outCol0 * geometry.stride2 - geometry.padW2;
+    const int rawMidColumnEnd = (window.outCol0 + window.outCols - 1) * geometry.stride2 - geometry.padW2 +
+                                geometry.kw2;
+    window.midCol0 = MaxI(0, rawMidColumnBegin);
+    const int midColumnEnd = MinI(geometry.wo1, rawMidColumnEnd);
+    window.padL2 = window.midCol0 - rawMidColumnBegin;
+    window.padR2 = rawMidColumnEnd - midColumnEnd;
+    window.wSub = midColumnEnd - window.midCol0;
 
-    const int icRaw0 = b.midCol0 * f.stride1 - f.padW1;
-    const int icRaw1 = (mcEnd - 1) * f.stride1 - f.padW1 + f.kw1;
-    b.xCol0 = MaxI(0, icRaw0);
-    const int icEnd = MinI(f.wi, icRaw1);
-    b.padL1 = b.xCol0 - icRaw0;
-    b.padR1 = icRaw1 - icEnd;
-    b.wIn = icEnd - b.xCol0;
+    const int rawInputColumnBegin = window.midCol0 * geometry.stride1 - geometry.padW1;
+    const int rawInputColumnEnd = (midColumnEnd - 1) * geometry.stride1 - geometry.padW1 + geometry.kw1;
+    window.xCol0 = MaxI(0, rawInputColumnBegin);
+    const int inputColumnEnd = MinI(geometry.wi, rawInputColumnEnd);
+    window.padL1 = window.xCol0 - rawInputColumnBegin;
+    window.padR1 = rawInputColumnEnd - inputColumnEnd;
+    window.wIn = inputColumnEnd - window.xCol0;
 
-    b.conv1MPerBand = b.midReal * b.wSub;
-    b.conv1Tile = MakeTileSpec(b.conv1MPerBand, f.mMax1, 1);
+    window.conv1MPerBand = window.midReal * window.wSub;
+    window.conv1Tile = MakeTileSpec(window.conv1MPerBand, geometry.mMax1, 1);
 
-    b.rowsPerRun = (b.outCols == f.wo2) ? f.hb : 1;
-    b.mRun = b.rowsPerRun * b.outCols;
-    b.nRun = f.hb / b.rowsPerRun;
-    b.conv2Tile = MakeTileSpec(b.mRun, f.mMax2, 1);
+    // 完整输出宽度可连续跨行；切列后按单行执行，避免把行间空隙误当作连续 M。
+    window.rowsPerRun = (window.outCols == geometry.wo2) ? geometry.hb : 1;
+    window.mRun = window.rowsPerRun * window.outCols;
+    window.nRun = geometry.hb / window.rowsPerRun;
+    window.conv2Tile = MakeTileSpec(window.mRun, geometry.mMax2, 1);
 }
 
 } // namespace FusedMultiConv2dShape
@@ -275,55 +350,70 @@ constexpr int L0B_SLOT_BYTES = L0B_BYTES / 2;
 constexpr int L0C_BYTES = 256 * 1024;
 constexpr int L0C_ELEMS = L0C_BYTES / 4;
 constexpr int L1_SEG_ALIGN = 512;
-constexpr int MTE1_BYTES_PER_CYC = 190;
-constexpr int MTE2_BYTES_PER_CYC = 120;
-constexpr int MTE2_ROW_REQ_CYC = 8;
-constexpr int FIX_L1_BYTES_PER_CYC = 290;
-constexpr int FIX_GM_BYTES_PER_CYC = 105;
-constexpr int FIX_GM_REQ_CYC_X2 = 19;
-constexpr int SCALAR_TILE_CYC = 420;
-constexpr int SCALAR_BASE_CYC = 4000;
+constexpr int MTE1_COST_FACTOR = 190;
+constexpr int MTE2_COST_FACTOR = 120;
+constexpr int MTE2_ROW_COST = 8;
+constexpr int FIX_L1_COST_FACTOR = 290;
+constexpr int FIX_GM_COST_FACTOR = 105;
+constexpr int FIX_GM_REQUEST_COST_X2 = 19;
+constexpr int SCALAR_TILE_COST = 420;
+constexpr int SCALAR_BASE_COST = 4000;
 
+// 根据输入宽度选择默认偏置宽度；elemBytes 为输入元素字节数。
 constexpr int BiasElemBytes(int elemBytes) { return elemBytes == 2 ? 2 : 4; }
 
-struct Params {
-    int n;
-    int ci;
-    int hi;
-    int wi;
-    int cout1;
-    int cout2;
-
-    int kh1;
-    int kw1;
-    int stride1;
-    int stride2;
-
-    int padH1, padW1;
-    int padH2, padW2;
-    int elemBytes;
-
-    int hasDeqScale2 = 0;
-
-    int weightElemBytes = 0;
-    int midElemBytes = 0;
-    int biasElemBytes = 0;
-    int hasQuantScale1 = 0;
-    int hasQuantScale2 = 0;
-
-    int kh2 = 0;
-    int kw2 = 0;
+struct ConvTilingInputs {
+    int batchSize;                    // 批次数
+    int inputChannels;                // 输入通道数
+    int inputHeight;                  // 输入高度
+    int inputWidth;                   // 输入宽度
+    int outputChannels1;              // 第一层输出通道数
+    int outputChannels2;              // 第二层输出通道数
+    int kernelHeight1;                // 第一层卷积核高
+    int kernelWidth1;                 // 第一层卷积核宽
+    int stride1;                      // 第一层高宽公共步长
+    int stride2;                      // 第二层高宽公共步长
+    int paddingHeight1;               // 第一层上下对称补边
+    int paddingWidth1;                // 第一层左右对称补边
+    int paddingHeight2;               // 第二层上下对称补边
+    int paddingWidth2;                // 第二层左右对称补边
+    int inputElementBytes;            // 输入元素字节数
+    int hasDequantScale2 = 0;         // 第二层是否使用反量化表
+    int weightElementBytes = 0;       // 权重元素字节数，零时同输入
+    int intermediateElementBytes = 0; // 中间元素字节数，零时同输入
+    int biasElementBytes = 0;         // 偏置元素字节数，零时按输入推导
+    int hasQuantScale1 = 0;           // 第一层是否使用量化表
+    int hasQuantScale2 = 0;           // 第二层是否使用量化表
+    int kernelHeight2 = 0;            // 第二层卷积核高，零时同第一层
+    int kernelWidth2 = 0;             // 第二层卷积核宽，零时同第一层
 };
 
-constexpr int WeightElemBytes(const Params& p) { return p.weightElemBytes == 0 ? p.elemBytes : p.weightElemBytes; }
-constexpr int MidElemBytes(const Params& p) { return p.midElemBytes == 0 ? p.elemBytes : p.midElemBytes; }
-constexpr int ParamBiasElemBytes(const Params& p)
+// 读取权重元素宽度；inputs 为卷积配置，未指定时沿用输入宽度。
+constexpr int WeightElemBytes(const ConvTilingInputs& inputs)
 {
-    return p.biasElemBytes == 0 ? BiasElemBytes(p.elemBytes) : p.biasElemBytes;
+    return inputs.weightElementBytes == 0 ? inputs.inputElementBytes : inputs.weightElementBytes;
+}
+// 读取中间元素宽度；inputs 为卷积配置，未指定时沿用输入宽度。
+constexpr int MidElemBytes(const ConvTilingInputs& inputs)
+{
+    return inputs.intermediateElementBytes == 0 ? inputs.inputElementBytes : inputs.intermediateElementBytes;
+}
+// 读取偏置元素宽度；inputs 为卷积配置，未指定时按输入类型推导。
+constexpr int ParamBiasElemBytes(const ConvTilingInputs& inputs)
+{
+    return inputs.biasElementBytes == 0 ? BiasElemBytes(inputs.inputElementBytes) : inputs.biasElementBytes;
 }
 
-constexpr int Kh2(const Params& p) { return p.kh2 == 0 ? p.kh1 : p.kh2; }
-constexpr int Kw2(const Params& p) { return p.kw2 == 0 ? p.kw1 : p.kw2; }
+// 读取第二层卷积核高；inputs 为卷积配置，零值时沿用第一层。
+constexpr int Kh2(const ConvTilingInputs& inputs)
+{
+    return inputs.kernelHeight2 == 0 ? inputs.kernelHeight1 : inputs.kernelHeight2;
+}
+// 读取第二层卷积核宽；inputs 为卷积配置，零值时沿用第一层。
+constexpr int Kw2(const ConvTilingInputs& inputs)
+{
+    return inputs.kernelWidth2 == 0 ? inputs.kernelWidth1 : inputs.kernelWidth2;
+}
 
 enum Reject {
     RJ_OK = 0,
@@ -344,748 +434,903 @@ enum Reject {
     RJ_WSEG,
 };
 
-// 将几何校验返回码转换为错误说明。
-inline const char* RejectText(int r)
+// 返回分块失败原因；reason 为几何校验返回码。
+inline const char* RejectText(int reason)
 {
-    switch (r) {
+    switch (reason) {
         case RJ_OK:
             return "ok";
         case RJ_ELEM_BYTES:
-            return "elemBytes 只能是 1(int8) 或 2(fp16)";
+            return "element width must be 1 (int8) or 2 (fp16)";
         case RJ_SHAPE_POSITIVE:
-            return "形状里有非正数";
+            return "dimensions must be positive";
         case RJ_CHANNEL_C0:
-            return "ci 和 cout1 必须是 C0 的整数倍（C0 = 32/elemBytes）";
+            return "input and intermediate channels must satisfy C0 alignment";
         case RJ_OUT_EMPTY:
-            return "卷积输出为空（kernel 比补零后的输入还大）";
+            return "convolution output is empty";
         case RJ_HB_DIVIDE:
-            return "band 高度不整除 ho2";
+            return "band height must divide output height";
         case RJ_MIDROWS:
-            return "一个 band 需要的 conv1 行数超过了 ho1";
+            return "band has no valid intermediate rows";
         case RJ_TILE_K:
-            return "找不到既整除 K 又装得进 L0A 的 K 切分";
+            return "no valid K tile fits L0A";
         case RJ_M_TILES:
-            return "M 方向的块数超过 MAX_M_TILES";
+            return "M tile count exceeds MAX_M_TILES";
         case RJ_L0C:
-            return "一个 M 子块装不进 L0C";
+            return "M tile exceeds L0C capacity";
         case RJ_L0B:
-            return "权重按 K 折之后仍然装不进 L0B";
+            return "weight segments exceed L0B capacity";
         case RJ_BT:
-            return "bias 的通道数超过一个 BT 槽（512）";
+            return "bias channels exceed BT slot capacity";
         case RJ_L1:
-            return "L1 装不下 fm + mid + w1 + w2";
+            return "L1 allocation exceeds available capacity";
         case RJ_U16:
-            return "指令字段只有 16 位：m1Max（min(midRows,ho1)*wSubMax）或 staging 的位置数（xRows*wInMax）超过 65535";
+            return "instruction extent exceeds the 16-bit limit";
         case RJ_NO_HB:
-            return "没有任何 band 高度能同时满足全部约束";
+            return "no band height satisfies all constraints";
         case RJ_WSEG:
-            return "列分段数不合法（必须在 1..wo2 之间）";
+            return "column segment count must be within output width";
         default:
-            return "未知";
+            return "unknown rejection";
     }
 }
 
-struct Geometry {
-    Params p;
-
-    int c0, weightC0, midC0, c1, midC1;
-    int ho1, wo1, ho2, wo2;
-    int k1, k2;
-
-    int hb, nchunk;
-
-    int wseg, nwseg;
-    int wSubMax, wInMax;
-    int chunkTotal;
-
-    int midRows;
-    int xRows;
-    int m1Max;
-
-    int tileK1, tileK2;
-    int mMax1, mMax2;
-    int l0bChunks1, l0bChunkK1, tilesPerChunk1;
-    int l0bChunks2, l0bChunkK2, tilesPerChunk2;
-    int l0bPP1, l0bPP2;
-    int l0bSlot1Elems, l0bSlot2Elems;
-
-    int l0bElems;
-    int l0cElems;
-
-    int l0cStride;
-
-    int w1Stage, w2Stage;
-
-    int fmElems, midElems, w1Elems, w2Elems;
-    int fmAddr, midAddr, w1Addr, w2Addr, b1Addr, b2Addr;
-    int b1Bytes, b2Bytes;
-    int dq2Addr, dq2Bytes;
-    int q1Addr, q1Bytes;
-    int q2Addr, q2Bytes;
-    int l1Used;
-
-    int xPlane, yPlane;
-
-    int fz1K, fz1N, fz2K, fz2N;
+struct ConvTilingGeometry {
+    ConvTilingInputs inputs;        // 两层卷积输入配置
+    int inputC0;                    // 输入通道打包粒度
+    int weightC0;                   // 权重通道打包粒度
+    int intermediateC0;             // 中间通道打包粒度
+    int inputWeightGroups;          // 输入通道的权重分组数
+    int intermediateWeightGroups;   // 中间通道的权重分组数
+    int outputHeight1;              // 第一层输出高
+    int outputWidth1;               // 第一层输出宽
+    int outputHeight2;              // 第二层输出高
+    int outputWidth2;               // 第二层输出宽
+    int reductionLength1;           // 第一层完整归约长度
+    int reductionLength2;           // 第二层完整归约长度
+    int bandHeight;                 // 输出行带高
+    int heightBandCount;            // 每图高度方向行带数
+    int segmentWidth;               // 输出列段宽度上限
+    int widthSegmentCount;          // 每行带列段数
+    int intermediateWidthMax;       // 中间窗口宽度上限
+    int inputWindowWidthMax;        // 输入窗口宽度上限
+    int totalBandTasks;             // 全部批次的行带列段任务数
+    int intermediateRows;           // 第二层所需中间行跨度
+    int inputWindowRows;            // 输入窗口有效行数上限
+    int intermediatePositionsMax;   // 中间窗口位置数上限
+    int tileK1;                     // 第一层单次归约长度
+    int tileK2;                     // 第二层单次归约长度
+    int tileMMax1;                  // 第一层单次 M 上限
+    int tileMMax2;                  // 第二层单次 M 上限
+    int weightSegmentCount1;        // 第一层权重段数
+    int weightSegmentK1;            // 第一层单段归约长度
+    int kTilesPerWeightSegment1;    // 第一层每权重段 K 分块数
+    int weightSegmentCount2;        // 第二层权重段数
+    int weightSegmentK2;            // 第二层单段归约长度
+    int kTilesPerWeightSegment2;    // 第二层每权重段 K 分块数
+    int l0bPingPong1;               // 第一层 L0B ping/pong 开关
+    int l0bPingPong2;               // 第二层 L0B ping/pong 开关
+    int l0bSlotElements1;           // 第一层 L0B 槽跨度，单位元素
+    int l0bSlotElements2;           // 第二层 L0B 槽跨度，单位元素
+    int l0bElements;                // 共享 L0B 元素容量
+    int l0cElements;                // 共享 L0C 累加元素容量
+    int l0cSlotStride;              // 第一层 L0C 槽跨度，单位元素
+    int weightRing1;                // 第一层权重循环搬运开关
+    int weightRing2;                // 第二层权重循环搬运开关
+    int inputBufferElements;        // L1 输入缓冲元素数
+    int intermediateBufferElements; // L1 中间缓冲元素数
+    int weightBufferElements1;      // L1 第一层权重元素数
+    int weightBufferElements2;      // L1 第二层权重元素数
+    int inputBufferAddress;         // L1 输入缓冲字节地址
+    int intermediateBufferAddress;  // L1 中间缓冲字节地址
+    int weightBufferAddress1;       // L1 第一层权重字节地址
+    int weightBufferAddress2;       // L1 第二层权重字节地址
+    int biasBufferAddress1;         // L1 第一层偏置字节地址
+    int biasBufferAddress2;         // L1 第二层偏置字节地址
+    int biasBufferBytes1;           // 第一层偏置分配字节数
+    int biasBufferBytes2;           // 第二层偏置分配字节数
+    int dequantBufferAddress2;      // L1 第二层反量化表字节地址
+    int dequantBufferBytes2;        // 第二层反量化表分配字节数
+    int quantBufferAddress1;        // L1 第一层量化表字节地址
+    int quantBufferBytes1;          // 第一层量化表分配字节数
+    int quantBufferAddress2;        // L1 第二层量化表字节地址
+    int quantBufferBytes2;          // 第二层量化表分配字节数
+    int l1UsedBytes;                // L1 分配总字节数
+    int inputImageElements;         // 每图输入元素数
+    int outputImageElements;        // 每图输出元素数
+    int filterStorageK1;            // 第一层 FRACTAL_Z 外层 K 维
+    int filterStorageN1;            // 第一层 FRACTAL_Z 外层 N 维
+    int filterStorageK2;            // 第二层 FRACTAL_Z 外层 K 维
+    int filterStorageN2;            // 第二层 FRACTAL_Z 外层 N 维
 };
 
-struct KChoice {
-    int tileK;
-    int mMax;
-    int nTiles;
-    bool ok;
+struct ComputeTileChoice {
+    int tileK;        // 单次归约长度
+    int maxPositions; // 单次 M 上限
+    int tileCount;    // M 分块数
+    bool valid;       // 是否找到合法分块
 };
 
-// 在片上容量约束内选择 K 分块和 M 上限。
-inline KChoice PickTileK(int k, int c0, int elemBytes, int cout, int totalM, int weightBytes)
+// 选择 K 步长及 M 上限；reductionLength/kAlignment 为归约长度/粒度，inputBytes/weightBytes 为元素宽度，
+// outputChannels 为输出通道数，positions 为待划分的位置数。
+inline ComputeTileChoice PickTileK(int reductionLength, int kAlignment, int inputBytes, int outputChannels,
+                                   int positions, int weightBytes)
 {
-    KChoice best;
+    ComputeTileChoice best;
     best.tileK = 0;
-    best.mMax = 0;
-    best.nTiles = 0;
-    best.ok = false;
-    if (k <= 0 || c0 <= 0 || cout <= 0 || totalM <= 0 || weightBytes <= 0) {
+    best.maxPositions = 0;
+    best.tileCount = 0;
+    best.valid = false;
+    if (reductionLength <= 0 || kAlignment <= 0 || outputChannels <= 0 || positions <= 0 || weightBytes <= 0) {
         return best;
     }
 
-    const int mCapC = L0C_ELEMS / Align(cout, MMAD_M0);
+    const int accumulatorLimit = L0C_ELEMS / Align(outputChannels, MMAD_M0);
 
-    const int ckMax = L0B_BYTES / (Align(cout, MMAD_M0) * weightBytes);
-    for (int tk = c0; tk <= k; tk += c0) {
-        if ((k % tk) != 0) {
+    const int weightKLimit = L0B_BYTES / (Align(outputChannels, MMAD_M0) * weightBytes);
+    for (int tileK = kAlignment; tileK <= reductionLength; tileK += kAlignment) {
+        if ((reductionLength % tileK) != 0) {
             continue;
         }
-        if (tk > ckMax) {
-            continue;
-        }
-
-        const int mCapA = L0A_SLOT_BYTES / (tk * elemBytes);
-
-        int mMax = MinI(mCapA, mCapC) / MMAD_M0 * MMAD_M0;
-        if (mMax <= 0) {
-            continue;
-        }
-        if (mMax > totalM) {
-            mMax = totalM;
-        }
-        const int nT = CeilDiv(totalM, mMax);
-        if (nT > MAX_M_TILES) {
+        if (tileK > weightKLimit) {
             continue;
         }
 
-        if (!best.ok || nT < best.nTiles || (nT == best.nTiles && tk > best.tileK)) {
-            best.tileK = tk;
-            best.mMax = mMax;
-            best.nTiles = nT;
-            best.ok = true;
+        const int operandLimit = L0A_SLOT_BYTES / (tileK * inputBytes);
+
+        int maxPositions = MinI(operandLimit, accumulatorLimit) / MMAD_M0 * MMAD_M0;
+        if (maxPositions <= 0) {
+            continue;
+        }
+        if (maxPositions > positions) {
+            maxPositions = positions;
+        }
+        const int tileCount = CeilDiv(positions, maxPositions);
+        if (tileCount > MAX_M_TILES) {
+            continue;
+        }
+
+        if (!best.valid || tileCount < best.tileCount || (tileCount == best.tileCount && tileK > best.tileK)) {
+            best.tileK = tileK;
+            best.maxPositions = maxPositions;
+            best.tileCount = tileCount;
+            best.valid = true;
         }
     }
     return best;
 }
 
-// 在 budget 字节内选择整分 K 的权重段数及段长。
-inline bool PickL0bChunksIn(int cout, int k, int elemBytes, int tileK, int budget, int& chunks, int& chunkK)
+// 选择整分 K 的权重段；outputChannels/reductionLength 为通道/归约长度，weightBytes 为元素宽度，
+// tileK 为归约步长，budgetBytes 为容量，segmentCount/segmentK 接收段数/段长。
+inline bool PickL0bChunksIn(int outputChannels, int reductionLength, int weightBytes, int tileK, int budgetBytes,
+                            int& segmentCount, int& segmentK)
 {
-    const int coutA = Align(cout, MMAD_M0);
-    for (int c = 1; c <= k / tileK; ++c) {
-        if ((k % c) != 0) {
+    const int alignedChannels = Align(outputChannels, MMAD_M0);
+    for (int count = 1; count <= reductionLength / tileK; ++count) {
+        if ((reductionLength % count) != 0) {
             continue;
         }
-        const int ck = k / c;
-        if ((ck % tileK) != 0) {
+        const int candidateK = reductionLength / count;
+        if ((candidateK % tileK) != 0) {
             continue;
         }
-        if (coutA * ck * elemBytes <= budget) {
-            chunks = c;
-            chunkK = ck;
+        if (alignedChannels * candidateK * weightBytes <= budgetBytes) {
+            segmentCount = count;
+            segmentK = candidateK;
             return true;
         }
     }
     return false;
 }
 
-// 选择 L0B 权重分段，优先使用 ping/pong 缓冲。
-inline bool PickL0bChunks(int cout, int k, int elemBytes, int tileK, int& chunks, int& chunkK, int& pingpong)
+// 优先选择 L0B ping/pong；outputChannels/reductionLength 为通道/归约长度，weightBytes/tileK 为元素宽度/步长，
+// segmentCount/segmentK/pingPong 接收段数/段长/缓冲开关。
+inline bool PickL0bChunks(int outputChannels, int reductionLength, int weightBytes, int tileK, int& segmentCount,
+                          int& segmentK, int& pingPong)
 {
-    if (PickL0bChunksIn(cout, k, elemBytes, tileK, L0B_SLOT_BYTES, chunks, chunkK)) {
-        pingpong = 1;
+    if (PickL0bChunksIn(outputChannels, reductionLength, weightBytes, tileK, L0B_SLOT_BYTES, segmentCount, segmentK)) {
+        pingPong = 1;
         return true;
     }
-    pingpong = 0;
-    return PickL0bChunksIn(cout, k, elemBytes, tileK, L0B_BYTES, chunks, chunkK);
+    pingPong = 0;
+    return PickL0bChunksIn(outputChannels, reductionLength, weightBytes, tileK, L0B_BYTES, segmentCount, segmentK);
 }
 
-// 将几何和每核分块数写入 tiling 共用的扁平结构。
-inline void Flatten(const Geometry& g, int chunksPerCore, FlatGeom& f)
+// 写入 kernel 共用参数；geometry 为推导结果，chunksPerCore 为每核任务上限，flat 接收扁平字段。
+inline void Flatten(const ConvTilingGeometry& geometry, int chunksPerCore, FlatGeom& flat)
 {
-    f.n = g.p.n;
-    f.ci = g.p.ci;
-    f.hi = g.p.hi;
-    f.wi = g.p.wi;
-    f.cout1 = g.p.cout1;
-    f.cout2 = g.p.cout2;
-    f.kh1 = g.p.kh1;
-    f.kw1 = g.p.kw1;
-    f.kh2 = Kh2(g.p);
-    f.kw2 = Kw2(g.p);
-    f.stride1 = g.p.stride1;
-    f.stride2 = g.p.stride2;
-    f.padH1 = g.p.padH1;
-    f.padW1 = g.p.padW1;
-    f.padH2 = g.p.padH2;
-    f.padW2 = g.p.padW2;
-    f.elemBytes = g.p.elemBytes;
-    f.weightElemBytes = WeightElemBytes(g.p);
-    f.midElemBytes = MidElemBytes(g.p);
-    f.biasElemBytes = ParamBiasElemBytes(g.p);
+    flat.n = geometry.inputs.batchSize;
+    flat.ci = geometry.inputs.inputChannels;
+    flat.hi = geometry.inputs.inputHeight;
+    flat.wi = geometry.inputs.inputWidth;
+    flat.cout1 = geometry.inputs.outputChannels1;
+    flat.cout2 = geometry.inputs.outputChannels2;
+    flat.kh1 = geometry.inputs.kernelHeight1;
+    flat.kw1 = geometry.inputs.kernelWidth1;
+    flat.kh2 = Kh2(geometry.inputs);
+    flat.kw2 = Kw2(geometry.inputs);
+    flat.stride1 = geometry.inputs.stride1;
+    flat.stride2 = geometry.inputs.stride2;
+    flat.padH1 = geometry.inputs.paddingHeight1;
+    flat.padW1 = geometry.inputs.paddingWidth1;
+    flat.padH2 = geometry.inputs.paddingHeight2;
+    flat.padW2 = geometry.inputs.paddingWidth2;
+    flat.elemBytes = geometry.inputs.inputElementBytes;
+    flat.weightElemBytes = WeightElemBytes(geometry.inputs);
+    flat.midElemBytes = MidElemBytes(geometry.inputs);
+    flat.biasElemBytes = ParamBiasElemBytes(geometry.inputs);
 
-    f.c0 = g.c0;
-    f.weightC0 = g.weightC0;
-    f.midC0 = g.midC0;
-    f.ho1 = g.ho1;
-    f.wo1 = g.wo1;
-    f.ho2 = g.ho2;
-    f.wo2 = g.wo2;
-    f.k1 = g.k1;
-    f.k2 = g.k2;
+    flat.c0 = geometry.inputC0;
+    flat.weightC0 = geometry.weightC0;
+    flat.midC0 = geometry.intermediateC0;
+    flat.ho1 = geometry.outputHeight1;
+    flat.wo1 = geometry.outputWidth1;
+    flat.ho2 = geometry.outputHeight2;
+    flat.wo2 = geometry.outputWidth2;
+    flat.k1 = geometry.reductionLength1;
+    flat.k2 = geometry.reductionLength2;
 
-    f.hb = g.hb;
-    f.nchunk = g.nchunk;
-    f.wseg = g.wseg;
-    f.nwseg = g.nwseg;
-    f.chunkTotal = g.chunkTotal;
-    f.chunksPerCore = chunksPerCore;
+    flat.hb = geometry.bandHeight;
+    flat.nchunk = geometry.heightBandCount;
+    flat.wseg = geometry.segmentWidth;
+    flat.nwseg = geometry.widthSegmentCount;
+    flat.chunkTotal = geometry.totalBandTasks;
+    flat.chunksPerCore = chunksPerCore;
 
-    f.midRows = g.midRows;
-    f.mMax1 = g.mMax1;
-    f.mMax2 = g.mMax2;
-    f.tileK1 = g.tileK1;
-    f.tileK2 = g.tileK2;
-    f.l0bChunks1 = g.l0bChunks1;
-    f.l0bChunkK1 = g.l0bChunkK1;
-    f.tilesPerChunk1 = g.tilesPerChunk1;
-    f.l0bChunks2 = g.l0bChunks2;
-    f.l0bChunkK2 = g.l0bChunkK2;
-    f.tilesPerChunk2 = g.tilesPerChunk2;
-    f.l0bPP1 = g.l0bPP1;
-    f.l0bPP2 = g.l0bPP2;
-    f.l0bSlot1Elems = g.l0bSlot1Elems;
-    f.l0bSlot2Elems = g.l0bSlot2Elems;
-    f.l0bElems = g.l0bElems;
-    f.l0cElems = g.l0cElems;
-    f.l0cStride = g.l0cStride;
-    f.w1Stage = g.w1Stage;
-    f.w2Stage = g.w2Stage;
+    flat.midRows = geometry.intermediateRows;
+    flat.mMax1 = geometry.tileMMax1;
+    flat.mMax2 = geometry.tileMMax2;
+    flat.tileK1 = geometry.tileK1;
+    flat.tileK2 = geometry.tileK2;
+    flat.l0bChunks1 = geometry.weightSegmentCount1;
+    flat.l0bChunkK1 = geometry.weightSegmentK1;
+    flat.tilesPerChunk1 = geometry.kTilesPerWeightSegment1;
+    flat.l0bChunks2 = geometry.weightSegmentCount2;
+    flat.l0bChunkK2 = geometry.weightSegmentK2;
+    flat.tilesPerChunk2 = geometry.kTilesPerWeightSegment2;
+    flat.l0bPP1 = geometry.l0bPingPong1;
+    flat.l0bPP2 = geometry.l0bPingPong2;
+    flat.l0bSlot1Elems = geometry.l0bSlotElements1;
+    flat.l0bSlot2Elems = geometry.l0bSlotElements2;
+    flat.l0bElems = geometry.l0bElements;
+    flat.l0cElems = geometry.l0cElements;
+    flat.l0cStride = geometry.l0cSlotStride;
+    flat.w1Stage = geometry.weightRing1;
+    flat.w2Stage = geometry.weightRing2;
 
-    f.fmAddr = g.fmAddr;
-    f.fmElems = g.fmElems;
-    f.midAddr = g.midAddr;
-    f.midElems = g.midElems;
-    f.w1Addr = g.w1Addr;
-    f.w1Elems = g.w1Elems;
-    f.w2Addr = g.w2Addr;
-    f.w2Elems = g.w2Elems;
-    f.b1Addr = g.b1Addr;
-    f.b2Addr = g.b2Addr;
-    f.dq2Addr = g.dq2Addr;
-    f.q1Addr = g.q1Addr;
-    f.q2Addr = g.q2Addr;
+    flat.fmAddr = geometry.inputBufferAddress;
+    flat.fmElems = geometry.inputBufferElements;
+    flat.midAddr = geometry.intermediateBufferAddress;
+    flat.midElems = geometry.intermediateBufferElements;
+    flat.w1Addr = geometry.weightBufferAddress1;
+    flat.w1Elems = geometry.weightBufferElements1;
+    flat.w2Addr = geometry.weightBufferAddress2;
+    flat.w2Elems = geometry.weightBufferElements2;
+    flat.b1Addr = geometry.biasBufferAddress1;
+    flat.b2Addr = geometry.biasBufferAddress2;
+    flat.dq2Addr = geometry.dequantBufferAddress2;
+    flat.q1Addr = geometry.quantBufferAddress1;
+    flat.q2Addr = geometry.quantBufferAddress2;
 
-    f.xPlane = g.xPlane;
-    f.yPlane = g.yPlane;
-    f.yPlaneM = g.ho2 * g.wo2;
+    flat.xPlane = geometry.inputImageElements;
+    flat.yPlane = geometry.outputImageElements;
+    flat.yPlaneM = geometry.outputHeight2 * geometry.outputWidth2;
 }
 
-// 按元素宽度和权重驻留方式分配 L1 缓冲地址。
-inline void LayOutL1(const Params& p, Geometry& g, int xBytes, int midBytes, int weightBytes, int biasBytes)
+// 分配 L1 字节地址；inputs 为通道配置，geometry 为缓冲大小及输出地址，
+// xBytes/midBytes/weightBytes/biasBytes 分别为输入/中间/权重/偏置元素宽度。
+inline void LayOutL1(const ConvTilingInputs& inputs, ConvTilingGeometry& geometry, int xBytes, int midBytes,
+                     int weightBytes, int biasBytes)
 {
-    g.fmAddr = 0;
-    g.midAddr = Align(g.fmAddr + g.fmElems * xBytes, L1_SEG_ALIGN);
-    g.w1Addr = Align(g.midAddr + g.midElems * midBytes, L1_SEG_ALIGN);
-    g.w2Addr = Align(g.w1Addr + g.w1Elems * weightBytes, L1_SEG_ALIGN);
-    g.b1Addr = Align(g.w2Addr + g.w2Elems * weightBytes, L1_SEG_ALIGN);
-    g.b1Bytes = Align(p.cout1 * biasBytes, L1_SEG_ALIGN);
-    g.b2Addr = g.b1Addr + g.b1Bytes;
-    g.b2Bytes = Align(p.cout2 * biasBytes, L1_SEG_ALIGN);
+    geometry.inputBufferAddress = 0;
+    geometry.intermediateBufferAddress = Align(geometry.inputBufferAddress + geometry.inputBufferElements * xBytes,
+                                               L1_SEG_ALIGN);
+    geometry.weightBufferAddress1 = Align(
+        geometry.intermediateBufferAddress + geometry.intermediateBufferElements * midBytes, L1_SEG_ALIGN);
+    geometry.weightBufferAddress2 = Align(geometry.weightBufferAddress1 + geometry.weightBufferElements1 * weightBytes,
+                                          L1_SEG_ALIGN);
+    geometry.biasBufferAddress1 = Align(geometry.weightBufferAddress2 + geometry.weightBufferElements2 * weightBytes,
+                                        L1_SEG_ALIGN);
+    geometry.biasBufferBytes1 = Align(inputs.outputChannels1 * biasBytes, L1_SEG_ALIGN);
+    geometry.biasBufferAddress2 = geometry.biasBufferAddress1 + geometry.biasBufferBytes1;
+    geometry.biasBufferBytes2 = Align(inputs.outputChannels2 * biasBytes, L1_SEG_ALIGN);
 
-    g.dq2Addr = g.b2Addr + g.b2Bytes;
-    g.dq2Bytes = (p.hasDeqScale2 != 0) ? Align(p.cout2 * (int)sizeof(long long), L1_SEG_ALIGN) : 0;
-    g.q1Addr = g.dq2Addr + g.dq2Bytes;
-    g.q1Bytes = (p.hasQuantScale1 != 0) ? Align(p.cout1 * (int)sizeof(long long), L1_SEG_ALIGN) : 0;
-    g.q2Addr = g.q1Addr + g.q1Bytes;
-    g.q2Bytes = (p.hasQuantScale2 != 0) ? Align(p.cout2 * (int)sizeof(long long), L1_SEG_ALIGN) : 0;
-    g.l1Used = g.q2Addr + g.q2Bytes;
+    geometry.dequantBufferAddress2 = geometry.biasBufferAddress2 + geometry.biasBufferBytes2;
+    geometry.dequantBufferBytes2 = (inputs.hasDequantScale2 != 0) ?
+                                       Align(inputs.outputChannels2 * (int)sizeof(long long), L1_SEG_ALIGN) :
+                                       0;
+    geometry.quantBufferAddress1 = geometry.dequantBufferAddress2 + geometry.dequantBufferBytes2;
+    geometry.quantBufferBytes1 = (inputs.hasQuantScale1 != 0) ?
+                                     Align(inputs.outputChannels1 * (int)sizeof(long long), L1_SEG_ALIGN) :
+                                     0;
+    geometry.quantBufferAddress2 = geometry.quantBufferAddress1 + geometry.quantBufferBytes1;
+    geometry.quantBufferBytes2 = (inputs.hasQuantScale2 != 0) ?
+                                     Align(inputs.outputChannels2 * (int)sizeof(long long), L1_SEG_ALIGN) :
+                                     0;
+    geometry.l1UsedBytes = geometry.quantBufferAddress2 + geometry.quantBufferBytes2;
 }
 
-// 由行带高 hb、列段数 nwseg 和 L1 字节预算计算几何。
-inline int DeriveWith(const Params& p, int hb, int nwseg, int l1Budget, Geometry& g)
+// 校验分块推导的基础输入；inputs 为两层卷积配置，hb 为候选行带高。
+inline int ValidateDeriveInputs(const ConvTilingInputs& inputs, int hb)
 {
-    const int xBytes = p.elemBytes;
-    const int weightBytes = WeightElemBytes(p);
-    const int midBytes = MidElemBytes(p);
-    const int biasBytes = ParamBiasElemBytes(p);
+    const int xBytes = inputs.inputElementBytes;
+    const int weightBytes = WeightElemBytes(inputs);
+    const int midBytes = MidElemBytes(inputs);
+    const int biasBytes = ParamBiasElemBytes(inputs);
     if ((xBytes != 1 && xBytes != 2) || (weightBytes != 1 && weightBytes != 2) || (midBytes != 1 && midBytes != 2) ||
         (biasBytes != 2 && biasBytes != 4)) {
         return RJ_ELEM_BYTES;
     }
-    if (p.n <= 0 || p.ci <= 0 || p.hi <= 0 || p.wi <= 0 || p.cout1 <= 0 || p.cout2 <= 0 || p.kh1 <= 0 || p.kw1 <= 0 ||
-        Kh2(p) <= 0 || Kw2(p) <= 0 || p.stride1 <= 0 || p.stride2 <= 0 || p.padH1 < 0 || p.padW1 < 0 || p.padH2 < 0 ||
-        p.padW2 < 0 || hb <= 0) {
+    if (inputs.batchSize <= 0 || inputs.inputChannels <= 0 || inputs.inputHeight <= 0 || inputs.inputWidth <= 0 ||
+        inputs.outputChannels1 <= 0 || inputs.outputChannels2 <= 0 || inputs.kernelHeight1 <= 0 ||
+        inputs.kernelWidth1 <= 0 || Kh2(inputs) <= 0 || Kw2(inputs) <= 0 || inputs.stride1 <= 0 ||
+        inputs.stride2 <= 0 || inputs.paddingHeight1 < 0 || inputs.paddingWidth1 < 0 || inputs.paddingHeight2 < 0 ||
+        inputs.paddingWidth2 < 0 || hb <= 0) {
         return RJ_SHAPE_POSITIVE;
     }
-
-    g.p = p;
-    g.c0 = 32 / xBytes;
-    g.weightC0 = 32 / weightBytes;
-    g.midC0 = 32 / midBytes;
-
-    if ((p.ci % g.c0) != 0 || (p.ci % g.weightC0) != 0 || (p.cout1 % g.midC0) != 0 || (p.cout1 % g.weightC0) != 0) {
-        return RJ_CHANNEL_C0;
-    }
-
-    g.c1 = p.ci / g.weightC0;
-    g.midC1 = p.cout1 / g.weightC0;
-
-    const int kh1 = p.kh1;
-    const int kw1 = p.kw1;
-    const int kh2 = Kh2(p);
-    const int kw2 = Kw2(p);
-
-    g.ho1 = (p.hi + 2 * p.padH1 - kh1) / p.stride1 + 1;
-    g.wo1 = (p.wi + 2 * p.padW1 - kw1) / p.stride1 + 1;
-    if (g.ho1 <= 0 || g.wo1 <= 0) {
-        return RJ_OUT_EMPTY;
-    }
-    g.ho2 = (g.ho1 + 2 * p.padH2 - kh2) / p.stride2 + 1;
-    g.wo2 = (g.wo1 + 2 * p.padW2 - kw2) / p.stride2 + 1;
-    if (g.ho2 <= 0 || g.wo2 <= 0) {
-        return RJ_OUT_EMPTY;
-    }
-
-    g.k1 = p.ci * kh1 * kw1;
-    g.k2 = p.cout1 * kh2 * kw2;
-    g.fz1K = g.c1 * kh1 * kw1;
-    g.fz1N = CeilDiv(p.cout1, MMAD_M0);
-    g.fz2K = g.midC1 * kh2 * kw2;
-    g.fz2N = CeilDiv(p.cout2, MMAD_M0);
-
-    if ((g.ho2 % hb) != 0) {
-        return RJ_HB_DIVIDE;
-    }
-    if (nwseg <= 0 || nwseg > g.wo2) {
-        return RJ_WSEG;
-    }
-    g.hb = hb;
-    g.nchunk = g.ho2 / hb;
-
-    g.wseg = CeilDiv(g.wo2, nwseg);
-    g.nwseg = CeilDiv(g.wo2, g.wseg);
-    g.chunkTotal = p.n * g.nchunk * g.nwseg;
-
-    g.midRows = p.stride2 * (hb - 1) + kh2;
-
-    const int midRowsCap = MinI(g.midRows, g.ho1);
-
-    g.wSubMax = MinI(g.wo1, (g.wseg - 1) * p.stride2 + kw2);
-    g.wInMax = MinI(p.wi, (g.wSubMax - 1) * p.stride1 + kw1);
-    g.m1Max = midRowsCap * g.wSubMax;
-    g.xRows = MinI(p.stride1 * (midRowsCap - 1) + kh1, p.hi);
-
-    if (g.m1Max > 65535 || (long long)g.xRows * g.wInMax > 65535) {
-        return RJ_U16;
-    }
-
-    const int mRunMax = (g.nwseg == 1) ? (hb * g.wo2) : g.wseg;
-    const int kBlock1 = MaxI(g.c0, g.weightC0);
-    const int kBlock2 = MaxI(g.midC0, g.weightC0);
-
-    if (Align(p.cout1, MMAD_M0) * kBlock1 * weightBytes > L0B_BYTES ||
-        Align(p.cout2, MMAD_M0) * kBlock2 * weightBytes > L0B_BYTES) {
-        return RJ_L0B;
-    }
-    const KChoice kc1 = PickTileK(g.k1, kBlock1, xBytes, p.cout1, g.m1Max, weightBytes);
-    const KChoice kc2 = PickTileK(g.k2, kBlock2, midBytes, p.cout2, mRunMax, weightBytes);
-    if (!kc1.ok || !kc2.ok) {
-        return RJ_TILE_K;
-    }
-    g.tileK1 = kc1.tileK;
-    g.mMax1 = kc1.mMax;
-    g.tileK2 = kc2.tileK;
-    g.mMax2 = kc2.mMax;
-
-    if (!PickL0bChunks(p.cout1, g.k1, weightBytes, g.tileK1, g.l0bChunks1, g.l0bChunkK1, g.l0bPP1) ||
-        !PickL0bChunks(p.cout2, g.k2, weightBytes, g.tileK2, g.l0bChunks2, g.l0bChunkK2, g.l0bPP2)) {
-        return RJ_L0B;
-    }
-
-    if (nwseg > 1 && g.l0bPP1 != 0) {
-        int c1 = 0, ck1 = 0;
-        if (PickL0bChunksIn(p.cout1, g.k1, weightBytes, g.tileK1, L0B_BYTES, c1, ck1) && c1 == 1) {
-            g.l0bChunks1 = c1;
-            g.l0bChunkK1 = ck1;
-        }
-    }
-
-    if (g.l0bChunks1 == 1) {
-        g.l0bPP1 = 0;
-    }
-    if (g.l0bChunks2 == 1) {
-        g.l0bPP2 = 0;
-    }
-    g.tilesPerChunk1 = g.l0bChunkK1 / g.tileK1;
-    g.tilesPerChunk2 = g.l0bChunkK2 / g.tileK2;
-
-    for (int c = 0; c < g.nchunk; ++c) {
-        const int raw = p.stride2 * hb * c - p.padH2;
-        const int a = MaxI(0, raw);
-        const int padT2 = a - raw;
-        const int midReal = MinI(g.midRows - padT2, g.ho1 - a);
-        if (midReal <= 0) {
-            return RJ_MIDROWS;
-        }
-        if (MakeTileSpec(midReal * g.wSubMax, g.mMax1, 1).n == 0) {
-            return RJ_M_TILES;
-        }
-    }
-    if (MakeTileSpec(mRunMax, g.mMax2, 1).n == 0) {
-        return RJ_M_TILES;
-    }
-
-    const int l0a1 = Align(g.mMax1, MMAD_M0) * g.tileK1 * xBytes;
-    const int l0a2 = Align(g.mMax2, MMAD_M0) * g.tileK2 * midBytes;
-    if (l0a1 > L0A_SLOT_BYTES || l0a2 > L0A_SLOT_BYTES) {
-        return RJ_TILE_K;
-    }
-
-    const int l0b1 = Align(p.cout1, MMAD_M0) * g.l0bChunkK1 * weightBytes;
-    const int l0b2 = Align(p.cout2, MMAD_M0) * g.l0bChunkK2 * weightBytes;
-    const int use1 = l0b1 * (g.l0bPP1 != 0 ? 2 : 1);
-    const int use2 = l0b2 * (g.l0bPP2 != 0 ? 2 : 1);
-    const int l0bMax = MaxI(use1, use2);
-    if (l0bMax > L0B_BYTES) {
-        return RJ_L0B;
-    }
-    g.l0bElems = l0bMax / weightBytes;
-
-    g.l0bSlot1Elems = (g.l0bPP1 != 0) ? l0b1 / weightBytes : 0;
-    g.l0bSlot2Elems = (g.l0bPP2 != 0) ? l0b2 / weightBytes : 0;
-
-    const int l0c1 = Align(g.mMax1, MMAD_M0) * Align(p.cout1, MMAD_M0);
-    const int l0c2 = Align(g.mMax2, MMAD_M0) * Align(p.cout2, MMAD_M0);
-
-    if (MaxI(l0c1, l0c2) > L0C_ELEMS) {
-        return RJ_L0C;
-    }
-
-    g.l0cStride = (2 * l0c1 <= L0C_ELEMS) ? l0c1 : 0;
-    g.l0cElems = MaxI(g.l0cStride + l0c1, l0c2);
-
-    if (p.cout1 > BT_SLOT_ELEMS || p.cout2 > BT_SLOT_ELEMS) {
-        return RJ_BT;
-    }
-
-    g.fmElems = g.xRows * g.wInMax * p.ci;
-    g.midElems = g.m1Max * p.cout1;
-    const int w1Full = Align(p.cout1, MMAD_M0) * g.k1;
-    const int w2Full = Align(p.cout2, MMAD_M0) * g.k2;
-
-    const int w1Ring = 2 * Align(p.cout1, MMAD_M0) * g.l0bChunkK1;
-    const int w2Ring = 2 * Align(p.cout2, MMAD_M0) * g.l0bChunkK2;
-    const bool w1CanStage = (g.l0bChunks1 > 1) && (w1Ring < w1Full);
-    const bool w2CanStage = (g.l0bChunks2 > 1) && (w2Ring < w2Full);
-
-    const bool w2Bigger = (w2Full - w2Ring) >= (w1Full - w1Ring);
-    int modes[4];
-    modes[0] = 0;
-    modes[1] = w2Bigger ? 2 : 1;
-    modes[2] = w2Bigger ? 1 : 2;
-    modes[3] = 3;
-
-    const int budget = (l1Budget > 0) ? l1Budget : 0x7fffffff;
-    int used = -1;
-    for (int mi = 0; mi < 4; ++mi) {
-        const int mode = modes[mi];
-        const int s1 = (mode & 1) != 0 ? 1 : 0;
-        const int s2 = (mode & 2) != 0 ? 1 : 0;
-        if ((s1 != 0 && !w1CanStage) || (s2 != 0 && !w2CanStage)) {
-            continue;
-        }
-        g.w1Stage = s1;
-        g.w2Stage = s2;
-        g.w1Elems = (s1 != 0) ? w1Ring : w1Full;
-        g.w2Elems = (s2 != 0) ? w2Ring : w2Full;
-        LayOutL1(p, g, xBytes, midBytes, weightBytes, biasBytes);
-        if (g.l1Used <= budget) {
-            used = mode;
-            break;
-        }
-    }
-    if (used < 0) {
-        return RJ_L1;
-    }
-
-    g.xPlane = p.ci * p.hi * p.wi;
-    g.yPlane = p.cout2 * g.ho2 * g.wo2;
     return RJ_OK;
 }
 
-// 估算最忙核心的计算和搬运周期。
-inline long long CoreCostCycles(const Geometry& g, int chunksPerCore)
+// 推导通道分组、两层输出和归约长度；inputs 为输入配置，geometry 接收几何结果。
+inline int DeriveConvolutionGeometry(const ConvTilingInputs& inputs, ConvTilingGeometry& geometry)
 {
-    FlatGeom f;
-    Flatten(g, chunksPerCore, f);
-    const int cout1A = Align(g.p.cout1, MMAD_M0);
-    const int cout2A = Align(g.p.cout2, MMAD_M0);
-    const int xBytes = g.p.elemBytes;
-    const int midBytes = MidElemBytes(g.p);
-    const int wBytes = WeightElemBytes(g.p);
+    geometry.inputs = inputs;
+    geometry.inputC0 = 32 / inputs.inputElementBytes;
+    geometry.weightC0 = 32 / WeightElemBytes(inputs);
+    geometry.intermediateC0 = 32 / MidElemBytes(inputs);
+    if ((inputs.inputChannels % geometry.inputC0) != 0 || (inputs.inputChannels % geometry.weightC0) != 0 ||
+        (inputs.outputChannels1 % geometry.intermediateC0) != 0 || (inputs.outputChannels1 % geometry.weightC0) != 0) {
+        return RJ_CHANNEL_C0;
+    }
+    geometry.inputWeightGroups = inputs.inputChannels / geometry.weightC0;
+    geometry.intermediateWeightGroups = inputs.outputChannels1 / geometry.weightC0;
+    geometry.outputHeight1 = (inputs.inputHeight + 2 * inputs.paddingHeight1 - inputs.kernelHeight1) / inputs.stride1 +
+                             1;
+    geometry.outputWidth1 = (inputs.inputWidth + 2 * inputs.paddingWidth1 - inputs.kernelWidth1) / inputs.stride1 + 1;
+    if (geometry.outputHeight1 <= 0 || geometry.outputWidth1 <= 0) {
+        return RJ_OUT_EMPTY;
+    }
+    geometry.outputHeight2 = (geometry.outputHeight1 + 2 * inputs.paddingHeight2 - Kh2(inputs)) / inputs.stride2 + 1;
+    geometry.outputWidth2 = (geometry.outputWidth1 + 2 * inputs.paddingWidth2 - Kw2(inputs)) / inputs.stride2 + 1;
+    if (geometry.outputHeight2 <= 0 || geometry.outputWidth2 <= 0) {
+        return RJ_OUT_EMPTY;
+    }
+    geometry.reductionLength1 = inputs.inputChannels * inputs.kernelHeight1 * inputs.kernelWidth1;
+    geometry.reductionLength2 = inputs.outputChannels1 * Kh2(inputs) * Kw2(inputs);
+    geometry.filterStorageK1 = geometry.inputWeightGroups * inputs.kernelHeight1 * inputs.kernelWidth1;
+    geometry.filterStorageN1 = CeilDiv(inputs.outputChannels1, MMAD_M0);
+    geometry.filterStorageK2 = geometry.intermediateWeightGroups * Kh2(inputs) * Kw2(inputs);
+    geometry.filterStorageN2 = CeilDiv(inputs.outputChannels2, MMAD_M0);
+    return RJ_OK;
+}
 
-    const int yBytes = g.p.hasDeqScale2 ? 2 : midBytes;
-    const int kPerMmad1 = (xBytes == 2) ? 16 : 32;
-    const int kPerMmad2 = (midBytes == 2) ? 16 : 32;
+// 反推输出行带所需的中间及输入窗口；hb/nwseg 为候选划分，geometry 为已知卷积几何。
+inline int DeriveWindowGeometry(const ConvTilingInputs& inputs, int hb, int nwseg, ConvTilingGeometry& geometry)
+{
+    if ((geometry.outputHeight2 % hb) != 0) {
+        return RJ_HB_DIVIDE;
+    }
+    if (nwseg <= 0 || nwseg > geometry.outputWidth2) {
+        return RJ_WSEG;
+    }
+    geometry.bandHeight = hb;
+    geometry.heightBandCount = geometry.outputHeight2 / hb;
+    geometry.segmentWidth = CeilDiv(geometry.outputWidth2, nwseg);
+    geometry.widthSegmentCount = CeilDiv(geometry.outputWidth2, geometry.segmentWidth);
+    geometry.totalBandTasks = inputs.batchSize * geometry.heightBandCount * geometry.widthSegmentCount;
+    // 连续输出的覆盖范围为步长乘间隔数，再加本层卷积核跨度。
+    geometry.intermediateRows = inputs.stride2 * (hb - 1) + Kh2(inputs);
+    const int midRowsCap = MinI(geometry.intermediateRows, geometry.outputHeight1);
+    geometry.intermediateWidthMax = MinI(geometry.outputWidth1,
+                                         (geometry.segmentWidth - 1) * inputs.stride2 + Kw2(inputs));
+    geometry.inputWindowWidthMax = MinI(inputs.inputWidth,
+                                        (geometry.intermediateWidthMax - 1) * inputs.stride1 + inputs.kernelWidth1);
+    geometry.intermediatePositionsMax = midRowsCap * geometry.intermediateWidthMax;
+    geometry.inputWindowRows = MinI(inputs.stride1 * (midRowsCap - 1) + inputs.kernelHeight1, inputs.inputHeight);
+    if (geometry.intermediatePositionsMax > 65535 ||
+        (long long)geometry.inputWindowRows * geometry.inputWindowWidthMax > 65535) {
+        return RJ_U16;
+    }
+    return RJ_OK;
+}
 
-    int bands[3] = {0, g.nchunk / 2, g.nchunk - 1};
-    int wsegs[3] = {0, g.nwseg / 2, g.nwseg - 1};
-    long long wCube = 0, wMte1 = 0, wMte2 = 0, wFix = 0, wScalar = 0;
-    for (int bi = 0; bi < 3; ++bi) {
-        for (int wj = 0; wj < 3; ++wj) {
-            const int band = bands[bi];
-            const int woSegIdx = wsegs[wj];
-            if (band < 0 || woSegIdx < 0) {
+// 选择两层的 K 步长和 M 上限；inputs/geometry 为输入及窗口几何，mRunMax 为第二层单次 M 范围。
+inline int SelectComputeTiles(const ConvTilingInputs& inputs, int mRunMax, ConvTilingGeometry& geometry)
+{
+    const int weightBytes = WeightElemBytes(inputs);
+    const int kBlock1 = MaxI(geometry.inputC0, geometry.weightC0);
+    const int kBlock2 = MaxI(geometry.intermediateC0, geometry.weightC0);
+    if (Align(inputs.outputChannels1, MMAD_M0) * kBlock1 * weightBytes > L0B_BYTES ||
+        Align(inputs.outputChannels2, MMAD_M0) * kBlock2 * weightBytes > L0B_BYTES) {
+        return RJ_L0B;
+    }
+    const ComputeTileChoice tileChoice1 = PickTileK(geometry.reductionLength1, kBlock1, inputs.inputElementBytes,
+                                                    inputs.outputChannels1, geometry.intermediatePositionsMax,
+                                                    weightBytes);
+    const ComputeTileChoice tileChoice2 = PickTileK(geometry.reductionLength2, kBlock2, MidElemBytes(inputs),
+                                                    inputs.outputChannels2, mRunMax, weightBytes);
+    if (!tileChoice1.valid || !tileChoice2.valid) {
+        return RJ_TILE_K;
+    }
+    geometry.tileK1 = tileChoice1.tileK;
+    geometry.tileMMax1 = tileChoice1.maxPositions;
+    geometry.tileK2 = tileChoice2.tileK;
+    geometry.tileMMax2 = tileChoice2.maxPositions;
+    return RJ_OK;
+}
+
+// 配置权重段和 L0B 复用；nwseg 为候选列段数，inputs/geometry 为卷积配置及分块结果。
+inline int SelectWeightSegments(const ConvTilingInputs& inputs, int nwseg, ConvTilingGeometry& geometry)
+{
+    const int weightBytes = WeightElemBytes(inputs);
+    if (!PickL0bChunks(inputs.outputChannels1, geometry.reductionLength1, weightBytes, geometry.tileK1,
+                       geometry.weightSegmentCount1, geometry.weightSegmentK1, geometry.l0bPingPong1) ||
+        !PickL0bChunks(inputs.outputChannels2, geometry.reductionLength2, weightBytes, geometry.tileK2,
+                       geometry.weightSegmentCount2, geometry.weightSegmentK2, geometry.l0bPingPong2)) {
+        return RJ_L0B;
+    }
+    if (nwseg > 1 && geometry.l0bPingPong1 != 0) {
+        int segmentCount = 0, segmentK = 0;
+        if (PickL0bChunksIn(inputs.outputChannels1, geometry.reductionLength1, weightBytes, geometry.tileK1, L0B_BYTES,
+                            segmentCount, segmentK) &&
+            segmentCount == 1) {
+            geometry.weightSegmentCount1 = segmentCount;
+            geometry.weightSegmentK1 = segmentK;
+        }
+    }
+    if (geometry.weightSegmentCount1 == 1) {
+        geometry.l0bPingPong1 = 0;
+    }
+    if (geometry.weightSegmentCount2 == 1) {
+        geometry.l0bPingPong2 = 0;
+    }
+    geometry.kTilesPerWeightSegment1 = geometry.weightSegmentK1 / geometry.tileK1;
+    geometry.kTilesPerWeightSegment2 = geometry.weightSegmentK2 / geometry.tileK2;
+    return RJ_OK;
+}
+
+// 检查边界行带的有效 M 划分；inputs/geometry 为卷积配置及候选几何，mRunMax 为第二层 M 范围。
+inline int ValidateBandTiles(const ConvTilingInputs& inputs, int mRunMax, const ConvTilingGeometry& geometry)
+{
+    for (int bandIndex = 0; bandIndex < geometry.heightBandCount; ++bandIndex) {
+        const int rawMidRow = inputs.stride2 * geometry.bandHeight * bandIndex - inputs.paddingHeight2;
+        const int midRowBegin = MaxI(0, rawMidRow);
+        const int topPadding2 = midRowBegin - rawMidRow;
+        const int validMidRows = MinI(geometry.intermediateRows - topPadding2, geometry.outputHeight1 - midRowBegin);
+        if (validMidRows <= 0) {
+            return RJ_MIDROWS;
+        }
+        if (MakeTileSpec(validMidRows * geometry.intermediateWidthMax, geometry.tileMMax1, 1).n == 0) {
+            return RJ_M_TILES;
+        }
+    }
+    return MakeTileSpec(mRunMax, geometry.tileMMax2, 1).n == 0 ? RJ_M_TILES : RJ_OK;
+}
+
+// 检查 L0A/L0B 占用并记录缓冲跨度；inputs 为元素宽度配置，geometry 接收容量结果。
+inline int ConfigureOperandBuffers(const ConvTilingInputs& inputs, ConvTilingGeometry& geometry)
+{
+    const int l0a1 = Align(geometry.tileMMax1, MMAD_M0) * geometry.tileK1 * inputs.inputElementBytes;
+    const int l0a2 = Align(geometry.tileMMax2, MMAD_M0) * geometry.tileK2 * MidElemBytes(inputs);
+    if (l0a1 > L0A_SLOT_BYTES || l0a2 > L0A_SLOT_BYTES) {
+        return RJ_TILE_K;
+    }
+    const int weightBytes = WeightElemBytes(inputs);
+    const int l0b1 = Align(inputs.outputChannels1, MMAD_M0) * geometry.weightSegmentK1 * weightBytes;
+    const int l0b2 = Align(inputs.outputChannels2, MMAD_M0) * geometry.weightSegmentK2 * weightBytes;
+    const int usedBytes1 = l0b1 * (geometry.l0bPingPong1 != 0 ? 2 : 1);
+    const int usedBytes2 = l0b2 * (geometry.l0bPingPong2 != 0 ? 2 : 1);
+    const int l0bMax = MaxI(usedBytes1, usedBytes2);
+    if (l0bMax > L0B_BYTES) {
+        return RJ_L0B;
+    }
+    geometry.l0bElements = l0bMax / weightBytes;
+    geometry.l0bSlotElements1 = (geometry.l0bPingPong1 != 0) ? l0b1 / weightBytes : 0;
+    geometry.l0bSlotElements2 = (geometry.l0bPingPong2 != 0) ? l0b2 / weightBytes : 0;
+    return RJ_OK;
+}
+
+// 配置两层共用的 L0C 和固定分层 BT；inputs/geometry 为通道及 M 分块配置。
+inline int ConfigureAccumulatorBuffers(const ConvTilingInputs& inputs, ConvTilingGeometry& geometry)
+{
+    const int l0c1 = Align(geometry.tileMMax1, MMAD_M0) * Align(inputs.outputChannels1, MMAD_M0);
+    const int l0c2 = Align(geometry.tileMMax2, MMAD_M0) * Align(inputs.outputChannels2, MMAD_M0);
+    if (MaxI(l0c1, l0c2) > L0C_ELEMS) {
+        return RJ_L0C;
+    }
+    // 第一层能容纳两份累加结果时启用 ping/pong，第二层仍复用 L0C 起始地址。
+    geometry.l0cSlotStride = (2 * l0c1 <= L0C_ELEMS) ? l0c1 : 0;
+    geometry.l0cElements = MaxI(geometry.l0cSlotStride + l0c1, l0c2);
+    return inputs.outputChannels1 > BT_SLOT_ELEMS || inputs.outputChannels2 > BT_SLOT_ELEMS ? RJ_BT : RJ_OK;
+}
+
+// 按驻留优先级选择 L1 权重布局；inputs/geometry 为配置及容量，l1Budget 为可用字节数。
+inline int SelectL1WeightLayout(const ConvTilingInputs& inputs, int l1Budget, ConvTilingGeometry& geometry)
+{
+    geometry.inputBufferElements = geometry.inputWindowRows * geometry.inputWindowWidthMax * inputs.inputChannels;
+    geometry.intermediateBufferElements = geometry.intermediatePositionsMax * inputs.outputChannels1;
+    const int w1Full = Align(inputs.outputChannels1, MMAD_M0) * geometry.reductionLength1;
+    const int w2Full = Align(inputs.outputChannels2, MMAD_M0) * geometry.reductionLength2;
+    const int w1Ring = 2 * Align(inputs.outputChannels1, MMAD_M0) * geometry.weightSegmentK1;
+    const int w2Ring = 2 * Align(inputs.outputChannels2, MMAD_M0) * geometry.weightSegmentK2;
+    const bool w1CanStage = (geometry.weightSegmentCount1 > 1) && (w1Ring < w1Full);
+    const bool w2CanStage = (geometry.weightSegmentCount2 > 1) && (w2Ring < w2Full);
+    const bool w2Bigger = (w2Full - w2Ring) >= (w1Full - w1Ring);
+    const int modes[4] = {0, w2Bigger ? 2 : 1, w2Bigger ? 1 : 2, 3};
+    const int budget = (l1Budget > 0) ? l1Budget : 0x7fffffff;
+    // 优先两套权重常驻；容量不足时先循环搬运更能节省空间的一层。
+    for (int modeIndex = 0; modeIndex < 4; ++modeIndex) {
+        const int mode = modes[modeIndex];
+        const int stage1 = (mode & 1) != 0 ? 1 : 0;
+        const int stage2 = (mode & 2) != 0 ? 1 : 0;
+        if ((stage1 != 0 && !w1CanStage) || (stage2 != 0 && !w2CanStage)) {
+            continue;
+        }
+        geometry.weightRing1 = stage1;
+        geometry.weightRing2 = stage2;
+        geometry.weightBufferElements1 = (stage1 != 0) ? w1Ring : w1Full;
+        geometry.weightBufferElements2 = (stage2 != 0) ? w2Ring : w2Full;
+        LayOutL1(inputs, geometry, inputs.inputElementBytes, MidElemBytes(inputs), WeightElemBytes(inputs),
+                 ParamBiasElemBytes(inputs));
+        if (geometry.l1UsedBytes <= budget) {
+            return RJ_OK;
+        }
+    }
+    return RJ_L1;
+}
+
+// 推导一组完整候选；inputs 为卷积配置，hb/nwseg 为划分，l1Budget 为预算，geometry 接收结果。
+inline int DeriveWith(const ConvTilingInputs& inputs, int hb, int nwseg, int l1Budget, ConvTilingGeometry& geometry)
+{
+    int status = ValidateDeriveInputs(inputs, hb);
+    if (status != RJ_OK) {
+        return status;
+    }
+    status = DeriveConvolutionGeometry(inputs, geometry);
+    if (status != RJ_OK) {
+        return status;
+    }
+    status = DeriveWindowGeometry(inputs, hb, nwseg, geometry);
+    if (status != RJ_OK) {
+        return status;
+    }
+    const int mRunMax = (geometry.widthSegmentCount == 1) ? (hb * geometry.outputWidth2) : geometry.segmentWidth;
+    if ((status = SelectComputeTiles(inputs, mRunMax, geometry)) != RJ_OK ||
+        (status = SelectWeightSegments(inputs, nwseg, geometry)) != RJ_OK ||
+        (status = ValidateBandTiles(inputs, mRunMax, geometry)) != RJ_OK ||
+        (status = ConfigureOperandBuffers(inputs, geometry)) != RJ_OK ||
+        (status = ConfigureAccumulatorBuffers(inputs, geometry)) != RJ_OK ||
+        (status = SelectL1WeightLayout(inputs, l1Budget, geometry)) != RJ_OK) {
+        return status;
+    }
+    geometry.inputImageElements = inputs.inputChannels * inputs.inputHeight * inputs.inputWidth;
+    geometry.outputImageElements = inputs.outputChannels2 * geometry.outputHeight2 * geometry.outputWidth2;
+    return RJ_OK;
+}
+
+struct BandCost {
+    long long cube = 0;   // 矩阵计算代价
+    long long mte1 = 0;   // L1 到 L0 搬运代价
+    long long mte2 = 0;   // GM 到 L1 搬运代价
+    long long fix = 0;    // 累加结果输出代价
+    long long scalar = 0; // 分块调度代价
+};
+
+// 估算一个行带的矩阵计算代价；geometry 为候选几何，band 为裁剪后的执行窗口。
+inline long long EstimateBandCubeCost(const ConvTilingGeometry& geometry, const BandLite& band)
+{
+    const int cout1A = Align(geometry.inputs.outputChannels1, MMAD_M0);
+    const int cout2A = Align(geometry.inputs.outputChannels2, MMAD_M0);
+    const int cubeKFactor1 = (geometry.inputs.inputElementBytes == 2) ? 16 : 32;
+    const int cubeKFactor2 = (MidElemBytes(geometry.inputs) == 2) ? 16 : 32;
+    long long cost = 0;
+    for (int tileIndex = 0; tileIndex < band.conv1Tile.n; ++tileIndex) {
+        cost += (long long)(Align(TileRows(band.conv1Tile, tileIndex), MMAD_M0) / MMAD_M0) * (cout1A / MMAD_M0) *
+                (geometry.reductionLength1 / cubeKFactor1);
+    }
+    for (int runIndex = 0; runIndex < band.nRun; ++runIndex) {
+        for (int tileIndex = 0; tileIndex < band.conv2Tile.n; ++tileIndex) {
+            cost += (long long)(Align(TileRows(band.conv2Tile, tileIndex), MMAD_M0) / MMAD_M0) * (cout2A / MMAD_M0) *
+                    (geometry.reductionLength2 / cubeKFactor2);
+        }
+    }
+    return cost;
+}
+
+// 估算操作数搬运代价；geometry 为候选几何，band 为本行带的有效 M 范围。
+inline long long EstimateBandMte1Cost(const ConvTilingGeometry& geometry, const BandLite& band)
+{
+    const int cout1A = Align(geometry.inputs.outputChannels1, MMAD_M0);
+    const int cout2A = Align(geometry.inputs.outputChannels2, MMAD_M0);
+    const int weightBytes = WeightElemBytes(geometry.inputs);
+    long long operandBytes = (long long)band.conv1MPerBand * geometry.reductionLength1 *
+                                 geometry.inputs.inputElementBytes +
+                             (long long)band.nRun * band.mRun * geometry.reductionLength2 *
+                                 MidElemBytes(geometry.inputs);
+    operandBytes += (geometry.weightSegmentCount1 == 1) ?
+                        (long long)cout1A * geometry.reductionLength1 * weightBytes :
+                        (long long)band.conv1Tile.n * cout1A * geometry.reductionLength1 * weightBytes;
+    operandBytes += (geometry.weightSegmentCount2 == 1) ?
+                        (long long)cout2A * geometry.reductionLength2 * weightBytes :
+                        (long long)band.nRun * band.conv2Tile.n * cout2A * geometry.reductionLength2 * weightBytes;
+    return operandBytes / MTE1_COST_FACTOR;
+}
+
+// 估算输入及循环权重搬运代价；geometry 为驻留配置，band 为有效输入窗口。
+inline long long EstimateBandMte2Cost(const ConvTilingGeometry& geometry, const BandLite& band)
+{
+    const long long inputBytes = (long long)band.xRows * band.wIn * geometry.inputs.inputChannels *
+                                 geometry.inputs.inputElementBytes;
+    long long cost = inputBytes / MTE2_COST_FACTOR;
+    if (band.wIn != geometry.inputs.inputWidth) {
+        cost += (long long)band.xRows * geometry.inputs.inputChannels * MTE2_ROW_COST;
+    }
+    long long ringWeightBytes = 0;
+    if (geometry.weightRing1 != 0) {
+        ringWeightBytes += (long long)band.conv1Tile.n * Align(geometry.inputs.outputChannels1, MMAD_M0) *
+                           geometry.reductionLength1 * WeightElemBytes(geometry.inputs);
+    }
+    if (geometry.weightRing2 != 0) {
+        ringWeightBytes += (long long)band.nRun * band.conv2Tile.n * Align(geometry.inputs.outputChannels2, MMAD_M0) *
+                           geometry.reductionLength2 * WeightElemBytes(geometry.inputs);
+    }
+    return cost + ringWeightBytes / MTE2_COST_FACTOR;
+}
+
+// 估算中间与最终结果写回代价；geometry 为数据通路配置，band 为本行带分块。
+inline long long EstimateBandFixCost(const ConvTilingGeometry& geometry, const BandLite& band)
+{
+    const int cout1A = Align(geometry.inputs.outputChannels1, MMAD_M0);
+    const int cout2A = Align(geometry.inputs.outputChannels2, MMAD_M0);
+    const int outputBytes = geometry.inputs.hasDequantScale2 ? 2 : MidElemBytes(geometry.inputs);
+    long long cost = (long long)band.conv1MPerBand * cout1A * 4 / FIX_L1_COST_FACTOR;
+    const long long outputRequests = (long long)band.nRun * band.conv2Tile.n * cout2A;
+    const long long outputSize = (long long)band.nRun * band.mRun * cout2A * outputBytes;
+    cost += outputRequests * FIX_GM_REQUEST_COST_X2 / 2 + outputSize / FIX_GM_COST_FACTOR;
+    return cost;
+}
+
+// 估算最忙核心的候选代价；geometry 为候选几何，chunksPerCore 为每核最多处理的行带数。
+inline long long CoreCostCycles(const ConvTilingGeometry& geometry, int chunksPerCore)
+{
+    FlatGeom flat;
+    Flatten(geometry, chunksPerCore, flat);
+    const int bands[3] = {0, geometry.heightBandCount / 2, geometry.heightBandCount - 1};
+    const int segments[3] = {0, geometry.widthSegmentCount / 2, geometry.widthSegmentCount - 1};
+    BandCost worst;
+    // 对首、中、尾窗口分别取各流水代价上界，避免边界裁剪低估最忙核心。
+    for (int bandIndex : bands) {
+        for (int segmentIndex : segments) {
+            if (bandIndex < 0 || segmentIndex < 0) {
                 continue;
             }
-            BandLite b;
-            MakeBandLite(f, band, woSegIdx, b);
-            long long cube = 0;
-            for (int i = 0; i < b.conv1Tile.n; ++i) {
-                cube += (long long)(Align(TileRows(b.conv1Tile, i), MMAD_M0) / MMAD_M0) * (cout1A / MMAD_M0) *
-                        (g.k1 / kPerMmad1);
+            BandLite band;
+            MakeBandLite(flat, bandIndex, segmentIndex, band);
+            const long long cube = EstimateBandCubeCost(geometry, band);
+            const long long mte1 = EstimateBandMte1Cost(geometry, band);
+            const long long mte2 = EstimateBandMte2Cost(geometry, band);
+            const long long fix = EstimateBandFixCost(geometry, band);
+            const long long scalar = (long long)(band.conv1Tile.n + band.nRun * band.conv2Tile.n) * SCALAR_TILE_COST;
+            worst.cube = cube > worst.cube ? cube : worst.cube;
+            worst.mte1 = mte1 > worst.mte1 ? mte1 : worst.mte1;
+            worst.mte2 = mte2 > worst.mte2 ? mte2 : worst.mte2;
+            worst.fix = fix > worst.fix ? fix : worst.fix;
+            worst.scalar = scalar > worst.scalar ? scalar : worst.scalar;
+        }
+    }
+    long long residentWeightBytes = 0;
+    if (geometry.weightRing1 == 0) {
+        residentWeightBytes += (long long)Align(geometry.inputs.outputChannels1, MMAD_M0) * geometry.reductionLength1 *
+                               WeightElemBytes(geometry.inputs);
+    }
+    if (geometry.weightRing2 == 0) {
+        residentWeightBytes += (long long)Align(geometry.inputs.outputChannels2, MMAD_M0) * geometry.reductionLength2 *
+                               WeightElemBytes(geometry.inputs);
+    }
+    return (long long)chunksPerCore * (worst.cube + worst.mte1 + worst.mte2 + worst.fix + worst.scalar) +
+           residentWeightBytes / MTE2_COST_FACTOR + SCALAR_BASE_COST;
+}
+
+struct RowBandChoice {
+    int height = 0;             // 最佳完整行带高
+    long long cost = 0;         // 行覆盖代价
+    int stagedLayers = 3;       // 循环搬运权重的层数
+    int firstReject = RJ_NO_HB; // 首个有效候选失败原因
+};
+
+struct SearchCostBounds {
+    long long fullWidth[4] = {-1, -1, -1, -1};  // 各驻留等级的完整行带最小代价
+    long long splitWidth[4] = {-1, -1, -1, -1}; // 各驻留等级的切列最小代价
+};
+
+struct SearchPreference {
+    int stagedLayers = -1;   // 允许的权重循环层数
+    bool allowSplit = false; // 是否允许切列
+    long long cutoff = 0;    // 候选代价上界
+};
+
+struct SplitBandChoice {
+    int height = 0;        // 最佳行带高
+    int segments = 1;      // 最佳列段数
+    int chunksPerCore = 0; // 每核最多行带数
+};
+
+// 校验搜索输入并得到最终输出高宽；inputs 为卷积配置，outputHeight/outputWidth 接收尺寸。
+inline int GetSearchOutputShape(const ConvTilingInputs& inputs, int& outputHeight, int& outputWidth)
+{
+    if (inputs.inputElementBytes != 1 && inputs.inputElementBytes != 2) {
+        return RJ_ELEM_BYTES;
+    }
+    if (inputs.batchSize <= 0 || inputs.inputChannels <= 0 || inputs.inputHeight <= 0 || inputs.inputWidth <= 0 ||
+        inputs.outputChannels1 <= 0 || inputs.outputChannels2 <= 0 || inputs.kernelHeight1 <= 0 ||
+        inputs.kernelWidth1 <= 0 || Kh2(inputs) <= 0 || Kw2(inputs) <= 0 || inputs.stride1 <= 0 ||
+        inputs.stride2 <= 0 || inputs.paddingHeight1 < 0 || inputs.paddingWidth1 < 0 || inputs.paddingHeight2 < 0 ||
+        inputs.paddingWidth2 < 0) {
+        return RJ_SHAPE_POSITIVE;
+    }
+    const int midHeight = (inputs.inputHeight + 2 * inputs.paddingHeight1 - inputs.kernelHeight1) / inputs.stride1 + 1;
+    if (midHeight <= 0) {
+        return RJ_OUT_EMPTY;
+    }
+    outputHeight = (midHeight + 2 * inputs.paddingHeight2 - Kh2(inputs)) / inputs.stride2 + 1;
+    if (outputHeight <= 0) {
+        return RJ_OUT_EMPTY;
+    }
+    const int midWidth = (inputs.inputWidth + 2 * inputs.paddingWidth1 - inputs.kernelWidth1) / inputs.stride1 + 1;
+    if (midWidth <= 0) {
+        return RJ_OUT_EMPTY;
+    }
+    outputWidth = (midWidth + 2 * inputs.paddingWidth2 - Kw2(inputs)) / inputs.stride2 + 1;
+    return outputWidth <= 0 ? RJ_OUT_EMPTY : RJ_OK;
+}
+
+// 搜索完整行带；inputs 为输入，outputHeight/aicNum/l1Budget 为搜索约束，返回最优行带和失败原因。
+inline RowBandChoice SearchFullWidthBands(const ConvTilingInputs& inputs, int outputHeight, int aicNum, int l1Budget)
+{
+    RowBandChoice best;
+    ConvTilingGeometry probe;
+    for (int hb = 1; hb <= outputHeight; ++hb) {
+        if ((outputHeight % hb) != 0) {
+            continue;
+        }
+        const int status = DeriveWith(inputs, hb, 1, l1Budget, probe);
+        if (status != RJ_OK) {
+            if (best.firstReject == RJ_NO_HB && status != RJ_HB_DIVIDE) {
+                best.firstReject = status;
             }
-            for (int r = 0; r < b.nRun; ++r) {
-                for (int q = 0; q < b.conv2Tile.n; ++q) {
-                    cube += (long long)(Align(TileRows(b.conv2Tile, q), MMAD_M0) / MMAD_M0) * (cout2A / MMAD_M0) *
-                            (g.k2 / kPerMmad2);
+            continue;
+        }
+        const long long rounds = CeilDiv(probe.totalBandTasks, aicNum);
+        const long long cost = rounds * (long long)probe.intermediateRows;
+        const int stagedLayers = probe.weightRing1 + probe.weightRing2;
+        if (best.height == 0 || stagedLayers < best.stagedLayers ||
+            (stagedLayers == best.stagedLayers && (cost < best.cost || (cost == best.cost && hb > best.height)))) {
+            best.height = hb;
+            best.cost = cost;
+            best.stagedLayers = stagedLayers;
+        }
+    }
+    return best;
+}
+
+// 汇总两种列布局的最小代价；inputs 为卷积配置，outputHeight/maxSegments 为搜索范围，
+// aicNum/l1Budget 为资源，firstReject 记录首个失败。
+inline SearchCostBounds CollectSearchCosts(const ConvTilingInputs& inputs, int outputHeight, int maxSegments,
+                                           int aicNum, int l1Budget, int& firstReject)
+{
+    SearchCostBounds bounds;
+    ConvTilingGeometry probe;
+    for (int hb = 1; hb <= outputHeight; ++hb) {
+        if ((outputHeight % hb) != 0) {
+            continue;
+        }
+        for (int nw = 1; nw <= maxSegments; ++nw) {
+            const int status = DeriveWith(inputs, hb, nw, l1Budget, probe);
+            if (status != RJ_OK) {
+                if (firstReject == RJ_NO_HB && status != RJ_HB_DIVIDE && status != RJ_WSEG) {
+                    firstReject = status;
                 }
+                continue;
             }
-            long long mte1Bytes = (long long)b.conv1MPerBand * g.k1 * xBytes +
-                                  (long long)b.nRun * b.mRun * g.k2 * midBytes;
-            mte1Bytes += (g.l0bChunks1 == 1) ? (long long)cout1A * g.k1 * wBytes :
-                                               (long long)b.conv1Tile.n * cout1A * g.k1 * wBytes;
-            mte1Bytes += (g.l0bChunks2 == 1) ? (long long)cout2A * g.k2 * wBytes :
-                                               (long long)b.nRun * b.conv2Tile.n * cout2A * g.k2 * wBytes;
-            const long long mte1 = mte1Bytes / MTE1_BYTES_PER_CYC;
-
-            const long long fmBytes = (long long)b.xRows * b.wIn * g.p.ci * xBytes;
-            long long mte2 = fmBytes / MTE2_BYTES_PER_CYC;
-            if (b.wIn != g.p.wi) {
-                mte2 += (long long)b.xRows * g.p.ci * MTE2_ROW_REQ_CYC;
-            }
-
-            long long fix = (long long)b.conv1MPerBand * cout1A * 4 / FIX_L1_BYTES_PER_CYC;
-            const long long gmReq = (long long)b.nRun * b.conv2Tile.n * cout2A;
-            const long long gmBytes = (long long)b.nRun * b.mRun * cout2A * yBytes;
-            fix += gmReq * FIX_GM_REQ_CYC_X2 / 2 + gmBytes / FIX_GM_BYTES_PER_CYC;
-
-            long long wRing = 0;
-            if (g.w1Stage != 0) {
-                wRing += (long long)b.conv1Tile.n * cout1A * g.k1 * wBytes;
-            }
-            if (g.w2Stage != 0) {
-                wRing += (long long)b.nRun * b.conv2Tile.n * cout2A * g.k2 * wBytes;
-            }
-            mte2 += wRing / MTE2_BYTES_PER_CYC;
-            const long long scalar = (long long)(b.conv1Tile.n + b.nRun * b.conv2Tile.n) * SCALAR_TILE_CYC;
-            if (cube > wCube) {
-                wCube = cube;
-            }
-            if (mte1 > wMte1) {
-                wMte1 = mte1;
-            }
-            if (mte2 > wMte2) {
-                wMte2 = mte2;
-            }
-            if (fix > wFix) {
-                wFix = fix;
-            }
-            if (scalar > wScalar) {
-                wScalar = scalar;
+            const int activeCores = MinI(aicNum, probe.totalBandTasks);
+            const int chunksPerCore = CeilDiv(probe.totalBandTasks, activeCores);
+            const long long cost = CoreCostCycles(probe, chunksPerCore);
+            const int stagedLayers = probe.weightRing1 + probe.weightRing2;
+            long long& minimum = nw == 1 ? bounds.fullWidth[stagedLayers] : bounds.splitWidth[stagedLayers];
+            if (minimum < 0 || cost < minimum) {
+                minimum = cost;
             }
         }
     }
-
-    long long wtBytes = 0;
-    if (g.w1Stage == 0) {
-        wtBytes += (long long)cout1A * g.k1 * wBytes;
-    }
-    if (g.w2Stage == 0) {
-        wtBytes += (long long)cout2A * g.k2 * wBytes;
-    }
-    return (long long)chunksPerCore * (wCube + wMte1 + wMte2 + wFix + wScalar) + wtBytes / MTE2_BYTES_PER_CYC +
-           SCALAR_BASE_CYC;
+    return bounds;
 }
 
-// 搜索行带高和列段数，选择估算周期最小的有效几何。
-inline int PickHb(const Params& p, int aicNum, int l1Budget, Geometry& g)
+// 确定可接受的代价区间；bounds 为各驻留等级的最优代价，返回切列许可及阈值。
+inline SearchPreference ChooseSearchPreference(const SearchCostBounds& bounds)
+{
+    SearchPreference preference;
+    for (int stage = 0; stage < 4; ++stage) {
+        if (bounds.fullWidth[stage] >= 0 || bounds.splitWidth[stage] >= 0) {
+            preference.stagedLayers = stage;
+            break;
+        }
+    }
+    if (preference.stagedLayers < 0) {
+        return preference;
+    }
+    const long long fullBest = bounds.fullWidth[preference.stagedLayers];
+    const long long splitBest = bounds.splitWidth[preference.stagedLayers];
+    // 切列至少降低 20% 代价才启用；随后允许 2% 区间内按任务均衡和较少切列择优。
+    preference.allowSplit = splitBest >= 0 && (fullBest < 0 || splitBest * 5 <= fullBest * 4);
+    long long minimumCost = fullBest >= 0 ? fullBest : -1;
+    if (preference.allowSplit && (minimumCost < 0 || splitBest < minimumCost)) {
+        minimumCost = splitBest;
+    }
+    preference.cutoff = minimumCost + minimumCost / 50;
+    return preference;
+}
+
+// 在代价区间内择优；inputs 为卷积配置，outputHeight/maxSegments 为搜索范围，
+// aicNum/l1Budget 为资源，preference 为代价及驻留筛选规则。
+inline SplitBandChoice SearchSplitBands(const ConvTilingInputs& inputs, int outputHeight, int maxSegments, int aicNum,
+                                        int l1Budget, const SearchPreference& preference)
+{
+    SplitBandChoice best;
+    ConvTilingGeometry probe;
+    for (int hb = 1; hb <= outputHeight; ++hb) {
+        if ((outputHeight % hb) != 0) {
+            continue;
+        }
+        for (int nw = 1; nw <= maxSegments; ++nw) {
+            if (DeriveWith(inputs, hb, nw, l1Budget, probe) != RJ_OK ||
+                probe.weightRing1 + probe.weightRing2 != preference.stagedLayers ||
+                (nw > 1 && !preference.allowSplit)) {
+                continue;
+            }
+            const int chunksPerCore = CeilDiv(probe.totalBandTasks, MinI(aicNum, probe.totalBandTasks));
+            if (CoreCostCycles(probe, chunksPerCore) > preference.cutoff) {
+                continue;
+            }
+            if (best.height == 0 || chunksPerCore < best.chunksPerCore ||
+                (chunksPerCore == best.chunksPerCore &&
+                 (nw < best.segments || (nw == best.segments && hb > best.height)))) {
+                best.height = hb;
+                best.segments = nw;
+                best.chunksPerCore = chunksPerCore;
+            }
+        }
+    }
+    return best;
+}
+
+// 搜索行带高和列段数；inputs 为输入，aicNum/l1Budget 为资源，geometry 接收最终可执行几何。
+inline int PickHb(const ConvTilingInputs& inputs, int aicNum, int l1Budget, ConvTilingGeometry& geometry)
 {
     if (aicNum <= 0) {
         aicNum = 1;
     }
-    Geometry probe;
-
-    if (p.elemBytes != 1 && p.elemBytes != 2) {
-        return RJ_ELEM_BYTES;
+    int outputHeight = 0, outputWidth = 0;
+    const int status = GetSearchOutputShape(inputs, outputHeight, outputWidth);
+    if (status != RJ_OK) {
+        return status;
     }
-    if (p.n <= 0 || p.ci <= 0 || p.hi <= 0 || p.wi <= 0 || p.cout1 <= 0 || p.cout2 <= 0 || p.kh1 <= 0 || p.kw1 <= 0 ||
-        Kh2(p) <= 0 || Kw2(p) <= 0 || p.stride1 <= 0 || p.stride2 <= 0 || p.padH1 < 0 || p.padW1 < 0 || p.padH2 < 0 ||
-        p.padW2 < 0) {
-        return RJ_SHAPE_POSITIVE;
-    }
-    const int ho1 = (p.hi + 2 * p.padH1 - p.kh1) / p.stride1 + 1;
-    if (ho1 <= 0) {
-        return RJ_OUT_EMPTY;
-    }
-    const int ho2 = (ho1 + 2 * p.padH2 - Kh2(p)) / p.stride2 + 1;
-    if (ho2 <= 0) {
-        return RJ_OUT_EMPTY;
-    }
-
-    const int wo1 = (p.wi + 2 * p.padW1 - p.kw1) / p.stride1 + 1;
-    if (wo1 <= 0) {
-        return RJ_OUT_EMPTY;
-    }
-    const int wo2 = (wo1 + 2 * p.padW2 - Kw2(p)) / p.stride2 + 1;
-    if (wo2 <= 0) {
-        return RJ_OUT_EMPTY;
-    }
-
-    int bestHb = 0;
-    long long bestCost = 0;
-    int bestStage = 3;
-    int firstReal = RJ_NO_HB;
-    for (int hb = 1; hb <= ho2; ++hb) {
-        if ((ho2 % hb) != 0) {
-            continue;
-        }
-        const int rc = DeriveWith(p, hb, 1, l1Budget, probe);
-        if (rc != RJ_OK) {
-            if (firstReal == RJ_NO_HB && rc != RJ_HB_DIVIDE) {
-                firstReal = rc;
-            }
-            continue;
-        }
-        const long long rounds = CeilDiv(probe.chunkTotal, aicNum);
-        const long long cost = rounds * (long long)probe.midRows;
-
-        const int stg = probe.w1Stage + probe.w2Stage;
-        if (bestHb == 0 || stg < bestStage ||
-            (stg == bestStage && (cost < bestCost || (cost == bestCost && hb > bestHb)))) {
-            bestHb = hb;
-            bestCost = cost;
-            bestStage = stg;
+    RowBandChoice rowChoice = SearchFullWidthBands(inputs, outputHeight, aicNum, l1Budget);
+    if (rowChoice.height != 0) {
+        const long long fullWidthTasks = (long long)inputs.batchSize * (outputHeight / rowChoice.height);
+        if (fullWidthTasks >= (long long)aicNum && fullWidthTasks % (long long)aicNum == 0) {
+            return DeriveWith(inputs, rowChoice.height, 1, l1Budget, geometry);
         }
     }
-
-    if (bestHb != 0) {
-        const long long ct1 = (long long)p.n * (ho2 / bestHb);
-        if (ct1 >= (long long)aicNum && (ct1 % (long long)aicNum) == 0) {
-            return DeriveWith(p, bestHb, 1, l1Budget, g);
-        }
+    const int maxSegments = MinI(aicNum, outputWidth);
+    const auto bounds = CollectSearchCosts(inputs, outputHeight, maxSegments, aicNum, l1Budget, rowChoice.firstReject);
+    const auto preference = ChooseSearchPreference(bounds);
+    const auto splitChoice = preference.stagedLayers >= 0 ?
+                                 SearchSplitBands(inputs, outputHeight, maxSegments, aicNum, l1Budget, preference) :
+                                 SplitBandChoice{};
+    if (splitChoice.height != 0) {
+        return DeriveWith(inputs, splitChoice.height, splitChoice.segments, l1Budget, geometry);
     }
-
-    int bestHb2 = 0;
-    int bestNw = 1;
-    const int nwMax = MinI(aicNum, wo2);
-
-    long long bn1[4] = {-1, -1, -1, -1};
-    long long bng[4] = {-1, -1, -1, -1};
-    for (int hb = 1; hb <= ho2; ++hb) {
-        if ((ho2 % hb) != 0) {
-            continue;
-        }
-        for (int nw = 1; nw <= nwMax; ++nw) {
-            const int rc = DeriveWith(p, hb, nw, l1Budget, probe);
-            if (rc != RJ_OK) {
-                if (firstReal == RJ_NO_HB && rc != RJ_HB_DIVIDE && rc != RJ_WSEG) {
-                    firstReal = rc;
-                }
-                continue;
-            }
-            const int bdCap = (aicNum < probe.chunkTotal) ? aicNum : probe.chunkTotal;
-            const int chunksPerCore = CeilDiv(probe.chunkTotal, bdCap);
-            const long long cost = CoreCostCycles(probe, chunksPerCore);
-            const int stg = probe.w1Stage + probe.w2Stage;
-            if (nw == 1) {
-                if (bn1[stg] < 0 || cost < bn1[stg]) {
-                    bn1[stg] = cost;
-                }
-            } else {
-                if (bng[stg] < 0 || cost < bng[stg]) {
-                    bng[stg] = cost;
-                }
-            }
-        }
-    }
-
-    int useStage = -1;
-    for (int st = 0; st < 4; ++st) {
-        if (bn1[st] >= 0 || bng[st] >= 0) {
-            useStage = st;
-            break;
-        }
-    }
-    if (useStage >= 0) {
-        const long long nw1Best = bn1[useStage];
-        const long long nwgBest = bng[useStage];
-
-        const bool nwgOk = (nwgBest >= 0) && (nw1Best < 0 || nwgBest * 5 <= nw1Best * 4);
-        long long adminMin = -1;
-        if (nw1Best >= 0) {
-            adminMin = nw1Best;
-        }
-        if (nwgOk && (adminMin < 0 || nwgBest < adminMin)) {
-            adminMin = nwgBest;
-        }
-
-        const long long cutoff = adminMin + adminMin / 50;
-
-        int keyChunksPerCore = 0, keyNw = 0, keyHb = 0;
-        for (int hb = 1; hb <= ho2; ++hb) {
-            if ((ho2 % hb) != 0) {
-                continue;
-            }
-            for (int nw = 1; nw <= nwMax; ++nw) {
-                if (DeriveWith(p, hb, nw, l1Budget, probe) != RJ_OK) {
-                    continue;
-                }
-                if (probe.w1Stage + probe.w2Stage != useStage) {
-                    continue;
-                }
-                if (nw > 1 && !nwgOk) {
-                    continue;
-                }
-                const int bdCap = (aicNum < probe.chunkTotal) ? aicNum : probe.chunkTotal;
-                const int chunksPerCore = CeilDiv(probe.chunkTotal, bdCap);
-                if (CoreCostCycles(probe, chunksPerCore) > cutoff) {
-                    continue;
-                }
-                if (bestHb2 == 0 || chunksPerCore < keyChunksPerCore ||
-                    (chunksPerCore == keyChunksPerCore && (nw < keyNw || (nw == keyNw && hb > keyHb)))) {
-                    bestHb2 = hb;
-                    bestNw = nw;
-                    keyChunksPerCore = chunksPerCore;
-                    keyNw = nw;
-                    keyHb = hb;
-                }
-            }
-        }
-    }
-    if (bestHb2 == 0) {
-        if (bestHb == 0) {
-            return firstReal;
-        }
-        return DeriveWith(p, bestHb, 1, l1Budget, g);
-    }
-    return DeriveWith(p, bestHb2, bestNw, l1Budget, g);
+    return rowChoice.height == 0 ? rowChoice.firstReject : DeriveWith(inputs, rowChoice.height, 1, l1Budget, geometry);
 }
 
 } // namespace FusedMultiConv2dShape

@@ -34,44 +34,44 @@ static const char* ArgStr(int argc, char** argv, const char* key, const char* df
 
 int main(int argc, char** argv)
 {
-    Params p;
-    p.n = ArgInt(argc, argv, "--n", 1);
-    p.ci = ArgInt(argc, argv, "--ci", 32);
-    p.hi = ArgInt(argc, argv, "--hi", 288);
-    p.wi = ArgInt(argc, argv, "--wi", 112);
-    p.cout1 = ArgInt(argc, argv, "--cout1", 64);
-    p.cout2 = ArgInt(argc, argv, "--cout2", 96);
-    p.kh1 = ArgInt(argc, argv, "--kh", 3);
-    p.kw1 = ArgInt(argc, argv, "--kw", 3);
+    ConvTilingInputs inputs;
+    inputs.batchSize = ArgInt(argc, argv, "--n", 1);
+    inputs.inputChannels = ArgInt(argc, argv, "--ci", 32);
+    inputs.inputHeight = ArgInt(argc, argv, "--hi", 288);
+    inputs.inputWidth = ArgInt(argc, argv, "--wi", 112);
+    inputs.outputChannels1 = ArgInt(argc, argv, "--cout1", 64);
+    inputs.outputChannels2 = ArgInt(argc, argv, "--cout2", 96);
+    inputs.kernelHeight1 = ArgInt(argc, argv, "--kh", 3);
+    inputs.kernelWidth1 = ArgInt(argc, argv, "--kw", 3);
     // conv2 的核。不给就是 0 = 沿用 conv1（S::Kh2 / S::Kw2 负责翻译）。
-    p.kh2 = ArgInt(argc, argv, "--kh2", 0);
-    p.kw2 = ArgInt(argc, argv, "--kw2", 0);
-    p.stride1 = ArgInt(argc, argv, "--s1", 1);
-    p.stride2 = ArgInt(argc, argv, "--s2", 1);
-    p.padH1 = ArgInt(argc, argv, "--ph1", 0);
-    p.padW1 = ArgInt(argc, argv, "--pw1", 0);
-    p.padH2 = ArgInt(argc, argv, "--ph2", 0);
-    p.padW2 = ArgInt(argc, argv, "--pw2", 0);
+    inputs.kernelHeight2 = ArgInt(argc, argv, "--kh2", 0);
+    inputs.kernelWidth2 = ArgInt(argc, argv, "--kw2", 0);
+    inputs.stride1 = ArgInt(argc, argv, "--s1", 1);
+    inputs.stride2 = ArgInt(argc, argv, "--s2", 1);
+    inputs.paddingHeight1 = ArgInt(argc, argv, "--ph1", 0);
+    inputs.paddingWidth1 = ArgInt(argc, argv, "--pw1", 0);
+    inputs.paddingHeight2 = ArgInt(argc, argv, "--ph2", 0);
+    inputs.paddingWidth2 = ArgInt(argc, argv, "--pw2", 0);
     // s8f16 = int8 进 / fp16 出：入口和 int8 一样（elemBytes = 1），但 L1 末尾
     // 多一段 per-channel 反量化表，所以几何要按带表的算。
     const char* dt = ArgStr(argc, argv, "--dtype", "fp16");
     const bool int8 = std::strcmp(dt, "int8") == 0;
     const bool s8f16 = std::strcmp(dt, "s8f16") == 0;
     const bool a16w8 = std::strcmp(dt, "a16w8") == 0;
-    p.elemBytes = (int8 || s8f16) ? 1 : 2;
-    p.hasDeqScale2 = (s8f16 || a16w8) ? 1 : 0;
-    p.hasQuantScale1 = (int8 || s8f16 || a16w8) ? 1 : 0;
-    p.hasQuantScale2 = int8 ? 1 : 0;
+    inputs.inputElementBytes = (int8 || s8f16) ? 1 : 2;
+    inputs.hasDequantScale2 = (s8f16 || a16w8) ? 1 : 0;
+    inputs.hasQuantScale1 = (int8 || s8f16 || a16w8) ? 1 : 0;
+    inputs.hasQuantScale2 = int8 ? 1 : 0;
     if (a16w8) {
-        p.weightElemBytes = 1;
-        p.midElemBytes = 1;
-        p.biasElemBytes = 4;
+        inputs.weightElementBytes = 1;
+        inputs.intermediateElementBytes = 1;
+        inputs.biasElementBytes = 4;
     }
     const int l1 = ArgInt(argc, argv, "--l1", 1024 * 1024);
     const int aic = ArgInt(argc, argv, "--cores", 8);
 
-    Geometry g;
-    const int rc = PickHb(p, aic, l1, g);
+    ConvTilingGeometry geometry;
+    const int rc = PickHb(inputs, aic, l1, geometry);
     if (rc != RJ_OK) {
         // 带上共用头的修订号。这份头是**算子那份的副本**，过期了预检的结论就和
         // 算子的 tiling 不一致 —— 而不带版本号的话，两边报的是一模一样的一句话，
@@ -91,23 +91,23 @@ int main(int argc, char** argv)
                 "（每带 %d 行、每段 %d 列）| L1 %d/%d 字节 (%.0f%%) | "
                 "tileK %d/%d, M 子块 <=%d/%d 个位置, "
                 "L0B 折 %d/%d 段\n",
-                g.ho1, g.wo1, g.ho2, g.wo2, g.nchunk, g.nwseg, g.chunkTotal, g.hb, g.wseg,
-                g.l1Used, l1, 100.0 * g.l1Used / l1, g.tileK1, g.tileK2, g.mMax1, g.mMax2,
-                g.l0bChunks1, g.l0bChunks2);
-    if (g.nwseg > 1) {
+                geometry.outputHeight1, geometry.outputWidth1, geometry.outputHeight2, geometry.outputWidth2, geometry.heightBandCount, geometry.widthSegmentCount, geometry.totalBandTasks, geometry.bandHeight, geometry.segmentWidth,
+                geometry.l1UsedBytes, l1, 100.0 * geometry.l1UsedBytes / l1, geometry.tileK1, geometry.tileK2, geometry.tileMMax1, geometry.tileMMax2,
+                geometry.weightSegmentCount1, geometry.weightSegmentCount2);
+    if (geometry.widthSegmentCount > 1) {
         std::printf("    按 W 分核：每段算 mid 的 %d 列 / x 的 %d 列（整幅是 %d / %d）\n",
-                    g.wSubMax, g.wInMax, g.wo1, p.wi);
+                    geometry.intermediateWidthMax, geometry.inputWindowWidthMax, geometry.outputWidth1, inputs.inputWidth);
     }
-    if (g.dq2Bytes > 0) {
-        std::printf("    反量化表: %d 字节常驻 L1（%d 个通道 x uint64）\n", g.dq2Bytes, p.cout2);
+    if (geometry.dequantBufferBytes2 > 0) {
+        std::printf("    反量化表: %d 字节常驻 L1（%d 个通道 x uint64）\n", geometry.dequantBufferBytes2, inputs.outputChannels2);
     }
-    if (g.q1Bytes > 0) {
+    if (geometry.quantBufferBytes1 > 0) {
         std::printf("    conv1 重量化表: %d 字节常驻 L1（%d 个通道 x uint64）\n",
-                    g.q1Bytes, p.cout1);
+                    geometry.quantBufferBytes1, inputs.outputChannels1);
     }
-    if (g.q2Bytes > 0) {
+    if (geometry.quantBufferBytes2 > 0) {
         std::printf("    conv2 重量化表: %d 字节常驻 L1（%d 个通道 x uint64）\n",
-                    g.q2Bytes, p.cout2);
+                    geometry.quantBufferBytes2, inputs.outputChannels2);
     }
     return 0;
 }
