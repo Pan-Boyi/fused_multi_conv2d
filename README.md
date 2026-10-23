@@ -113,6 +113,44 @@ python3 run_profile.py profile.json --cases fusion_cases.json \
 `SetM1Dequant` 仅作为日志诊断记录，不用于单独判断根因。
 若 FP16 层没有 ReLU 等 Fixpipe 运算，是否命中一阶段仍以真实图为准。
 
+## 以融合前设备输出验证精度
+
+添加 `--compare-unfused --no-msprof`，用第二阶段融合前两个 ExtendConv2D 的实际设备输出作为 golden：
+
+```bash
+python3 run_profile.py --cases fusion_cases.json --only fusion_a16w8 \
+  --compare-unfused --no-msprof --steps check,case,om,push,prof
+```
+
+同一份 ONNX 编译为两个模型：`om/` 中两个 Pass 均开启，得到一个 FusedMultiConv2d；
+`reference/` 中第一阶段开启、第二阶段关闭，最终图必须保留两个直接连接的 ExtendConv2D。
+两个模型固定同一份权重、scale 和源图，绑定同一 case；基准模型不会退回 CPU golden。
+此模式验证第二阶段融合等价性，不验证第一阶段把 Conv 改为 ExtendConv2D 的等价性。
+
+板侧先运行参考模型，再运行融合模型，逐字节使用同一份 x 和 bias。
+每个模型核对实际输出 dtype、NCHW 形状及字节数；执行失败或输出未写完整时不接受结果。
+INT8 要求逐位相同；FP16 默认相对误差不超过 `1e-3`，参考值为零时要求实际值也为零，
+全部元素均须通过。该模式不使用 `RATIO_MIN` 放宽通过比例，原有 CPU golden 保留不变。
+
+结果自动拉回本地 case 目录的 `comparison_<本次运行标识>/comparison/`：
+
+| 文件 | 内容 |
+| :-- | :-- |
+| `reference.bin` | 两个 ExtendConv2D 的实际输出，作为本次 golden |
+| `fused.bin` | FusedMultiConv2d 的实际输出 |
+| `comparison.json` | 位差数量、超差数量、最大绝对/相对误差、首个超差 NCHW 坐标，以及输入、模型和输出哈希 |
+
+数值失败仍拉回输出和报告，命令返回失败。单个模型执行失败时保存错误及已完成模型的输出。
+对比模式不启用 profiling，避免把两个模型的执行混入性能统计。
+
+只重新编译两个模型可使用 `--steps om`；已有成对模型时可使用 `--steps push,prof`。
+本机直接执行使用 `fc2d.py ... --compare-unfused --steps case,om,run`，或给板侧 runner 传入：
+
+```bash
+python3 run_fused_multi_conv2d.py case.bin FusedMultiConv2d 0 fused.om \
+  --reference-om reference.om --comparison-output comparison
+```
+
 ## 上板 + profiling：run_profile.py
 
 `fc2d.py` 假设你在同一台机器上出 `.om` 又跑。真实情况常常是两台：一台有 CANN 和

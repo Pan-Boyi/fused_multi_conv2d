@@ -1,3 +1,4 @@
+/* Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved. */
 /* libascendcl.so 的桩：让 run_fused_multi_conv2d.py 的整条模型 API 下发路径能在
  * 没有 NPU 的机器上跑完。
  *
@@ -26,6 +27,34 @@ static int    g_loaded = 0;
 
 typedef struct { void* p; size_t n; } Buf;
 typedef struct { Buf* b[MAXIN]; int n; } Dataset;
+typedef struct { uint32_t id; } ModelDesc;
+typedef struct { int reference; char path[1024]; } Model;
+typedef struct { char name[128]; size_t dimCount; int64_t dims[128]; } ModelDims;
+static Model g_models[32];
+static uint32_t g_model_count = 0;
+
+static const char* model_option(uint32_t id, const char* option)
+{
+    char key[128];
+    snprintf(key, sizeof(key), "FC2D_STUB_%s_%s",
+             g_models[id].reference ? "REFERENCE" : "FUSED", option);
+    return getenv(key);
+}
+
+static void trace_execution(uint32_t id, Dataset* input)
+{
+    const char* path = getenv("FC2D_STUB_TRACE");
+    if (!path) return;
+    FILE* stream = fopen(path, "a");
+    if (!stream) return;
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (int i = 0; i < input->n; ++i)
+        for (size_t j = 0; j < input->b[i]->n; ++j)
+            hash = (hash ^ ((uint8_t*)input->b[i]->p)[j]) * UINT64_C(1099511628211);
+    fprintf(stream, "execute %s %d %llu\n", g_models[id].reference ? "reference" : "fused",
+            input->n, (unsigned long long)hash);
+    fclose(stream);
+}
 
 static void load_conf(void)
 {
@@ -79,18 +108,50 @@ int aclmdlLoadFromFile(const char* path, uint32_t* id)
     FILE* f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "[stub] om 打不开: %s\n", path); return 1; }
     fclose(f);
-    *id = 1;
+    if (g_model_count + 1 >= 32) return 1;
+    *id = ++g_model_count;
+    const char* reference = getenv("FC2D_STUB_REFERENCE_OM");
+    g_models[*id].reference = reference ? !strcmp(reference, path) : strstr(path, "/reference/") != NULL;
+    snprintf(g_models[*id].path, sizeof(g_models[*id].path), "%s", path);
     return 0;
 }
 int aclmdlUnload(uint32_t id) { (void)id; return 0; }
-void* aclmdlCreateDesc(void) { load_conf(); return malloc(8); }
+void* aclmdlCreateDesc(void) { load_conf(); return calloc(1, sizeof(ModelDesc)); }
 int aclmdlDestroyDesc(void* d) { free(d); return 0; }
-int aclmdlGetDesc(void* d, uint32_t id) { (void)d; (void)id; return 0; }
+int aclmdlGetDesc(void* d, uint32_t id) { ((ModelDesc*)d)->id = id; return 0; }
 size_t aclmdlGetNumInputs(void* d) { (void)d; load_conf(); return (size_t)g_nin; }
 size_t aclmdlGetNumOutputs(void* d) { (void)d; return 1; }
 size_t aclmdlGetInputSizeByIndex(void* d, size_t i)
 { (void)d; return (i < (size_t)g_nin) ? g_size[i] : 0; }
-size_t aclmdlGetOutputSizeByIndex(void* d, size_t i) { (void)d; (void)i; return g_out; }
+size_t aclmdlGetOutputSizeByIndex(void* d, size_t i)
+{
+    (void)i;
+    const char* value = model_option(((ModelDesc*)d)->id, "SIZE");
+    return value ? (size_t)strtoull(value, NULL, 10) : g_out;
+}
+int aclmdlGetOutputDataType(void* d, size_t i)
+{
+    (void)i;
+    const char* value = model_option(((ModelDesc*)d)->id, "DTYPE");
+    if (!value) value = getenv("FC2D_STUB_OUTPUT_DTYPE");
+    return value ? atoi(value) : 2;
+}
+int aclmdlGetOutputDims(void* d, size_t i, ModelDims* dims)
+{
+    (void)i;
+    const char* value = model_option(((ModelDesc*)d)->id, "SHAPE");
+    if (!value) value = getenv("FC2D_STUB_OUTPUT_SHAPE");
+    if (!value) return 1;
+    memset(dims, 0, sizeof(*dims));
+    strcpy(dims->name, "y");
+    while (*value && dims->dimCount < 128) {
+        char* end;
+        dims->dims[dims->dimCount++] = strtoll(value, &end, 10);
+        if (end == value) return 1;
+        value = *end == ',' ? end + 1 : end;
+    }
+    return *value ? 1 : 0;
+}
 const char* aclmdlGetInputNameByIndex(void* d, size_t i)
 { (void)d; return (i < (size_t)g_nin) ? g_name[i] : ""; }
 const char* aclmdlGetOutputNameByIndex(void* d, size_t i) { (void)d; (void)i; return "y"; }
@@ -110,10 +171,13 @@ int aclmdlAddDatasetBuffer(void* s, void* b)
 
 int aclmdlExecute(uint32_t id, void* in, void* out)
 {
-    (void)id; (void)in;
+    trace_execution(id, (Dataset*)in);
+    if (model_option(id, "EXECUTE_FAIL")) return 1;
     Dataset* o = (Dataset*)out;
     if (!o || o->n < 1) return 1;
-    const char* g = getenv("FC2D_STUB_GOLDEN");
+    if (model_option(id, "SKIP_WRITE")) return 0;
+    const char* g = model_option(id, "OUTPUT");
+    if (!g) g = getenv("FC2D_STUB_GOLDEN");
     if (!g) return 0;                       /* 不给 golden 就只验路径、不验数值 */
     FILE* f = fopen(g, "rb");
     if (!f) { fprintf(stderr, "[stub] golden 打不开: %s\n", g); return 1; }

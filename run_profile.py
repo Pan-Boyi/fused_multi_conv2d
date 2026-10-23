@@ -37,7 +37,7 @@ FusedMultiConv2d 上板执行 + profiling 的总驱动 —— **全部配置来�
 为什么形状必须从**同一处**派生
 ================================================================================
 case.bin 保存逻辑输入、参考输出和属性 spec；ONNX 从 spec 派生，并把两张 filter
-编译成常量。OM 只有 7 个运行输入，公开和私有属性在编译期写入模型。
+和 scale 编译成常量。OM 只有 x 和选配 bias 输入，公开和私有属性在编译期写入模型。
 .om.fc2d.json 用完整 case 与 OM 的 SHA256 绑定这组产物，执行前必须通过核对。
 
 所以这里的派生链是单向的、没有分叉的：
@@ -362,7 +362,7 @@ def preflight(rt):
 
 
 # ---------------------------------------------------------------- 远端脚本
-def remote_script(rt, case_name, om_name, use_msprof, msprof, expected_binding):
+def remote_script(rt, case_name, om_name, use_msprof, msprof, expected_binding, reference_binding=None):
     """Verify this bundle, record the runner RC separately, and return a JSON result.
 
     The profiler may return zero even when its child fails. The application wrapper
@@ -371,18 +371,25 @@ def remote_script(rt, case_name, om_name, use_msprof, msprof, expected_binding):
     wd = "%s/%s" % (rt.dir.rstrip("/"), case_name)
     command = "python3 run_fused_multi_conv2d.py case.bin FusedMultiConv2d %d %s" % (
         rt.device, shlex.quote(om_name))
+    if reference_binding is not None:
+        command += " --reference-om reference.om --comparison-output comparison"
     lines = ["set -o pipefail", "cd %s || exit 1" % shlex.quote(wd)]
     if rt.cann_env:
         lines += ["[ -f %s ] || exit 1; source %s >/dev/null 2>&1" %
                   (shlex.quote(rt.cann_env), shlex.quote(rt.cann_env))]
     lines += [
-        "python3 - %s %s <<'FC2D_VERIFY'" %
-        (shlex.quote(om_name), shlex.quote(json.dumps(expected_binding))),
+        "python3 - %s %s %s <<'FC2D_VERIFY'" %
+        (shlex.quote(om_name), shlex.quote(json.dumps(expected_binding)), shlex.quote(json.dumps(reference_binding))),
         "import json, sys",
         "import run_fused_multi_conv2d as runner",
         "actual = runner.validate_model_binding('case.bin', sys.argv[1])",
         "if actual != json.loads(sys.argv[2]):",
         "    raise SystemExit('remote case/OM differs from the selected local binding')",
+        "expected_reference = json.loads(sys.argv[3])",
+        "if expected_reference is not None:",
+        "    reference = runner.validate_reference_model_binding('case.bin', 'reference.om', sys.argv[1])",
+        "    if reference != expected_reference:",
+        "        raise SystemExit('remote reference OM differs from the selected local binding')",
         "FC2D_VERIFY",
         "[ $? -eq 0 ] || exit 1",
         "APP=$(mktemp); DEVICE_RC=$(mktemp); BEFORE=$(mktemp)",
@@ -466,10 +473,12 @@ def load_profile_state(paths, om_file, rt=None):
 
 
 # ---------------------------------------------------------------- 各步骤
-def do_push(rt, c, paths, om_file):
+def do_push(rt, c, paths, om_file, reference_om=None):
     # Reject stale model/case combinations before any remote mutation.
     import run_fused_multi_conv2d as runner
     runner.validate_model_binding(paths["bin"], om_file)
+    if reference_om is not None:
+        runner.validate_reference_model_binding(paths["bin"], reference_om, om_file)
     binding_file = om_file + ".fc2d.json"
     # 下面要 rm -rf 这个目录。远端路径是 json 给的，先把明显危险的挡掉 ——
     # remote.dir 空着的话 wd 会变成 "/<case 名>"，那条 rm 就打到根目录下面去了。
@@ -492,6 +501,10 @@ def do_push(rt, c, paths, om_file):
         raise RuntimeError("拷 .om 失败")
     if rt.scp_to(binding_file, "%s/%s" % (wd, os.path.basename(binding_file))) != 0:
         raise RuntimeError("拷 .fc2d.json binding 失败")
+    if reference_om is not None:
+        for source, target in ((reference_om, "reference.om"), (reference_om + ".fc2d.json", "reference.om.fc2d.json")):
+            if rt.scp_to(source, "%s/%s" % (wd, target)) != 0:
+                raise RuntimeError("Failed to upload reference model/binding")
     # run_fused_multi_conv2d.py 每次都拷。case.bin 的格式和它是配套的，远端留着一份旧的
     # 会报「case 文件版本 N，本脚本认 M」，而那时人往往已经在查算子了。
     if rt.scp_to(os.path.join(HERE, "run_fused_multi_conv2d.py"), "%s/run_fused_multi_conv2d.py" % wd) != 0:
@@ -499,10 +512,14 @@ def do_push(rt, c, paths, om_file):
     print("[OK] 已拷到 %s:%s" % (rt.target, wd))
 
 
-def do_prof(rt, c, paths, om_file, use_msprof, msprof, show_script=False):
+def do_prof(rt, c, paths, om_file, use_msprof, msprof, show_script=False, reference_om=None):
     import run_fused_multi_conv2d as runner
     binding = runner.validate_model_binding(paths["bin"], om_file)
-    script = remote_script(rt, c["name"], os.path.basename(om_file), use_msprof, msprof, binding)
+    if reference_om is not None and use_msprof:
+        raise RuntimeError("Device reference comparison requires --no-msprof")
+    reference_binding = (runner.validate_reference_model_binding(paths["bin"], reference_om, om_file)
+                         if reference_om is not None else None)
+    script = remote_script(rt, c["name"], os.path.basename(om_file), use_msprof, msprof, binding, reference_binding)
     if show_script:
         print("---- 远端将执行 ----\n%s--------------------" % script)
     log_path = os.path.join(os.path.dirname(paths["bin"]), "execution_%s.log" % uuid.uuid4().hex)
@@ -529,14 +546,62 @@ def do_prof(rt, c, paths, om_file, use_msprof, msprof, show_script=False):
     if result["prof"] is not None and not re.fullmatch(r"PROF_[A-Za-z0-9_.-]+", result["prof"]):
         raise RuntimeError("Invalid PROF directory in remote result")
     state.update(result)
+    if reference_binding is not None:
+        state["reference_binding"] = reference_binding
+        try:
+            state["comparison_report"] = collect_comparison(rt, c, paths, binding, reference_binding)
+            with open(state["comparison_report"]) as stream:
+                state["comparison_passed"] = json.load(stream)["passed"]
+        except (OSError, ValueError, RuntimeError) as exc:
+            state["comparison_error"] = str(exc)
+            state["collection_rc"] = 2
     save_profile_state(paths, state)
     print("[RESULT] Execution log: %s; device RC=%d, profiler RC=%d" %
           (log_path, state["device_rc"], state["profiler_rc"]))
     return state
 
 
+def collect_comparison(rt, case, paths, fused_binding, reference_binding):
+    """拉回本次设备对比输出，核对模型身份、输出摘要和数值报告。"""
+    import run_fused_multi_conv2d as runner
+    destination = os.path.join(os.path.dirname(paths["bin"]), "comparison_" + uuid.uuid4().hex)
+    os.makedirs(destination)
+    remote = "%s/%s/comparison" % (rt.dir.rstrip("/"), case["name"])
+    if rt.scp_from(remote, destination, recursive=True) != 0:
+        raise RuntimeError("Failed to retrieve device comparison outputs")
+    directory = os.path.join(destination, "comparison")
+    report_path = os.path.join(directory, "comparison.json")
+    with open(report_path) as stream:
+        report = json.load(stream)
+    if (report.get("case_sha256") != fused_binding["case_sha256"]
+            or report.get("source_graph_sha256") != fused_binding["fusion"]["source_graph_sha256"]
+            or report.get("golden_source") != "extend_pair_device_output"):
+        raise RuntimeError("Device comparison belongs to a different case/source")
+    outputs = {}
+    for role, binding in (("reference", reference_binding), ("fused", fused_binding)):
+        result = report.get("models", {}).get(role, {})
+        if result and result.get("model_sha256") != binding["model_sha256"]:
+            raise RuntimeError("Device comparison model hash differs: " + role)
+        if result.get("status") == "success":
+            path = os.path.join(directory, role + ".bin")
+            if result.get("output_sha256") != runner._file_sha256(path):
+                raise RuntimeError("Device comparison output hash differs: " + role)
+            with open(path, "rb") as stream:
+                outputs[role] = stream.read()
+    if len(outputs) == 2:
+        expected = reference_binding["output"]
+        actual = runner.compare_device_outputs(outputs["fused"], outputs["reference"],
+                    expected["dtype"], expected["shape"], report["comparison"]["relative_tolerance"])
+        if actual != report.get("comparison") or report.get("passed") != actual["passed"]:
+            raise RuntimeError("Device comparison metrics differ from the retrieved outputs")
+    elif report.get("passed"):
+        raise RuntimeError("Device comparison passed without both outputs")
+    print("[COMPARE] Device reference report: " + report_path)
+    return report_path
+
+
 def execution_failed(state):
-    return any(state.get(key) != 0 for key in
+    return state.get("comparison_passed") is False or any(state.get(key) != 0 for key in
                ("device_rc", "profiler_rc", "collection_rc", "ssh_rc"))
 
 
@@ -689,10 +754,14 @@ def main():
     ap.add_argument("--l1", type=int, default=1024 * 1024, help="形状预检按多大的 L1 算")
     ap.add_argument("--no-msprof", action="store_true",
                     help="远端只跑功能，不套 msprof；自动跳过 pull/export/parse")
+    ap.add_argument("--compare-unfused", action="store_true",
+                    help="以第二阶段融合前两个 ExtendConv2D 的设备输出为 golden，需配合 --no-msprof")
     ap.add_argument("--print-remote-script", action="store_true", help="把远端要执行的 bash 打出来")
     ap.add_argument("--list", action="store_true", help="只列出会做哪些")
     ap.add_argument("--keep-going", action="store_true", help="某条失败了继续做下一条")
     args = ap.parse_args()
+    if args.compare_unfused and not args.no_msprof:
+        ap.error("--compare-unfused requires --no-msprof")
 
     doc, remote_cfg, prof_cfg, cases = load_config(args.config)
     if args.cases:
@@ -775,15 +844,21 @@ def main():
             if "case" in steps:
                 fc2d.do_case(c, paths)
             if "om" in steps:
-                fc2d.do_om(c, paths, soc)
+                if args.compare_unfused:
+                    fc2d.do_om(c, paths, soc, compare_unfused=True)
+                else:
+                    fc2d.do_om(c, paths, soc)
 
             om_file = select_model(paths) if {"push", "prof", "pull", "export", "parse"} & set(steps) else None
+            reference_om = None
+            if args.compare_unfused and om_file is not None:
+                reference_om = select_model({"omdir": os.path.join(os.path.dirname(paths["bin"]), "reference")})
             if "push" in steps:
-                do_push(rt, c, paths, om_file)
+                do_push(rt, c, paths, om_file, reference_om=reference_om)
             state = None
             if "prof" in steps:
                 state = do_prof(rt, c, paths, om_file, use_msprof, prof_cfg["msprof"],
-                                args.print_remote_script)
+                                args.print_remote_script, reference_om=reference_om)
             if {"pull", "export", "parse"} & set(steps):
                 state = load_profile_state(paths, om_file, rt if "pull" in steps else None)
             if "pull" in steps:

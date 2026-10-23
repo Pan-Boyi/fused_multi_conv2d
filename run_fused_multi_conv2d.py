@@ -44,6 +44,7 @@ om，旧的反而先匹配上」。
 import ctypes
 import hashlib
 import json
+import math
 import os
 import statistics
 import struct
@@ -112,6 +113,12 @@ DTYPE_FP16 = 0
 DTYPE_INT8 = 1
 DTYPE_S8F16 = 2
 DTYPE_A16W8 = 3
+
+
+class AclModelDimensions(ctypes.Structure):
+    """aclmdlIODims 的公开 ABI。"""
+    _fields_ = [("name", ctypes.c_char * 128), ("dimCount", ctypes.c_size_t),
+                ("dims", ctypes.c_int64 * 128)]
 
 
 def model_input_slots(info):
@@ -210,6 +217,68 @@ def validate_model_binding(case_path, om_path):
         die("OM SHA256 differs from its binding; regenerate case and OM")
     if binding.get("case_sha256") != _file_sha256(case_path):
         die("case SHA256 differs from the compiled OM binding; weights/attributes changed, regenerate OM")
+    return binding
+
+
+def _reference_report_valid(report, names, source_sha256):
+    """确认参考模型保留两个 ExtendConv2D，只关闭第二阶段融合 Pass。"""
+    expected = {"pipeline": "extend_pair_reference", "source_conv_count": 2,
+                "unfused_convolution_count": 2, "fused_node_count": 0,
+                "stage1_extend_count": 2, "input_names": names,
+                "source_graph_sha256": source_sha256,
+                "enabled_passes": ["Conv2DFixPipeToExtendConv2DFusionPass"],
+                "disabled_passes": ["ExtendConv2DPairToFusedMultiConv2DFusionPass"]}
+    if not isinstance(report, dict) or any(report.get(k) != v for k, v in expected.items()):
+        return False
+    digest = report.get("model_graph_sha256")
+    return isinstance(digest, str) and len(digest) == 64 and all(c in "0123456789abcdef" for c in digest)
+
+
+def write_reference_model_binding(case_path, reference_om_path, fused_om_path, report,
+                                  expected_case_sha256=None):
+    """将未融合 OM 绑定到同一 case、源图及待测融合 OM。"""
+    if os.path.realpath(reference_om_path) == os.path.realpath(fused_om_path):
+        die("reference OM must be a separate file from fused OM")
+    fused = validate_model_binding(case_path, fused_om_path)
+    case_sha = _file_sha256(case_path)
+    if expected_case_sha256 is not None and case_sha != expected_case_sha256:
+        die("case SHA256 changed during reference compilation; regenerate case and both OMs")
+    tensors, _, _, _, _, _, _, info = load_case(case_path)
+    names = model_input_slots(info)
+    if not _reference_report_valid(report, names, fused["fusion"]["source_graph_sha256"]):
+        die("verified unfused reference graph report is required")
+    dtype, shape, _ = tensors["y_expect"]
+    binding = {"schema_version": 1, "role": "extend_pair_reference", "case_abi": CASE_VERSION,
+               "case_sha256": case_sha, "model_sha256": _file_sha256(reference_om_path),
+               "fused_model_sha256": fused["model_sha256"], "model_input_names": names,
+               "output": {"dtype": dtype, "shape": shape}, "reference": report}
+    path = reference_om_path + ".fc2d.json"
+    with open(path + ".tmp", "w") as stream:
+        json.dump(binding, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+    os.replace(path + ".tmp", path)
+    return path
+
+
+def validate_reference_model_binding(case_path, reference_om_path, fused_om_path):
+    """在访问设备前验证参考模型与待测模型的 case、源图和输出契约。"""
+    fused = validate_model_binding(case_path, fused_om_path)
+    try:
+        with open(reference_om_path + ".fc2d.json") as stream:
+            binding = json.load(stream)
+    except (OSError, ValueError) as exc:
+        die("missing or invalid reference binding: %s" % exc)
+    tensors, _, _, _, _, _, _, info = load_case(case_path)
+    dtype, shape, _ = tensors["y_expect"]
+    names = model_input_slots(info)
+    expected = {"schema_version": 1, "role": "extend_pair_reference", "case_abi": CASE_VERSION,
+                "case_sha256": _file_sha256(case_path), "model_sha256": _file_sha256(reference_om_path),
+                "fused_model_sha256": fused["model_sha256"], "model_input_names": names,
+                "output": {"dtype": dtype, "shape": shape}}
+    if not isinstance(binding, dict) or any(binding.get(k) != v for k, v in expected.items()):
+        die("reference binding differs from case/fused OM; rebuild both models")
+    if not _reference_report_valid(binding.get("reference"), names, fused["fusion"]["source_graph_sha256"]):
+        die("invalid unfused reference graph contract; rebuild reference OM")
     return binding
 
 
@@ -406,6 +475,8 @@ def load_acl():
         ("aclmdlGetNumOutputs", [c_vp], c_sz),
         ("aclmdlGetInputSizeByIndex", [c_vp, c_sz], c_sz),
         ("aclmdlGetOutputSizeByIndex", [c_vp, c_sz], c_sz),
+        ("aclmdlGetOutputDataType", [c_vp, c_sz], c_i),
+        ("aclmdlGetOutputDims", [c_vp, c_sz, ctypes.POINTER(AclModelDimensions)], c_i),
         ("aclmdlCreateDataset", [], c_vp),
         ("aclmdlDestroyDataset", [c_vp], c_i),
         ("aclmdlAddDatasetBuffer", [c_vp, c_vp], c_i),
@@ -989,13 +1060,269 @@ def evaluate(got, want, rel_tol, sentinel=Y_SENTINEL_U16):
     return r
 
 
+# ---------------------------------------------------------------- 融合前后设备输出对比
+def _require_acl_success(result, operation):
+    if result != ACL_SUCCESS:
+        raise RuntimeError("%s failed: %d %s" % (operation, result, acl_err_detail()))
+
+
+def execute_bound_model(acl, om_path, tensors, input_names, output_dtype, output_shape, repeat=1, warmup=0):
+    """在已有 ACL context 中执行一个 OM，并释放该模型占用的全部资源。"""
+    model_id, desc, datasets = None, None, []
+    allocations, buffers, host_buffers = [], [], []
+    try:
+        model = ctypes.c_uint32()
+        _require_acl_success(acl.aclmdlLoadFromFile(os.fsencode(om_path), ctypes.byref(model)), "aclmdlLoadFromFile")
+        model_id = model.value
+        desc = acl.aclmdlCreateDesc()
+        if not desc:
+            raise RuntimeError("aclmdlCreateDesc returned null")
+        _require_acl_success(acl.aclmdlGetDesc(desc, model_id), "aclmdlGetDesc")
+        count = int(acl.aclmdlGetNumInputs(desc))
+        if count != len(input_names) or int(acl.aclmdlGetNumOutputs(desc)) != 1:
+            raise RuntimeError("model input/output count differs from bound source graph")
+        shape = AclModelDimensions()
+        _require_acl_success(acl.aclmdlGetOutputDims(desc, 0, ctypes.byref(shape)), "aclmdlGetOutputDims")
+        if shape.dimCount > 128 or list(shape.dims[:shape.dimCount]) != list(output_shape):
+            raise RuntimeError("model output shape differs from bound NCHW output")
+        if int(acl.aclmdlGetOutputDataType(desc, 0)) != output_dtype:
+            raise RuntimeError("model output dtype differs from bound output dtype")
+        ordered_inputs = [None] * count
+        for name in input_names:
+            index = ctypes.c_size_t()
+            _require_acl_success(acl.aclmdlGetInputIndexByName(desc, name.encode(), ctypes.byref(index)),
+                                 "aclmdlGetInputIndexByName(%s)" % name)
+            if index.value >= count or ordered_inputs[index.value] is not None:
+                raise RuntimeError("model input names are not a one-to-one mapping")
+            ordered_inputs[index.value] = name
+        output_size = math.prod(output_shape) * DTYPE_SIZE[output_dtype]
+        if int(acl.aclmdlGetOutputSizeByIndex(desc, 0)) != output_size:
+            raise RuntimeError("model output byte size differs from bound output")
+        payloads = []
+        for index, name in enumerate(ordered_inputs):
+            data = tensors[name][2]
+            if int(acl.aclmdlGetInputSizeByIndex(desc, index)) != len(data):
+                raise RuntimeError("model input byte size differs for %s" % name)
+            payloads.append(data)
+        payloads.append(bytes([Y_SENTINEL_BYTE]) * output_size)
+        for payload in payloads:
+            device = ctypes.c_void_p()
+            _require_acl_success(acl.aclrtMalloc(ctypes.byref(device), len(payload), ACL_MEM_MALLOC_HUGE_FIRST), "aclrtMalloc")
+            allocations.append(device)
+            host = ctypes.create_string_buffer(payload, len(payload))
+            host_buffers.append(host)
+            _require_acl_success(acl.aclrtMemcpy(device, len(payload), ctypes.cast(host, ctypes.c_void_p),
+                                               len(payload), ACL_MEMCPY_HOST_TO_DEVICE), "aclrtMemcpy H2D")
+            buffer = acl.aclCreateDataBuffer(device, len(payload))
+            if not buffer:
+                raise RuntimeError("aclCreateDataBuffer returned null")
+            buffers.append(buffer)
+        for _ in range(2):
+            dataset = acl.aclmdlCreateDataset()
+            if not dataset:
+                raise RuntimeError("aclmdlCreateDataset returned null")
+            datasets.append(dataset)
+        for buffer in buffers[:-1]:
+            _require_acl_success(acl.aclmdlAddDatasetBuffer(datasets[0], buffer), "aclmdlAddDatasetBuffer input")
+        _require_acl_success(acl.aclmdlAddDatasetBuffer(datasets[1], buffers[-1]), "aclmdlAddDatasetBuffer output")
+        durations = []
+        for iteration in range(warmup + repeat):
+            start = time.perf_counter()
+            _require_acl_success(acl.aclmdlExecute(model_id, datasets[0], datasets[1]), "aclmdlExecute")
+            if iteration >= warmup:
+                durations.append((time.perf_counter() - start) * 1e6)
+        output = ctypes.create_string_buffer(output_size)
+        _require_acl_success(acl.aclrtMemcpy(ctypes.cast(output, ctypes.c_void_p), output_size, allocations[-1],
+                                           output_size, ACL_MEMCPY_DEVICE_TO_HOST), "aclrtMemcpy D2H")
+        raw = output.raw[:output_size]
+        # 换用另一种预填值再执行一次，识别未写输出，且允许合法的全 127 整数结果。
+        probe_pattern = ctypes.create_string_buffer(bytes([0x80]) * output_size, output_size)
+        _require_acl_success(acl.aclrtMemcpy(allocations[-1], output_size, ctypes.cast(probe_pattern, ctypes.c_void_p),
+                                           output_size, ACL_MEMCPY_HOST_TO_DEVICE), "aclrtMemcpy output write probe")
+        _require_acl_success(acl.aclmdlExecute(model_id, datasets[0], datasets[1]), "aclmdlExecute output write probe")
+        _require_acl_success(acl.aclrtMemcpy(ctypes.cast(output, ctypes.c_void_p), output_size, allocations[-1],
+                                           output_size, ACL_MEMCPY_DEVICE_TO_HOST), "aclrtMemcpy write probe D2H")
+        if output.raw[:output_size] != raw:
+            raise RuntimeError("output depends on initial buffer contents or is nondeterministic; possible unwritten output")
+        return raw, durations
+    finally:
+        for dataset in datasets:
+            acl.aclmdlDestroyDataset(dataset)
+        for buffer in buffers:
+            acl.aclDestroyDataBuffer(buffer)
+        for allocation in allocations:
+            acl.aclrtFree(allocation)
+        if model_id is not None:
+            acl.aclmdlUnload(model_id)
+        if desc:
+            acl.aclmdlDestroyDesc(desc)
+
+
+def compare_device_outputs(fused_raw, reference_raw, output_dtype, output_shape, rel_tol=1e-3):
+    """以未融合设备输出为 golden；整数逐位相等，浮点逐元素应用既有误差阈值。"""
+    if not math.isfinite(rel_tol) or rel_tol < 0:
+        raise ValueError("comparison tolerance must be finite and nonnegative")
+    if output_dtype not in (1, 2) or len(fused_raw) != len(reference_raw):
+        raise ValueError("comparison requires equally sized fp16 or int8 outputs")
+    count = math.prod(output_shape)
+    if len(fused_raw) != count * DTYPE_SIZE[output_dtype]:
+        raise ValueError("raw output size differs from output shape")
+    fused = decode_y(fused_raw, output_dtype == 2)
+    reference = decode_y(reference_raw, output_dtype == 2)
+    bit_mismatches, tolerance_mismatches, nonfinite = 0, 0, {"reference": 0, "fused": 0}
+    max_abs, max_rel, first, first_outside = 0.0, 0.0, None, None
+    for index, (got, want) in enumerate(zip(fused[0], reference[0])):
+        bit_diff = fused[1][index] != reference[1][index]
+        bit_mismatches += int(bit_diff)
+        finite = math.isfinite(got) and math.isfinite(want)
+        nonfinite["reference"] += int(not math.isfinite(want))
+        nonfinite["fused"] += int(not math.isfinite(got))
+        absolute = abs(got - want) if finite else float("inf")
+        relative = absolute / abs(want) if finite and want != 0 else (0.0 if absolute == 0 else float("inf"))
+        max_abs, max_rel = max(max_abs, absolute), max(max_rel, relative)
+        outside = not finite or (bit_diff if output_dtype == 2 else relative > rel_tol)
+        tolerance_mismatches += int(outside)
+        if (first is None and (bit_diff or outside)) or (first_outside is None and outside):
+            remainder, coordinates = index, []
+            for size in reversed(output_shape):
+                coordinates.append(remainder % size)
+                remainder //= size
+            mismatch = {"flat_index": index, "coordinates": list(reversed(coordinates)),
+                        "reference": want if math.isfinite(want) else str(want),
+                        "fused": got if math.isfinite(got) else str(got), "outside_tolerance": outside}
+            if first is None:
+                first = mismatch
+            if first_outside is None and outside:
+                first_outside = mismatch
+    return {"dtype": DTYPE_NAME[output_dtype], "shape": list(output_shape), "elements": count,
+            "bitwise_equal": fused_raw == reference_raw, "bit_mismatch_count": bit_mismatches,
+            "tolerance_mismatch_count": tolerance_mismatches, "first_mismatch": first,
+            "first_tolerance_mismatch": first_outside,
+            "max_absolute_error": max_abs if math.isfinite(max_abs) else "inf",
+            "max_relative_error": max_rel if math.isfinite(max_rel) else "inf", "nonfinite_count": nonfinite,
+            "relative_tolerance": 0.0 if output_dtype == 2 else rel_tol,
+            "zero_reference_absolute_tolerance": 0.0,
+            "required_pass_ratio": 1.0, "passed": tolerance_mismatches == 0}
+
+
+def run_reference_comparison(case_path, fused_om_path, reference_om_path, device_id=0,
+                             output_dir=None, rel_tol=1e-3, repeat=1, warmup=0):
+    """在同一设备依次运行两个绑定模型，保存原始输出及可追溯的精度报告。"""
+    fused_binding = validate_model_binding(case_path, fused_om_path)
+    reference_binding = validate_reference_model_binding(case_path, reference_om_path, fused_om_path)
+    tensors, _, _, _, _, _, _, info = load_case(case_path)
+    dtype, shape, _ = tensors["y_expect"]
+    if not math.isfinite(rel_tol) or rel_tol < 0 or repeat < 1 or warmup < 0:
+        die("invalid comparison tolerance/repeat/warmup")
+    suffix = "_".join(binding[key][:12] for binding, key in
+                      ((fused_binding, "case_sha256"), (fused_binding, "model_sha256"),
+                       (reference_binding, "model_sha256")))
+    output_dir = os.path.abspath(output_dir or os.path.join(os.path.dirname(fused_om_path), "comparison_" + suffix))
+    os.makedirs(output_dir, exist_ok=True)
+    for filename in ("reference.bin", "fused.bin", "comparison.json"):
+        stale = os.path.join(output_dir, filename)
+        if os.path.isfile(stale):
+            os.unlink(stale)
+    names = model_input_slots(info)
+    report = {"schema_version": 1, "run_id": str(time.time_ns()),
+              "golden_source": "extend_pair_device_output", "cpu_golden_used": False, "device_id": device_id,
+              "case_sha256": fused_binding["case_sha256"], "source_graph_sha256": fused_binding["fusion"]["source_graph_sha256"],
+              "runtime_input_sha256": {name: hashlib.sha256(tensors[name][2]).hexdigest() for name in names},
+              "output": {"dtype": DTYPE_NAME[dtype], "shape": shape},
+              "models": {"reference": {"model_sha256": reference_binding["model_sha256"], "status": "not_run"},
+                         "fused": {"model_sha256": fused_binding["model_sha256"], "status": "not_run"}},
+              "passed": False}
+    raw_outputs = {}
+    acl, initialized, device_set, stream = None, False, False, ctypes.c_void_p()
+    try:
+        acl = load_acl()
+        required = ("aclmdlLoadFromFile", "aclmdlUnload", "aclmdlCreateDesc", "aclmdlDestroyDesc",
+                    "aclmdlGetDesc", "aclmdlGetNumInputs", "aclmdlGetNumOutputs", "aclmdlGetInputIndexByName",
+                    "aclmdlGetInputSizeByIndex", "aclmdlGetOutputSizeByIndex", "aclmdlGetOutputDataType",
+                    "aclmdlGetOutputDims", "aclmdlCreateDataset", "aclmdlDestroyDataset", "aclmdlAddDatasetBuffer", "aclmdlExecute")
+        missing = [name for name in required if getattr(acl, name, None) is None]
+        if missing:
+            raise RuntimeError("comparison requires ACL model APIs: %s" % ", ".join(missing))
+        _require_acl_success(acl.aclInit(None), "aclInit")
+        initialized = True
+        _require_acl_success(acl.aclrtSetDevice(device_id), "aclrtSetDevice")
+        device_set = True
+        _require_acl_success(acl.aclrtCreateStream(ctypes.byref(stream)), "aclrtCreateStream")
+        for role, path, binding in (("reference", reference_om_path, reference_binding),
+                                     ("fused", fused_om_path, fused_binding)):
+            entry = {"model_sha256": binding["model_sha256"], "status": "failed"}
+            report["models"][role] = entry
+            try:
+                raw, durations = execute_bound_model(acl, path, tensors, names, dtype, shape, repeat, warmup)
+                raw_outputs[role] = raw
+                raw_path = os.path.join(output_dir, role + ".bin")
+                with open(raw_path + ".tmp", "wb") as output:
+                    output.write(raw)
+                os.replace(raw_path + ".tmp", raw_path)
+                entry.update(status="success", output_file=os.path.basename(raw_path),
+                             output_sha256=hashlib.sha256(raw).hexdigest(), durations_us=durations,
+                             output_write_probe="two_initial_patterns_equal", execution_count=warmup + repeat + 1)
+            except (RuntimeError, OSError) as exc:
+                entry["error"] = str(exc)
+        if len(raw_outputs) == 2:
+            report["comparison"] = compare_device_outputs(raw_outputs["fused"], raw_outputs["reference"], dtype, shape, rel_tol)
+            report["passed"] = report["comparison"]["passed"]
+    except (RuntimeError, OSError, SystemExit) as exc:
+        report["error"] = str(exc)
+    finally:
+        if acl is not None:
+            if stream.value:
+                acl.aclrtDestroyStream(stream)
+            if device_set:
+                acl.aclrtResetDevice(device_id)
+            if initialized:
+                acl.aclFinalize()
+        report_path = os.path.join(output_dir, "comparison.json")
+        with open(report_path + ".tmp", "w") as output:
+            json.dump(report, output, indent=2, sort_keys=True, allow_nan=False)
+            output.write("\n")
+        os.replace(report_path + ".tmp", report_path)
+    print("[%s] fused vs unfused device output; report: %s" % ("PASS" if report["passed"] else "FAIL", report_path))
+    if "comparison" in report:
+        comparison = report["comparison"]
+        print("  bit mismatches=%d tolerance mismatches=%d max_abs=%s max_rel=%s" %
+              (comparison["bit_mismatch_count"], comparison["tolerance_mismatch_count"],
+               comparison["max_absolute_error"], comparison["max_relative_error"]))
+    return 0 if report["passed"] else 1
+
+
+def _extract_pair_arguments(argv):
+    """提取具名对比选项，避免路径被既有位置参数解析器误认为主 OM。"""
+    remaining, options, index = [], {}, 0
+    while index < len(argv):
+        argument = argv[index]
+        flag, separator, inline = argument.partition("=")
+        if flag in ("--reference-om", "--comparison-output"):
+            if flag in options:
+                die("duplicate option %s" % flag)
+            if separator:
+                value = inline
+            else:
+                index += 1
+                value = argv[index] if index < len(argv) else ""
+            if not value or value.startswith("--"):
+                die("%s requires a path" % flag)
+            options[flag] = value
+        else:
+            remaining.append(argument)
+        index += 1
+    if "--comparison-output" in options and "--reference-om" not in options:
+        die("--comparison-output requires --reference-om")
+    return remaining, options
+
+
 # ---------------------------------------------------------------- main
 def main():
     # 参数是位置式的，而最自然的写法 `脚本 case.bin om_out/fp16` 会把 om 目录
     # 撞到「算子名」那一位上 —— 于是去找一个名叫 "om_out/fp16/" 的算子，报
     # MatchOpModel fail，看着像算子没装。真踩过，所以这里按**形状**认参数，
     # 不强求顺序：带 / 或者是个已存在的目录，那就是 om 目录；纯数字是 device。
-    argv = sys.argv[1:]
+    argv, pair_options = _extract_pair_arguments(sys.argv[1:])
     dry_run = "--dry-run" in argv
     if dry_run:
         argv = [a for a in argv if a != "--dry-run"]
@@ -1090,6 +1417,13 @@ def main():
             die("%s 既不是文件也不是目录" % om_arg)
 
     tensors, gold_nonzero, probe, sat, y_elems, shift1, shift2, info = load_case(case_path)
+    if pair_options:
+        if dry_run:
+            die("--reference-om requires actual device execution; --dry-run cannot validate fusion precision")
+        if om_file is None:
+            die("--reference-om requires a fused OM")
+        return run_reference_comparison(case_path, om_file, pair_options["--reference-om"], device_id,
+                                        pair_options.get("--comparison-output"), rel_tol, repeat, warmup)
     print("形状（来自 case 文件的 spec）: %s" % info["shape_text"])
     want_raw = tensors["y_expect"][2]
     yElemBytes = 1 if info["outInt8"] else 2

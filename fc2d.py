@@ -38,6 +38,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -313,8 +314,8 @@ def do_case(c, paths):
         die("gen_case 失败（%s）" % c["name"])
 
 
-def do_om(c, paths, soc):
-    """Compile the unfused source and verify both installed production passes."""
+def do_om(c, paths, soc, compare_unfused=False):
+    """Compile the fused OM and optionally its pre-stage-2 ExtendConv2D reference."""
     if not shutil.which("atc"):
         die("找不到 atc。先 source <CANN>/set_env.sh")
     if not soc:
@@ -336,6 +337,12 @@ def do_om(c, paths, soc):
     for pattern in ("*.om.fc2d.json", "*.om"):
         for old in omdir.glob(pattern):
             old.unlink()
+    reference_dir = omdir.parent / "reference"
+    if compare_unfused:
+        reference_dir.mkdir(parents=True, exist_ok=True)
+        for pattern in ("*.om.fc2d.json", "*.om"):
+            for old in reference_dir.glob(pattern):
+                old.unlink()
     audit = Path(tempfile.mkdtemp(prefix="fusion_", dir=str(omdir.parent)))
     graph_dumps = audit / "graphs"
     graph_dumps.mkdir()
@@ -345,6 +352,7 @@ def do_om(c, paths, soc):
     cache.mkdir()
     names = runner.model_input_slots(spec)
     phase = "source_generation"
+    reference_audit = None
 
     def unchanged():
         if runner._file_sha256(paths["bin"]) != frozen:
@@ -406,6 +414,30 @@ def do_om(c, paths, soc):
         binding = runner.write_model_binding(paths["bin"], str(models[0]),
                     expected_case_sha256=frozen, fusion_report=proof)
         print("  两阶段融合及真实 tiling 已验证；case/OM binding: %s" % binding)
+        if compare_unfused:
+            phase = "reference_compilation"
+            reference_audit = Path(tempfile.mkdtemp(prefix="reference_", dir=str(omdir.parent)))
+            reference_switch = reference_audit / "fusion_switch.json"
+            reference_switch.write_text(json.dumps({"Switch": {"GraphFusion": {
+                fusion.FIRST_PASS_NAME: "on", fusion.PASS_NAME: "off"}}}, indent=2) + "\n")
+            reference_output = reference_dir / c["name"]
+            # Keep stage 1 identical and isolate the pair fusion in stage 2.
+            invoke(base + ["--fusion_switch_file=" + str(reference_switch),
+                           "--output=" + str(reference_output)], reference_audit / "atc.log")
+            phase = "reference_export"
+            reference_models = list(reference_dir.glob("*.om"))
+            if len(reference_models) != 1:
+                raise ValueError("ATC must generate exactly one fresh ExtendConv2D reference OM")
+            reference_graph = reference_audit / "model_graph.json"
+            reference_proof = fusion.check_reference_graph(dump(reference_models[0], reference_graph), names)
+            reference_proof.update(source_graph_sha256=source_sha,
+                                   model_graph_sha256=runner._file_sha256(reference_graph))
+            unchanged()
+            (reference_audit / "reference_verification.json").write_text(json.dumps(reference_proof, indent=2) + "\n")
+            reference_binding = runner.write_reference_model_binding(paths["bin"],
+                str(reference_models[0]), str(models[0]), reference_proof, expected_case_sha256=frozen)
+            print("  第二阶段融合前的 ExtendConv2D reference OM 已验证；case/OM binding: %s" % reference_binding)
+            print("  reference 编译证据: %s" % reference_audit)
         print("  融合证据: %s" % audit)
     except (OSError, ValueError) as exc:
         diagnosis = fusion.diagnose_compilation(graph_dumps, names, capture, audit / "atc.log")
@@ -414,11 +446,15 @@ def do_om(c, paths, soc):
         if phase != "model_compilation":
             diagnosis["observed_stage"] = diagnosis["status"]
             diagnosis["status"] = phase + "_failed"
+        if reference_audit is not None:
+            diagnosis["reference_audit"] = str(reference_audit)
+            (reference_audit / "failure_report.json").write_text(json.dumps(diagnosis, indent=2) + "\n")
         (audit / "failure_report.json").write_text(json.dumps(diagnosis, indent=2) + "\n")
-        die("融合验证失败: %s。未生成可执行绑定；诊断目录: %s" % (exc, audit))
+        incomplete = "未生成完整的参考/融合模型对" if compare_unfused else "未生成可执行绑定"
+        die("编译验证失败: %s。%s；诊断目录: %s" % (exc, incomplete, audit))
 
 
-def do_run(c, paths, device, extra):
+def do_run(c, paths, device, extra, compare_unfused=False):
     runner = os.path.join(HERE, "run_fused_multi_conv2d.py")
     if not os.path.isfile(runner):
         die("找不到 run_fused_multi_conv2d.py")
@@ -426,7 +462,17 @@ def do_run(c, paths, device, extra):
         die("%s 还没生成" % paths["bin"])
     if not os.path.isdir(paths["omdir"]):
         die("%s 不存在 —— 先跑 --steps om" % paths["omdir"])
-    cmd = [sys.executable, runner, paths["bin"], "FusedMultiConv2d", str(device), paths["omdir"]] + extra
+    arguments = list(extra)
+    if compare_unfused:
+        reference_dir = os.path.join(os.path.dirname(paths["omdir"]), "reference")
+        references = [] if not os.path.isdir(reference_dir) else [
+            os.path.join(reference_dir, name) for name in os.listdir(reference_dir)
+            if name.endswith(".om") and os.path.isfile(os.path.join(reference_dir, name))]
+        if len(references) != 1:
+            die("%s 必须只有一个参考 OM；先用 --compare-unfused --steps om 编译" % reference_dir)
+        comparison_output = os.path.join(os.path.dirname(paths["bin"]), "comparison", uuid.uuid4().hex)
+        arguments += ["--reference-om", references[0], "--comparison-output", comparison_output]
+    cmd = [sys.executable, runner, paths["bin"], "FusedMultiConv2d", str(device), paths["omdir"]] + arguments
     print("  " + " ".join(cmd))
     return run(cmd)
 
@@ -439,6 +485,8 @@ def main():
                     help="只做名字匹配的这些 case，可给多次")
     ap.add_argument("--steps", default="check,case,om,run",
                     help="做哪几步，逗号分隔：check / case / om / run")
+    ap.add_argument("--compare-unfused", action="store_true",
+                    help="以第二阶段融合前的两个 ExtendConv2D 实板输出为 golden 对比精度")
     ap.add_argument("--l1", type=int, default=1024 * 1024,
                     help="形状预检时按多大的 L1 算（默认真机的 1 MB）")
     ap.add_argument("--soc", default=os.environ.get("FC2D_SOC", ""),
@@ -567,9 +615,15 @@ def main():
             if "case" in steps:
                 do_case(c, paths)
             if "om" in steps:
-                do_om(c, paths, args.soc)
+                if args.compare_unfused:
+                    do_om(c, paths, args.soc, compare_unfused=True)
+                else:
+                    do_om(c, paths, args.soc)
             if "run" in steps:
-                rc = do_run(c, paths, device, extra)
+                if args.compare_unfused:
+                    rc = do_run(c, paths, device, extra, compare_unfused=True)
+                else:
+                    rc = do_run(c, paths, device, extra)
                 if rc != 0:
                     raise RuntimeError("run_fused_multi_conv2d.py 返回 %d" % rc)
         except SystemExit:

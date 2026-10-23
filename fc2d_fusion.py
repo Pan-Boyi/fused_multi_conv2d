@@ -108,6 +108,18 @@ def check_compiled_graph(document, input_names, allow_scale_helpers=False):
             'unfused_convolution_count': 0, 'input_names': input_names}
 
 
+def check_reference_graph(document, input_names):
+    """Require the two ExtendConv2D nodes before the second fusion stage."""
+    ops = operators(document)
+    first = check_stage1_graph(document, input_names)
+    if any(op['type'] == 'SetM1Dequant' for op in ops):
+        raise ValueError('SetM1Dequant remains in reference OM; host constant folding must complete')
+    return dict(first, pipeline='extend_pair_reference', source_conv_count=2,
+                unfused_convolution_count=2, fused_node_count=0,
+                input_names=input_names, disabled_passes=[PASS_NAME],
+                enabled_passes=[FIRST_PASS_NAME])
+
+
 @contextlib.contextmanager
 def graph_dump_environment(directory):
     """Collect both fusion rounds from the same ATC invocation."""
