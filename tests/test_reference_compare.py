@@ -276,15 +276,22 @@ class ReferenceComparison(unittest.TestCase):
             with self.subTest(target=target), self.assertRaises(ValueError):
                 fusion.check_reference_graph(graph, names)
 
-    def test_compile_uses_same_source_and_separate_stage2_off_reference(self):
+    def compile_pair_with_registry(self, reference_failure=None):
         paths = dict(bin=str(self.case), onnx=str(self.work / 'source.onnx'),
                      omdir=str(self.fused.parent))
+        registry = self.work / 'support_fusion_pass.json'
+        original = ('{\n  "3510": "%s,OtherPass",\n  "5102": "%s,%s,OtherPass"\n}\n' %
+                    (fusion.FIRST_PASS_NAME, fusion.FIRST_PASS_NAME, fusion.PASS_NAME)).encode()
+        registry.write_bytes(original)
+        registry.chmod(0o640)
         compiles = []
 
         def atc(command, **kwargs):
             if '--mode=1' in command:
                 model = Path(next(arg.split('=', 1)[1] for arg in command if arg.startswith('--om=')))
                 target = Path(next(arg.split('=', 1)[1] for arg in command if arg.startswith('--json=')))
+                if model.parent.name == 'reference' and reference_failure == 'export':
+                    return 9
                 target.write_text(json.dumps(fake_graph(runner.model_input_slots(self.info),
                                                        model.parent.name == 'reference')))
                 return 0
@@ -292,7 +299,14 @@ class ReferenceComparison(unittest.TestCase):
             switch = Path(next(arg.split('=', 1)[1] for arg in command if arg.startswith('--fusion_switch_file=')))
             output = Path(next(arg.split('=', 1)[1] for arg in command if arg.startswith('--output=')))
             switches = json.loads(switch.read_text())['Switch']['GraphFusion']
+            registered = json.loads(registry.read_bytes())
+            present = fusion.PASS_NAME in registered['5102'].split(',')
+            self.assertEqual(present, output.parent.name != 'reference')
+            self.assertIn(fusion.FIRST_PASS_NAME, registered['5102'].split(','))
+            self.assertEqual(registered['3510'], fusion.FIRST_PASS_NAME + ',OtherPass')
             compiles.append((source.read_bytes(), switches, output.parent.name))
+            if output.parent.name == 'reference' and reference_failure == 'compile':
+                return 8
             output.with_suffix('.om').write_bytes(b'synthetic OM ' + output.parent.name.encode())
             if switches[fusion.PASS_NAME] == 'on':
                 emit_graph_dumps(runner.model_input_slots(self.info))
@@ -301,14 +315,67 @@ class ReferenceComparison(unittest.TestCase):
 
         with mock.patch.object(fc2d.shutil, 'which', return_value='/synthetic/atc'), \
                 mock.patch.object(fc2d, 'run', side_effect=atc), \
+                mock.patch.dict(os.environ, FC2D_SUPPORT_FUSION_PASS_JSON=str(registry),
+                                FC2D_FUSION_REGISTRY_STATE=str(self.work / 'registry-state')), \
                 contextlib.redirect_stdout(io.StringIO()):
-            fc2d.do_om(self.case_config, paths, 'MC62CM12AA', compare_unfused=True)
+            if reference_failure:
+                with self.assertRaises(SystemExit):
+                    fc2d.do_om(self.case_config, paths, 'MC62CM12AA', compare_unfused=True)
+            else:
+                fc2d.do_om(self.case_config, paths, 'MC62CM12AA', compare_unfused=True)
+        self.assertEqual(registry.read_bytes(), original)
+        self.assertEqual(registry.stat().st_mode & 0o777, 0o640)
+        return compiles
+
+    def test_compile_uses_same_source_and_removes_stage2_registration_for_reference(self):
+        compiles = self.compile_pair_with_registry()
         self.assertEqual(len(compiles), 2)
         self.assertEqual(compiles[0][0], compiles[1][0])
         self.assertEqual(compiles[0][1], {fusion.FIRST_PASS_NAME: 'on', fusion.PASS_NAME: 'on'})
         self.assertEqual(compiles[1][1], {fusion.FIRST_PASS_NAME: 'on', fusion.PASS_NAME: 'off'})
         self.assertEqual([entry[2] for entry in compiles], ['om', 'reference'])
         runner.validate_reference_model_binding(str(self.case), str(self.reference), str(self.fused))
+
+    def test_reference_compile_and_export_errors_restore_registration(self):
+        for failure in ('compile', 'export'):
+            with self.subTest(failure=failure):
+                compiles = self.compile_pair_with_registry(failure)
+                self.assertEqual(len(compiles), 2)
+                self.assertFalse(Path(str(self.reference) + '.fc2d.json').exists())
+
+    def test_restore_failure_blocks_reference_binding_and_next_fused_compile(self):
+        import fc2d_pass_config as pass_config
+        real_replace = pass_config.FusionPassRegistry._replace_config
+        captured = {}
+
+        def deny_restore(registry, payload, record):
+            if payload == registry.backup.read_bytes():
+                captured.update(original=payload, backup=registry.backup)
+                raise PermissionError('synthetic restoration permission failure')
+            return real_replace(registry, payload, record)
+
+        registry = self.work / 'support_fusion_pass.json'
+        state = self.work / 'registry-state'
+        paths = dict(bin=str(self.case), onnx=str(self.work / 'source.onnx'),
+                     omdir=str(self.fused.parent))
+        with mock.patch.object(pass_config.FusionPassRegistry, '_replace_config', deny_restore):
+            with self.assertRaises(SystemExit):
+                self.compile_pair_with_registry()
+            self.assertFalse(Path(str(self.reference) + '.fc2d.json').exists())
+            self.assertTrue(captured['backup'].is_file())
+            self.assertNotEqual(registry.read_bytes(), captured['original'])
+            reports = list(self.work.glob('reference_*/failure_report.json'))
+            self.assertEqual(len(reports), 1)
+            self.assertEqual(json.loads(reports[0].read_text())['phase'], 'reference_restore')
+            with mock.patch.dict(os.environ, FC2D_SUPPORT_FUSION_PASS_JSON=str(registry),
+                                 FC2D_FUSION_REGISTRY_STATE=str(state)), \
+                    mock.patch.object(fc2d, 'run') as atc, \
+                    contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+                fc2d.do_om(self.case_config, paths, 'MC62CM12AA')
+            atc.assert_not_called()
+        with pass_config.registry_session(path=registry, state_dir=state):
+            self.assertEqual(registry.read_bytes(), captured['original'])
+            self.assertEqual(registry.stat().st_mode & 0o777, 0o640)
 
     def local_remote(self):
         scripts = self.work / 'scripts'

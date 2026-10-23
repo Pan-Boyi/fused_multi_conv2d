@@ -124,6 +124,23 @@ python3 run_profile.py --cases fusion_cases.json --only fusion_a16w8 \
 
 同一份 ONNX 编译为两个模型：`om/` 中两个 Pass 均开启，得到一个 FusedMultiConv2d；
 `reference/` 中第一阶段开启、第二阶段关闭，最终图必须保留两个直接连接的 ExtendConv2D。
+参考编译前，harness 临时从当前 CANN 的 `support_fusion_pass.json` 架构名单中移除
+`ExtendConv2DPairToFusedMultiConv2DFusionPass`；编译、导图和检查结束后，恢复原始字节、
+所有者和权限，恢复成功才生成参考模型绑定。正常融合模型先在完整名单下编译。
+该方法适用于忽略 `fusion_switch_file` 关闭请求、仍强制执行第二阶段的安装包。
+
+配置默认按当前 `ASCEND_OPP_PATH`、`ASCEND_HOME_PATH` 和 ATC 路径定位，软链接按真实文件去重。
+也可显式传 `--fusion-pass-config /path/to/support_fusion_pass.json`，
+或设置 `FC2D_SUPPORT_FUSION_PASS_JSON`。不会跨多个 CANN 安装修改配置。
+若 SDK 属于当前用户但安装目录只读，原子替换时临时增加目录写权限，随后恢复原权限；
+没有相应权限时直接报错，不自动使用 sudo。
+
+所有 harness 编译共享配置锁。参考编译失败、Ctrl+C 或 SIGTERM 时会先结束 ATC，再恢复名单；
+SIGKILL 或机器掉电无法立即执行恢复，下一次 harness 编译会先恢复遗留事务。
+原文件备份和事务保存在 `${XDG_STATE_HOME:-~/.local/state}/fused_multi_conv2d/fusion_registry/`。
+如果文件在此期间被外部改动，保留备份并报错，后续编译不会在未恢复的配置下继续。
+该锁只协调使用同一用户状态目录的 harness；参考编译期间应避免另行启动独立 ATC。
+
 两个模型固定同一份权重、scale 和源图，绑定同一 case；基准模型不会退回 CPU golden。
 此模式验证第二阶段融合等价性，不验证第一阶段把 Conv 改为 ExtendConv2D 的等价性。
 

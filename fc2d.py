@@ -99,12 +99,15 @@ def step(msg):
 
 def run(argv, log_path=None):
     """Stream subprocess output and optionally retain the same output on disk."""
+    from fc2d_pass_config import current_lock_fd
+    lock_fd = current_lock_fd()
+    inherited = (lock_fd,) if lock_fd is not None else ()
     sys.stdout.flush()
     if log_path is None:
-        return subprocess.call(argv)
+        return subprocess.call(argv, pass_fds=inherited)
     with open(log_path, "w") as log:
         process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                   text=True, errors="replace", bufsize=1)
+                                   text=True, errors="replace", bufsize=1, pass_fds=inherited)
         try:
             for line in process.stdout:
                 print(line, end="", flush=True)
@@ -314,7 +317,17 @@ def do_case(c, paths):
         die("gen_case 失败（%s）" % c["name"])
 
 
-def do_om(c, paths, soc, compare_unfused=False):
+def do_om(c, paths, soc, compare_unfused=False, fusion_pass_config=None):
+    """锁定当前 CANN 配置，在参考编译后恢复第二阶段 Pass 注册。"""
+    from fc2d_pass_config import registry_session
+    try:
+        with registry_session(fusion_pass_config, required=compare_unfused) as registry:
+            return _compile_models(c, paths, soc, compare_unfused, registry)
+    except (OSError, ValueError, RuntimeError) as exc:
+        die("CANN fusion registry operation failed: %s" % exc)
+
+
+def _compile_models(c, paths, soc, compare_unfused=False, registry=None):
     """Compile the fused OM and optionally its pre-stage-2 ExtendConv2D reference."""
     if not shutil.which("atc"):
         die("找不到 atc。先 source <CANN>/set_env.sh")
@@ -421,15 +434,18 @@ def do_om(c, paths, soc, compare_unfused=False):
             reference_switch.write_text(json.dumps({"Switch": {"GraphFusion": {
                 fusion.FIRST_PASS_NAME: "on", fusion.PASS_NAME: "off"}}}, indent=2) + "\n")
             reference_output = reference_dir / c["name"]
-            # Keep stage 1 identical and isolate the pair fusion in stage 2.
-            invoke(base + ["--fusion_switch_file=" + str(reference_switch),
-                           "--output=" + str(reference_output)], reference_audit / "atc.log")
-            phase = "reference_export"
-            reference_models = list(reference_dir.glob("*.om"))
-            if len(reference_models) != 1:
-                raise ValueError("ATC must generate exactly one fresh ExtendConv2D reference OM")
-            reference_graph = reference_audit / "model_graph.json"
-            reference_proof = fusion.check_reference_graph(dump(reference_models[0], reference_graph), names)
+            # 部分 CANN 将名单中的 Pass 强制开启；参考编译期间临时移除该注册。
+            with registry.stage2_disabled() as registry_proof:
+                invoke(base + ["--fusion_switch_file=" + str(reference_switch),
+                               "--output=" + str(reference_output)], reference_audit / "atc.log")
+                phase = "reference_export"
+                reference_models = list(reference_dir.glob("*.om"))
+                if len(reference_models) != 1:
+                    raise ValueError("ATC must generate exactly one fresh ExtendConv2D reference OM")
+                reference_graph = reference_audit / "model_graph.json"
+                reference_proof = fusion.check_reference_graph(dump(reference_models[0], reference_graph), names)
+                phase = "reference_restore"
+            reference_proof['pass_registry'] = registry_proof
             reference_proof.update(source_graph_sha256=source_sha,
                                    model_graph_sha256=runner._file_sha256(reference_graph))
             unchanged()
@@ -439,7 +455,7 @@ def do_om(c, paths, soc, compare_unfused=False):
             print("  第二阶段融合前的 ExtendConv2D reference OM 已验证；case/OM binding: %s" % reference_binding)
             print("  reference 编译证据: %s" % reference_audit)
         print("  融合证据: %s" % audit)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RuntimeError) as exc:
         diagnosis = fusion.diagnose_compilation(graph_dumps, names, capture, audit / "atc.log")
         diagnosis.update(phase=phase, error=str(exc), source_graph_sha256=source_sha,
                          case_sha256=frozen)
@@ -487,6 +503,8 @@ def main():
                     help="做哪几步，逗号分隔：check / case / om / run")
     ap.add_argument("--compare-unfused", action="store_true",
                     help="以第二阶段融合前的两个 ExtendConv2D 实板输出为 golden 对比精度")
+    ap.add_argument("--fusion-pass-config", metavar="PATH",
+                    help="当前 CANN 的 support_fusion_pass.json；默认从活动 CANN 环境定位")
     ap.add_argument("--l1", type=int, default=1024 * 1024,
                     help="形状预检时按多大的 L1 算（默认真机的 1 MB）")
     ap.add_argument("--soc", default=os.environ.get("FC2D_SOC", ""),
@@ -615,10 +633,12 @@ def main():
             if "case" in steps:
                 do_case(c, paths)
             if "om" in steps:
+                options = {}
                 if args.compare_unfused:
-                    do_om(c, paths, args.soc, compare_unfused=True)
-                else:
-                    do_om(c, paths, args.soc)
+                    options['compare_unfused'] = True
+                if args.fusion_pass_config:
+                    options['fusion_pass_config'] = args.fusion_pass_config
+                do_om(c, paths, args.soc, **options)
             if "run" in steps:
                 if args.compare_unfused:
                     rc = do_run(c, paths, device, extra, compare_unfused=True)

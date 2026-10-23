@@ -756,6 +756,8 @@ def main():
                     help="远端只跑功能，不套 msprof；自动跳过 pull/export/parse")
     ap.add_argument("--compare-unfused", action="store_true",
                     help="以第二阶段融合前两个 ExtendConv2D 的设备输出为 golden，需配合 --no-msprof")
+    ap.add_argument("--fusion-pass-config", metavar="PATH",
+                    help="当前 CANN 的 support_fusion_pass.json；默认从活动 CANN 环境定位")
     ap.add_argument("--print-remote-script", action="store_true", help="把远端要执行的 bash 打出来")
     ap.add_argument("--list", action="store_true", help="只列出会做哪些")
     ap.add_argument("--keep-going", action="store_true", help="某条失败了继续做下一条")
@@ -844,10 +846,12 @@ def main():
             if "case" in steps:
                 fc2d.do_case(c, paths)
             if "om" in steps:
+                options = {}
                 if args.compare_unfused:
-                    fc2d.do_om(c, paths, soc, compare_unfused=True)
-                else:
-                    fc2d.do_om(c, paths, soc)
+                    options['compare_unfused'] = True
+                if args.fusion_pass_config:
+                    options['fusion_pass_config'] = args.fusion_pass_config
+                fc2d.do_om(c, paths, soc, **options)
 
             om_file = select_model(paths) if {"push", "prof", "pull", "export", "parse"} & set(steps) else None
             reference_om = None
