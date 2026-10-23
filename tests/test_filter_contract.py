@@ -57,10 +57,17 @@ class FilterContract(unittest.TestCase):
                     self.assertEqual(len(tensors[name][2]), width * dims[0] * dims[1] * dims[2] * dims[3])
                 self.assertEqual(tensors["filter1"][2], tensors["w1_nchw"][2])
                 model = fc2d_onnx.build_model(plan, tensors)
-                self.assertEqual(len(model.graph.input), 3 if mode == "fp16" else 5)
+                self.assertEqual(len(model.graph.input), 3)
                 self.assertEqual(sum(node.op_type == "Conv" for node in model.graph.node), 2)
                 initializers = {t.name: t for t in model.graph.initializer}
-                self.assertEqual(set(initializers), {"filter1", "filter2"})
+                scales=[] if mode=='fp16' else ['quant_scale1','quant_scale2' if mode=='int8' else 'dequant_scale2']
+                self.assertEqual(set(initializers), {'filter1','filter2',*scales})
+                for name in scales:
+                    self.assertEqual(initializers[name].data_type,fc2d_onnx.TensorProto.UINT64)
+                    self.assertEqual(list(initializers[name].dims),tensors[name][1])
+                    self.assertEqual(initializers[name].raw_data,tensors[name][2])
+                    self.assertNotIn(name,runner.model_input_slots(spec))
+                    self.assertNotIn(name+':',fc2d_onnx.input_shape_arg(plan))
                 self.assertEqual(list(initializers["filter2"].dims), [2, 64, 3, 1])
                 self.assertEqual(initializers["filter2"].raw_data, tensors["filter2"][2])
                 shapes = {value.name: [d.dim_value for d in value.type.tensor_type.shape.dim]
@@ -69,6 +76,22 @@ class FilterContract(unittest.TestCase):
                 self.assertNotIn("filter2:", fc2d_onnx.input_shape_arg(plan))
                 self.assertNotIn("filter1", runner.model_input_slots(spec))
                 self.assertEqual(plan["y"][1], [1, 2, 10, 15])
+
+    def test_consumed_scale_constants_require_original_dtype_shape_and_bytes(self):
+        for mode in ('int8','s8f16','a16w8'):
+            path=self.make_case(mode)
+            spec=fc2d.read_spec(str(path));tensors,*_=runner.load_case(str(path))
+            plan=fc2d_onnx.tensor_plan(spec)
+            for name in ('quant_scale1','quant_scale2' if mode=='int8' else 'dequant_scale2'):
+                actual_dt,dims,raw=tensors[name]
+                for fault in ('missing','dtype','shape','bytes'):
+                    with self.subTest(mode=mode,name=name,fault=fault):
+                        changed=dict(tensors)
+                        if fault=='missing':del changed[name]
+                        elif fault=='dtype':changed[name]=(1,dims,raw)
+                        elif fault=='shape':changed[name]=(actual_dt,[dims[0],1],raw)
+                        else:changed[name]=(actual_dt,dims,raw[:-1])
+                        with self.assertRaises(ValueError):fc2d_onnx.build_model(plan,changed)
 
     def test_old_packed_case_abi_is_rejected_before_model_compilation_or_execution(self):
         raw = bytearray(self.make_case("int8").read_bytes())

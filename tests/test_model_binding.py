@@ -53,7 +53,8 @@ class ModelBinding(unittest.TestCase):
     def test_binding_matches_full_case_and_model(self):
         model, sidecar = self.make_model()
         binding = runner.validate_model_binding(str(self.case), str(model))
-        self.assertEqual(binding['model_input_count'], 5)
+        self.assertEqual(binding['model_input_count'], 3)
+        self.assertEqual(binding['scale_mode'], 'constant')
         self.assertEqual(binding['weight_mode'], 'constant')
         self.assertEqual(binding, json.loads(sidecar.read_text()))
 
@@ -68,10 +69,12 @@ class ModelBinding(unittest.TestCase):
         model, sidecar = self.make_model()
         binding = json.loads(sidecar.read_text())
         self.assertEqual(binding['op_type'], 'FusedMultiConv2d')
-        for old_schema in (1, 2, 3, 4):
+        for old_schema in (1, 2, 3, 4, 5):
             previous = dict(binding, schema_version=old_schema)
-            previous.pop('op_type')
             sidecar.write_text(json.dumps(previous))
+            self.assert_rejected(self.case, model)
+        for scale_mode in (None, 'runtime'):
+            sidecar.write_text(json.dumps(dict(binding, scale_mode=scale_mode)))
             self.assert_rejected(self.case, model)
         for op_type in (None, 'OtherOperator'):
             sidecar.write_text(json.dumps(dict(binding, op_type=op_type)))
@@ -135,15 +138,17 @@ class ModelBinding(unittest.TestCase):
         subprocess.run([sys.executable, str(ROOT / 'tests/stub_ascendcl/make_conf.py'),
                         str(self.case), str(stub)], check=True, stdout=subprocess.DEVNULL)
         conf = stub / 'stub.conf'
-        with conf.open('a') as stream:
-            stream.write('filter1 6144\nfilter2 384\n')
+        runtime_conf=conf.read_text()
         env = dict(os.environ, LD_LIBRARY_PATH=str(stub), DYLD_LIBRARY_PATH=str(stub), FC2D_STUB_CONF=str(conf),
                    FC2D_STUB_GOLDEN=str(stub / 'golden.bin'), REPEAT='1', WARMUP='0')
-        result = subprocess.run([sys.executable, str(ROOT / 'run_fused_multi_conv2d.py'),
-                                 str(self.case), 'FusedMultiConv2d', '0', str(model)],
-                                env=env, cwd=str(stub), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('model has 7 inputs', result.stdout)
+        for extra in ('filter1 6144\nfilter2 384\n','quant_scale1 512\nquant_scale2 16\n'):
+            with self.subTest(extra_inputs=extra):
+                conf.write_text(runtime_conf+extra)
+                result = subprocess.run([sys.executable, str(ROOT / 'run_fused_multi_conv2d.py'),
+                                         str(self.case), 'FusedMultiConv2d', '0', str(model)],
+                                        env=env, cwd=str(stub), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('model has 5 inputs', result.stdout)
 
 
     def test_case_changed_during_atc_is_not_bound_to_old_weights(self):

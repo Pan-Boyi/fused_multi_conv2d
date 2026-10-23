@@ -203,10 +203,10 @@ class ProfileWorkflow(unittest.TestCase):
                 import onnx
                 model_path = next(arg.split('=', 1)[1] for arg in command if arg.startswith('--model='))
                 graph = onnx.load(model_path).graph
-                self.assertEqual(len(graph.input), 3)
+                self.assertEqual(len(graph.input), 1)
                 self.assertEqual(sum(n.op_type == 'Conv' for n in graph.node), 2)
                 self.assertNotIn('FusedMultiConv2d',[n.op_type for n in graph.node])
-                self.assertEqual({t.name for t in graph.initializer}, {'filter1', 'filter2'})
+                self.assertEqual({t.name for t in graph.initializer}, {'filter1','filter2','quant_scale1','quant_scale2'})
                 self.assertIn('--input_format=NCHW', command)
                 prefix = next(arg.split('=', 1)[1] for arg in command if arg.startswith('--output='))
                 switch = next(arg.split('=',1)[1] for arg in command if arg.startswith('--fusion_switch_file='))
@@ -388,8 +388,12 @@ class DefaultAndContractCases(unittest.TestCase):
                 model = onnx.load(paths['onnx'])
                 self.assertEqual([v.name for v in model.graph.input], runner.model_input_slots(fc2d.read_spec(paths['bin'])))
                 self.assertEqual(sum(n.op_type == 'Conv' for n in model.graph.node), 2)
-                self.assertEqual([list(t.dims) for t in model.graph.initializer],
-                                 [[64, 32, *case['kernel'][:2]], [2, 64, *case['kernel'][2:]]])
+                constants={t.name:t for t in model.graph.initializer}
+                self.assertEqual([list(constants[name].dims) for name in ('filter1','filter2')],
+                                 [[64,32,*case['kernel'][:2]],[2,64,*case['kernel'][2:]]])
+                tensors,*_=runner.load_case(paths['bin'])
+                for name,tensor in constants.items():
+                    self.assertEqual(tensor.raw_data,tensors[name][2])
                 self.assertNotIn('kernel_size', plan['attrs'])
                 self.assertEqual(plan['attrs']['fixed_shift_value'], case['fixed_shift_value'])
                 self.assertEqual(plan['attrs']['strides'], case['strides'])

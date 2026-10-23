@@ -57,7 +57,15 @@ class FusionPipeline(unittest.TestCase):
                         nodes=list(model.graph.node)
                         self.assertEqual(fusion.check_input_model(model),dict(source_conv_count=2))
                         self.assertEqual([v.name for v in model.graph.input],runner.model_input_slots(spec))
-                        self.assertEqual(len(model.graph.input),1+2*bias+2*(mode!='fp16'))
+                        self.assertEqual(len(model.graph.input),1+2*bias)
+                        scales=[] if mode=='fp16' else ['quant_scale1','quant_scale2' if mode=='int8' else 'dequant_scale2']
+                        constants={t.name:t for t in model.graph.initializer}
+                        self.assertEqual(set(constants),{'filter1','filter2',*scales})
+                        for name in scales:
+                            self.assertEqual(constants[name].data_type,onnx.TensorProto.UINT64)
+                            self.assertEqual(list(constants[name].dims),tensors[name][1])
+                            self.assertEqual(constants[name].raw_data,tensors[name][2])
+                            self.assertNotIn(name,runner.model_input_slots(spec))
                         self.assertEqual([n.name for n in nodes if n.op_type=='Relu'],
                                          ['relu%d'%(i+1) for i,v in enumerate(relu) if v])
                         convs=[n for n in nodes if n.op_type=='Conv']
@@ -142,7 +150,7 @@ class FusionPipeline(unittest.TestCase):
     def test_stage2_requires_exactly_one_fused_node_and_no_independent_convolution(self):
         valid=fake_graph(['x'])
         self.assertEqual(fusion.check_compiled_graph(valid,['x'])['fused_node_count'],1)
-        for op in ('Conv2D','ExtendConv2D','FusedMultiConv2d','Relu','AscendRequant','AscendDequant'):
+        for op in ('Conv2D','ExtendConv2D','FusedMultiConv2d','Relu','AscendRequant','AscendDequant','SetM1Dequant'):
             document=copy.deepcopy(valid);document['graph'][0]['op'].append(dict(name='extra',type=op))
             with self.subTest(op=op),self.assertRaises(ValueError):fusion.check_compiled_graph(document,['x'])
         with self.assertRaises(ValueError):fusion.check_compiled_graph(fake_graph(['unexpected']),['x'])
@@ -171,6 +179,17 @@ class FusionPipeline(unittest.TestCase):
         self.assertEqual(proof['stage1_snapshot_sha256'],runner._file_sha256(first))
         self.assertEqual(proof['stage2_snapshot_sha256'],runner._file_sha256(second))
 
+    def test_intermediate_snapshots_allow_dequant_setup_before_constant_folding(self):
+        dump_root=self.work/'before_fold'
+        with mock.patch.dict(os.environ, {'DUMP_GRAPH_PATH':str(dump_root)}):
+            snapshots=emit_graph_dumps(['x'])
+        for snapshot in snapshots:
+            text=snapshot.read_text().rsplit('}',1)[0]
+            snapshot.write_text(text+'  op { name: "scale_setup" type: "SetM1Dequant" }\n}\n')
+        proof=fusion.check_graph_dumps(dump_root,['x'])
+        self.assertEqual(proof['stage1_extend_count'],2)
+        self.assertEqual(proof['compile_count'],1)
+
     def test_dump_evidence_rejects_missing_unordered_or_unrelated_snapshots(self):
         for failure in ('missing_stage1','missing_stage2','reversed_snapshots',
                         'different_graph','different_process','stage1_graph','stage2_graph','stage2_residual','malformed_dump'):
@@ -194,8 +213,9 @@ class FusionPipeline(unittest.TestCase):
                 target=next(a.split('=',1)[1] for a in command if a.startswith('--json='))
                 if failure=='missing_export':return 0
                 graph=fake_graph(names)
-                if failure=='final_graph':
-                    graph['graph'][0]['op'].append(dict(name='unfused',type='ExtendConv2D'))
+                if failure in ('final_graph','final_dequant_setup'):
+                    graph['graph'][0]['op'].append(dict(name='unfused',
+                        type='SetM1Dequant' if failure=='final_dequant_setup' else 'ExtendConv2D'))
                 Path(target).write_text(json.dumps(graph));return 0
             if failure=='compile_failure':return 9
             prefix=next(a.split('=',1)[1] for a in command if a.startswith('--output='))
@@ -243,7 +263,8 @@ class FusionPipeline(unittest.TestCase):
         self.assertEqual(len(calls),2)
         self.assertEqual(len(list(self.work.rglob('stage1.om'))),0)
         binding=runner.validate_model_binding(str(case),str(model))
-        self.assertEqual(binding['schema_version'],5)
+        self.assertEqual(binding['schema_version'],6)
+        self.assertEqual(binding['scale_mode'],'constant')
         self.assertEqual(binding['fusion']['evidence_mode'],'single_atc_graph_dump')
         self.assertEqual(binding['fusion']['compile_count'],1)
         self.assertNotIn('stage1_graph_sha256',binding['fusion'])
@@ -251,7 +272,7 @@ class FusionPipeline(unittest.TestCase):
     def test_failed_compilation_or_fusion_invalidates_previous_binding(self):
         for failure in ('compile_failure','export_failure','missing_export','missing_stage1','missing_stage2',
                         'stage1_graph','stage2_graph','stage2_residual','reversed_snapshots','different_graph','different_process',
-                        'malformed_dump','final_graph','missing_tiling','wrong_shift','source_changed'):
+                        'malformed_dump','final_graph','final_dequant_setup','missing_tiling','wrong_shift','source_changed'):
             with self.subTest(failure=failure):
                 _,model,calls=self.compile_synthetic(failure)
                 self.assertFalse(Path(str(model)+'.fc2d.json').exists())

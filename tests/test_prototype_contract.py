@@ -109,7 +109,7 @@ class PrototypeContract(unittest.TestCase):
             model.write_bytes(b'synthetic model')
             binding_path=write_test_binding(str(path),str(model))
             binding=json.loads(Path(binding_path).read_text())
-            self.assertEqual(binding['schema_version'],5)
+            self.assertEqual(binding['schema_version'],6)
             binding['schema_version']=1
             Path(str(model)+'.fc2d.json').write_text(json.dumps(binding))
             with contextlib.redirect_stdout(io.StringIO()),self.assertRaises(SystemExit):

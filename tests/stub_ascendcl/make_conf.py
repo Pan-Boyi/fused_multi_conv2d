@@ -5,7 +5,8 @@
 —— 桩要是自己另算一套，就会把运行器里那段「模型要的字节数 vs case.bin 给的字节
 数」核对测成假通过。
 
-Graphs expose x plus consumed bias/scale tensors (1/3/5 inputs).
+Graphs expose x plus consumed bias tensors (1/3 inputs).
+Filters and consumed scale tables are constant initializers.
 The production pass creates unused list instances as internal Const nodes.
 """
 import io
@@ -38,7 +39,7 @@ with io.open(os.path.join(outdir, "stub.conf"), "w") as f:
 with open(os.path.join(outdir, "golden.bin"), "wb") as f:
     f.write(tensors["y_expect"][2])
 
-print("模型输入表（%d 个，x 与实际使用的 bias/scale）:" % len(present))
+print("模型输入表（%d 个，x 与实际使用的 bias）:" % len(present))
 for n in present:
     print("  %-16s %9d 字节" % (n, slot_bytes(n)))
 print("输出 %d 字节" % y_bytes)

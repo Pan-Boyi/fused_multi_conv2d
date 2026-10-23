@@ -38,7 +38,7 @@ IR_VERSION = 7
 OPSET = 11
 
 # Expected fused IR instances, including placeholders created by the pass.
-# runtime_slots() selects only inputs consumed by the unfused source graph.
+# runtime_slots() selects activations/biases; filters/scales stay constant.
 IR_SLOT_NAMES = [
     "x",
     "filter1",
@@ -139,33 +139,40 @@ def tensor_plan(spec):
 
 
 def runtime_slots(plan):
-    """Only tensors consumed by the unfused graph become external inputs."""
+    """Only activations and consumed biases are runtime inputs."""
     names = {"x"}
     for i, enabled in enumerate(plan["attrs"]["bias_mask"], 1):
         if enabled:
             names.add("bias%d" % i)
-    if plan["mode"] != DTYPE_FP16:
-        names.update(("quant_scale1", "dequant_scale2" if plan["mode"] in
-                      (DTYPE_S8F16, DTYPE_A16W8) else "quant_scale2"))
     return [(name, dt, shape) for name, dt, shape in plan["slots"] if name in names]
 
 
-def build_model(plan, filter_tensors):
+def constant_slots(plan):
+    """Scale parameters must be Const so GE can fold SetM1Dequant on the host."""
+    names = ["filter1", "filter2"]
+    if plan["mode"] != DTYPE_FP16:
+        names += ["quant_scale1", "dequant_scale2" if plan["mode"] in
+                  (DTYPE_S8F16, DTYPE_A16W8) else "quant_scale2"]
+    return names
+
+
+def build_model(plan, case_tensors):
     """Build the source computation; GE alone creates both fusion targets."""
     slots = {n: (dt, shape) for n, dt, shape in plan["slots"]}
     initializers = []
-    for name in ("filter1", "filter2"):
+    for name in constant_slots(plan):
         dt, shape = slots[name]
-        if name not in filter_tensors:
-            raise ValueError("missing logical filter tensor " + name)
-        actual_dt, dims, raw = filter_tensors[name]
+        if name not in case_tensors:
+            raise ValueError("missing constant tensor " + name)
+        actual_dt, dims, raw = case_tensors[name]
         count = 1
         for dim in shape:
             count *= dim
-        width = 2 if dt == "float16" else 1
+        width = {"float16": 2, "int8": 1, "uint64": 8}[dt]
+        case_dtype = {"float16": 1, "int8": 2, "uint64": 10}[dt]
         if (list(dims) != shape or len(raw) != count * width or
-                actual_dt != (GE_DT_FLOAT16 if dt == "float16" else GE_DT_INT8)):
-            raise ValueError("logical filter dtype/shape/bytes differ from plan: " + name)
+                actual_dt != case_dtype):
+            raise ValueError("constant dtype/shape/bytes differ from plan: " + name)
         initializers.append(helper.make_tensor(name, ONNX_DT[dt], shape, raw, raw=True))
     graph_inputs = [helper.make_tensor_value_info(n, ONNX_DT[dt], shape)
                     for n, dt, shape in runtime_slots(plan)]

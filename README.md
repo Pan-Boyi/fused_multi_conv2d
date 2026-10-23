@@ -35,6 +35,7 @@ python3 fc2d.py cases.json --steps run
 ## 两阶段融合验证
 
 源 ONNX 只构造两个连续的 `Conv`，两张 filter 保存真实 NCHW 形状并作为 initializer。
+实际使用的 uint64 scale 表也直接取自 case，保存为 initializer。
 按用例加入 `AscendRequant`、`AscendDequant` 和 `Relu`，由已安装 CANN 中的原始 Pass 完成：
 
 ```text
@@ -57,13 +58,19 @@ harness 不创建 ExtendConv2D/FusedMultiConv2d 源节点，不依赖 FusedMulti
 2. 同一进程、同一图的后续快照中只有一个 FusedMultiConv2d，不残留独立卷积、量化或 ReLU。
 3. 最终 OM 通过 `atc --mode=1` 导出 JSON，独立确认融合结果和运行输入。此步骤仅导出，不编译模型。
 4. 捕获本次编译的 native tiling，核对真实几何、bias、ReLU、blockDim，以及 FP16/A16W8 使用的定标值。
-5. 全部通过后写 schema **5** 的绑定，记录 case/OM、源 ONNX、两个阶段快照、最终图和 tiling 的哈希。
+5. 全部通过后写 schema **6** 的绑定，记录常量 weight/scale 契约及 case/OM、源 ONNX、两个阶段快照、最终图和 tiling 的哈希。
 
 不再关闭二阶段编译 `stage1.om`，因此不会为了观察中间图而编译 ExtendConv2D 内核。
 每次编译在 case 目录创建独立的 `fusion_*` 目录，保存 `fusion_switch.json`、`atc.log`、
 `graphs/`、`model_graph.json`、`tiling_capture/` 和 `fusion_verification.json`。
 失败时保存 `failure_report.json`，保留原始日志和快照，不签发可运行绑定。
-schema 1–4 的模型需要重编；case ABI 仍为 **8**，精度阈值及 profiling 步骤保持不变。
+schema 1–5 的模型需要重编；case ABI 仍为 **8**，精度阈值及 profiling 步骤保持不变。
+
+量化融合会生成 `SetM1Dequant`，把源 scale 转成 Fixpipe 所需位域。它有 host 实现，
+由 GE 在编译期常量折叠；把 scale 作为运行时 Data 会使该辅助节点无法消除，并触发运行时实现缺失。
+因此中间快照允许 `Const -> SetM1Dequant`，最终 OM 必须已经消除该节点。
+这与 ops-nn 的 [正式 GE 示例](https://gitcode.com/cann/ops-nn/blob/e8642461f87897148023868b00bb528d34ca934a/conv/fused_multi_conv2d/examples/test_geir_fused_multi_conv2d.cpp)
+使用 Const scale 的构图方式一致。harness 不自行生成或替代该辅助节点。
 
 图快照使用官方 `DUMP_GE_GRAPH=2`、`DUMP_GRAPH_LEVEL=1`、`DUMP_GRAPH_FORMAT=ge_proto`、
 `DUMP_GRAPH_PATH` 配置，递归读取 `pid_*` 目录下的 ModelDef protobuf text。
@@ -124,7 +131,7 @@ python3 run_profile.py profile.json
 | :-- | :-- | :-- |
 | `check` | 本地 | 形状预检 |
 | `case` | 本地 | 生成 `case.bin` |
-| `om` | 本地 | 生成双 Conv ONNX，单次编译验证两阶段融合和 native tiling，写 schema-5 binding |
+| `om` | 本地 | 生成双 Conv ONNX，单次编译验证两阶段融合和 native tiling，写 schema-6 binding |
 | `push` | 本地 -> 远端 | 每条 case 一个干净目录,拷 `case.bin`、`.om`、`.om.fc2d.json`、`run_fused_multi_conv2d.py` |
 | `prof` | 远端 | `$MSPROF bash <runner wrapper>`，分别记录 runner 与 profiler 返回码，并找出**本次**新生成的 `PROF_*`。`$MSPROF` 是 `profile.msprof` 给死的绝对路径(缺省 `/var/msprof`),**不搜 PATH** —— 远端那个 ssh 是非交互 shell,读不到 `~/.bashrc` 里 source 的 `set_env.sh`,搜 PATH 会说「没有 msprof」而其实装着。指向 msprof 那个可执行文件本身。 |
 | `pull` | 远端 -> 本地 | 把那个 `PROF_*` 拉回 `prof_out/<json 名>/<case 名>/` |
@@ -135,9 +142,9 @@ python3 run_profile.py profile.json
 
 - **`run_fused_multi_conv2d.py` 每次都重新拷过去。** 它和 `case.bin` 的格式是配套的,
   远端留着一份旧的会报「case 文件版本 N,本脚本认 M」,而那时人往往已经在查算子了。
-- **图模型有 1、3 或 5 个运行输入。** x 必有；启用 bias 时增加 bias1/bias2；
-  量化通路增加 scale1/scale2。scale2 按 dtype 使用 quant_scale2 或 dequant_scale2。
-  未使用的 list 实例由原始融合 Pass 创建为 Const，不需要外部零缓冲。两个 filters 固定在 OM 内，目标算子仍有 9 个输入实例。
+- **图模型有 1 或 3 个运行输入。** x 必有；启用 bias 时增加 bias1/bias2。
+  两张 filter 和实际使用的 scale 固定在 OM 内，未使用的 list 实例由原始融合 Pass 创建为 Const。
+  目标算子仍有 9 个输入实例，不需要外部零缓冲。
 - **上传和执行前都校验完整 case/OM SHA256。** prof-only 也会核对远端产物是否
   等于本地选中的 binding；旧模型或修改过的 case 必须重新编译 OM。
 - **每条 case 在远端使用独立目录。** 上传 case、唯一 OM、sidecar 和配套 runner。
@@ -177,8 +184,8 @@ python3 run_profile.py profile.json
 ## 为什么是一个 json 而不是三处
 
 case.bin 保存逻辑输入、golden 和属性 spec。ONNX 从它派生两个 Conv 的计算、
-逻辑 NCHW 常量权重和必要的 bias/scale 输入。GE 负责布局转换和两阶段融合，
-harness 在写绑定前核对最终图和真实 tiling。运行器在加载 ACL 前校验 schema-5
+逻辑 NCHW 常量权重、常量 scale 和必要的 bias 输入。GE 负责布局转换和两阶段融合，
+harness 在写绑定前核对最终图和真实 tiling。运行器在加载 ACL 前校验 schema-6
 `<model.om>.fc2d.json` 中完整 case 与 OM 的 SHA256 以及融合证据摘要。
 
 ```text
@@ -382,9 +389,9 @@ at compilation and preserves their origin shape/format; kernel dimensions and
 true Cout2 are inferred from that metadata. kernel_size is removed.
 
 The target operator retains nine input ports. The source graph exposes x and
-only consumed bias/scale tensors (1/3/5 runtime inputs). Unused instances become
-internal Const nodes created by the production pass. The two filters are embedded
-as logical NCHW initializers and GE handles FRACTAL_Z conversion. The frontend
+only consumed biases (1/3 runtime inputs). Unused instances become internal Const
+nodes created by the production pass. Both filters and consumed scale tables are
+initializers; GE handles FRACTAL_Z conversion and host scale folding. The frontend
 uses built-in Conv and Ascend quantization ONNX parsers, with input_format=NCHW.
 It contains neither ExtendConv2D nor FusedMultiConv2d.
 

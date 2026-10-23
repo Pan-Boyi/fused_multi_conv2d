@@ -90,7 +90,7 @@ HDR_LEN = struct.calcsize(HDR_FMT)
 REC_FMT = "<16sII4qQ"           # name, dtype, ndim, dims[4], nbytes
 REC_LEN = struct.calcsize(REC_FMT)
 
-# Case existence lists include constant filters for reference generation. They do
+# Case existence lists include constant filters/scales for reference generation. They do
 # not define graph runtime order; model_input_slots supplies the consumed inputs.
 ORDER = ["x", "filter1", "bias1", "filter2", "bias2"]
 INPUT_SLOTS = ["x", "filter1", "filter2", "bias1", "bias2",
@@ -119,8 +119,6 @@ def model_input_slots(info):
     slots = ["x"]
     if info["bias"]:
         slots += ["bias1", "bias2"]
-    if info["dtype_mode"] != DTYPE_FP16:
-        slots += ["quant_scale1", "dequant_scale2" if info["dtype_mode"] in (DTYPE_S8F16, DTYPE_A16W8) else "quant_scale2"]
     return slots
 
 
@@ -167,7 +165,7 @@ def _valid_fusion_report(report, names):
 
 
 def write_model_binding(case_path, om_path, expected_case_sha256=None, fusion_report=None):
-    """Bind a constant-weight OM to the exact case used during compilation."""
+    """Bind constant weights/scales to the exact case used during compilation."""
     with open(case_path, "rb") as stream:
         header = stream.read(12)
     if len(header) != 12 or struct.unpack_from("<I", header, 8)[0] != CASE_VERSION:
@@ -179,8 +177,8 @@ def write_model_binding(case_path, om_path, expected_case_sha256=None, fusion_re
     names = model_input_slots(info)
     if not _valid_fusion_report(fusion_report, names):
         die("verified production fusion report is required; rebuild through canndev PR 82567")
-    binding = {"schema_version": 5, "op_type": "FusedMultiConv2d", "case_abi": CASE_VERSION,
-               "pipeline": "onnx_conv_pair_fusion", "weight_mode": "constant", "model_input_count": len(names),
+    binding = {"schema_version": 6, "op_type": "FusedMultiConv2d", "case_abi": CASE_VERSION,
+               "pipeline": "onnx_conv_pair_fusion", "weight_mode": "constant", "scale_mode": "constant", "model_input_count": len(names),
                "model_input_names": names, "fusion": fusion_report,
                "model_sha256": _file_sha256(om_path), "case_sha256": expected_case_sha256 or case_sha}
     path = om_path + ".fc2d.json"
@@ -199,7 +197,8 @@ def validate_model_binding(case_path, om_path):
             binding = json.load(stream)
     except (OSError, ValueError) as exc:
         die("missing or invalid case/OM binding %s: %s; regenerate case and OM" % (path, exc))
-    contract = {"schema_version": 5, "op_type": "FusedMultiConv2d", "case_abi": CASE_VERSION, "weight_mode": "constant", "pipeline": "onnx_conv_pair_fusion"}
+    contract = {"schema_version": 6, "op_type": "FusedMultiConv2d", "case_abi": CASE_VERSION,
+                "weight_mode": "constant", "scale_mode": "constant", "pipeline": "onnx_conv_pair_fusion"}
     if not isinstance(binding, dict) or any(binding.get(k) != v for k, v in contract.items()):
         die("unsupported binding; regenerate OM through the production GE fusion pass")
     info = _binding_spec(case_path)
@@ -1114,7 +1113,7 @@ def main():
         dtype, dims, data = tensors[name]
         print("  %-9s %-6s %-16s %9d 字节" % (name, DTYPE_NAME[dtype], dims, len(data)))
     slots = runtime_input_slots(info)
-    print("模型运行输入（%d 个；两张 filter 是 OM 常量）:" % len(model_input_slots(info)))
+    print("模型运行输入（%d 个；filter 和 scale 是 OM 常量）:" % len(model_input_slots(info)))
     for i, name in enumerate(slots):
         print("  %d: %s" % (i, name))
     if info["outInt8"]:

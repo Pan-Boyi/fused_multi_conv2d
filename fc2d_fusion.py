@@ -93,7 +93,7 @@ def check_stage1_graph(document, input_names):
     return {'stage1_extend_count': 2, 'stage1_nodes': list(connected[0])}
 
 
-def check_compiled_graph(document, input_names):
+def check_compiled_graph(document, input_names, allow_scale_helpers=False):
     ops = operators(document)
     check_inputs(ops, input_names)
     fused = [op for op in ops if op['type'] == FUSED_TYPE]
@@ -102,6 +102,8 @@ def check_compiled_graph(document, input_names):
     remaining = [op for op in ops if op['type'] in SOURCE_COMPUTE_TYPES]
     if remaining:
         raise ValueError('unfused source computations remain: %s' % ', '.join(op.get('name', op['type']) for op in remaining))
+    if not allow_scale_helpers and any(op['type'] == 'SetM1Dequant' for op in ops):
+        raise ValueError('SetM1Dequant remains in final OM; scale parameters must be Const and host constant folding must complete')
     return {'fused_node_count': 1, 'fused_node_name': fused[0].get('name', ''),
             'unfused_convolution_count': 0, 'input_names': input_names}
 
@@ -180,7 +182,10 @@ def check_graph_dumps(directory, input_names):
     for path, sequence, graph in snapshots:
         for checker, target in ((check_stage1_graph, first_round), (check_compiled_graph, second_round)):
             try:
-                report = checker({'graph': [graph]}, input_names)
+                if checker is check_compiled_graph:
+                    report = checker({'graph': [graph]}, input_names, allow_scale_helpers=True)
+                else:
+                    report = checker({'graph': [graph]}, input_names)
                 target.append((path, sequence, graph, report))
             except ValueError:
                 pass
@@ -204,7 +209,7 @@ def diagnose_compilation(directory, input_names, tiling_directory, log):
     fused_graph = False
     for _, _, graph in snapshots:
         try:
-            check_compiled_graph({'graph': [graph]}, input_names)
+            check_compiled_graph({'graph': [graph]}, input_names, allow_scale_helpers=True)
             fused_graph = True
         except ValueError:
             pass
