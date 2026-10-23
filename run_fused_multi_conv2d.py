@@ -570,7 +570,7 @@ def report_ratio(got, want, n):
         g, w = got[0][i], want[0][i]
         if g == 0.0 or w == 0.0:
             continue
-        if g != g or w != w or abs(g) == float("inf"):
+        if not math.isfinite(g) or not math.isfinite(w):
             continue
         both_nz += 1
         if (g > 0) != (w > 0):
@@ -640,7 +640,7 @@ def probe_acc_scale(got, exact, n, shift2, dims):
         g, t = got[0][i], exact[0][i]
         if t == 0.0 or g == 0.0:
             continue
-        if g != g or t != t or abs(g) == float("inf"):
+        if not math.isfinite(g) or not math.isfinite(t):
             continue
         nz += 1
         if (g > 0) != (t > 0):
@@ -1013,7 +1013,7 @@ def evaluate(got, want, rel_tol, sentinel=Y_SENTINEL_U16):
     }
     gv, gb = got
     wv, wb = want
-    if gb == wb:
+    if gb == wb and all(math.isfinite(value) for values in (gv, wv) for value in values):
         # 逐位一致：相对误差全是 0
         r["hist"]["=0"] = n
         r["zero_golden"] = sum(1 for x in wv if x == 0.0)
@@ -1033,7 +1033,9 @@ def evaluate(got, want, rel_tol, sentinel=Y_SENTINEL_U16):
             # fp16 上「差 1」就是差 1 个 ULP（同号有限值的位模式相邻）。
             if abs(g8 - w8) == 1:
                 r["off_by_one"] += 1
-        if w == 0.0:
+        if not math.isfinite(g) or not math.isfinite(w):
+            err = float("inf")
+        elif w == 0.0:
             zero_golden += 1
             err = 0.0 if g == 0.0 else float("inf")
         else:
@@ -1160,55 +1162,103 @@ def execute_bound_model(acl, om_path, tensors, input_names, output_dtype, output
             acl.aclmdlDestroyDesc(desc)
 
 
-def compare_device_outputs(fused_raw, reference_raw, output_dtype, output_shape, rel_tol=1e-3):
-    """以未融合设备输出为 golden；整数逐位相等，浮点逐元素应用既有误差阈值。"""
+def _comparison_number(value):
+    """保留有限数值，将非有限值转换为可写入 JSON 的字符串。"""
+    return value if math.isfinite(value) else str(value)
+
+
+def _comparison_sample(index, actual, reference, shape, absolute, relative, outside):
+    """记录单个差异元素的数值、误差和张量坐标。"""
+    remainder, coordinates = index, []
+    for size in reversed(shape):
+        coordinates.append(remainder % size)
+        remainder //= size
+    return {"flat_index": index, "coordinates": list(reversed(coordinates)),
+            "reference": _comparison_number(reference), "fused": _comparison_number(actual),
+            "actual": _comparison_number(actual), "outside_tolerance": outside,
+            "absolute_error": _comparison_number(absolute), "relative_error": _comparison_number(relative),
+            "precision_0_001_passed": relative <= 0.001}
+
+
+def summarize_output_comparison(actual, reference, output_shape, output_dtype, rel_tol=1e-3):
+    """汇总已解码输出的差异；固定 0.001 统计不改变原有验收阈值。"""
     if not math.isfinite(rel_tol) or rel_tol < 0:
         raise ValueError("comparison tolerance must be finite and nonnegative")
-    if output_dtype not in (1, 2) or len(fused_raw) != len(reference_raw):
-        raise ValueError("comparison requires equally sized fp16 or int8 outputs")
     count = reduce(mul, output_shape, 1)
-    if len(fused_raw) != count * DTYPE_SIZE[output_dtype]:
-        raise ValueError("raw output size differs from output shape")
-    fused = decode_y(fused_raw, output_dtype == 2)
-    reference = decode_y(reference_raw, output_dtype == 2)
+    if output_dtype not in (1, 2) or any(len(values) != count for values in actual + reference):
+        raise ValueError("comparison requires equally sized fp16 or int8 outputs matching the shape")
     bit_mismatches, tolerance_mismatches, nonfinite = 0, 0, {"reference": 0, "fused": 0}
-    max_abs, max_rel, first, first_outside = 0.0, 0.0, None, None
-    for index, (got, want) in enumerate(zip(fused[0], reference[0])):
-        bit_diff = fused[1][index] != reference[1][index]
+    max_abs, max_rel, first, first_outside, precision_passed = 0.0, 0.0, None, None, 0
+    samples = []
+    for index, (got, want) in enumerate(zip(actual[0], reference[0])):
+        bit_diff = actual[1][index] != reference[1][index]
         bit_mismatches += int(bit_diff)
         finite = math.isfinite(got) and math.isfinite(want)
         nonfinite["reference"] += int(not math.isfinite(want))
         nonfinite["fused"] += int(not math.isfinite(got))
         absolute = abs(got - want) if finite else float("inf")
         relative = absolute / abs(want) if finite and want != 0 else (0.0 if absolute == 0 else float("inf"))
+        precision_passed += int(relative <= 0.001)
         max_abs, max_rel = max(max_abs, absolute), max(max_rel, relative)
         outside = not finite or (bit_diff if output_dtype == 2 else relative > rel_tol)
         tolerance_mismatches += int(outside)
-        if (first is None and (bit_diff or outside)) or (first_outside is None and outside):
-            remainder, coordinates = index, []
-            for size in reversed(output_shape):
-                coordinates.append(remainder % size)
-                remainder //= size
-            mismatch = {"flat_index": index, "coordinates": list(reversed(coordinates)),
-                        "reference": want if math.isfinite(want) else str(want),
-                        "fused": got if math.isfinite(got) else str(got), "outside_tolerance": outside}
+        if (bit_diff or outside) and (len(samples) < 50 or (first_outside is None and outside)):
+            mismatch = _comparison_sample(index, got, want, output_shape, absolute, relative, outside)
+            if len(samples) < 50:
+                samples.append(mismatch)
             if first is None:
                 first = mismatch
             if first_outside is None and outside:
                 first_outside = mismatch
+    precision_ratio = precision_passed / float(count) if count else 0.0
     return {"dtype": DTYPE_NAME[output_dtype], "shape": list(output_shape), "elements": count,
-            "bitwise_equal": fused_raw == reference_raw, "bit_mismatch_count": bit_mismatches,
+            "bitwise_equal": bit_mismatches == 0, "bit_mismatch_count": bit_mismatches,
             "tolerance_mismatch_count": tolerance_mismatches, "first_mismatch": first,
             "first_tolerance_mismatch": first_outside,
-            "max_absolute_error": max_abs if math.isfinite(max_abs) else "inf",
-            "max_relative_error": max_rel if math.isfinite(max_rel) else "inf", "nonfinite_count": nonfinite,
+            "max_absolute_error": _comparison_number(max_abs),
+            "max_relative_error": _comparison_number(max_rel), "nonfinite_count": nonfinite,
+            "mismatch_samples": samples,
+            "precision_0_001": {"relative_tolerance": 0.001, "passed_count": precision_passed,
+                                "failed_count": count - precision_passed, "total_count": count,
+                                "pass_ratio": precision_ratio, "pass_percent": precision_ratio * 100.0},
             "relative_tolerance": 0.0 if output_dtype == 2 else rel_tol,
             "zero_reference_absolute_tolerance": 0.0,
             "required_pass_ratio": 1.0, "passed": tolerance_mismatches == 0}
 
 
+def print_output_comparison(summary, actual_label, reference_label):
+    """打印固定 0.001 达标比例及按展平顺序取出的前 50 个差异元素。"""
+    precision = summary["precision_0_001"]
+    print("\n[comparison] %s vs %s" % (actual_label, reference_label))
+    print("  relative error <= 0.001: %d / %d = %.6f%%; zero reference requires exact zero" %
+          (precision["passed_count"], precision["total_count"], precision["pass_percent"]))
+    print("  bit mismatches=%d tolerance mismatches=%d max_abs=%s max_rel=%s" %
+          (summary["bit_mismatch_count"], summary["tolerance_mismatch_count"],
+           summary["max_absolute_error"], summary["max_relative_error"]))
+    samples = summary["mismatch_samples"]
+    print("  first %d mismatches (up to 50; NCHW coordinates):" % len(samples))
+    for sample in samples:
+        coordinate = ",".join(str(value) for value in sample["coordinates"])
+        print("    index=%d NCHW=[%s] %s=%s %s=%s abs_error=%s relative_error=%s precision_0.001=%s" %
+              (sample["flat_index"], coordinate, actual_label, sample["actual"],
+               reference_label, sample["reference"], sample["absolute_error"], sample["relative_error"],
+               "PASS" if sample["precision_0_001_passed"] else "FAIL"))
+
+
+def compare_device_outputs(fused_raw, reference_raw, output_dtype, output_shape, rel_tol=1e-3):
+    """以参考输出比较原始字节；整数逐位相等，浮点应用既有误差阈值。"""
+    if output_dtype not in (1, 2) or len(fused_raw) != len(reference_raw):
+        raise ValueError("comparison requires equally sized fp16 or int8 outputs")
+    if len(fused_raw) != reduce(mul, output_shape, 1) * DTYPE_SIZE[output_dtype]:
+        raise ValueError("raw output size differs from output shape")
+    return summarize_output_comparison(decode_y(fused_raw, output_dtype == 2),
+                                       decode_y(reference_raw, output_dtype == 2),
+                                       output_shape, output_dtype, rel_tol)
+
+
 def run_reference_comparison(case_path, fused_om_path, reference_om_path, device_id=0,
-                             output_dir=None, rel_tol=1e-3, repeat=1, warmup=0):
+                             output_dir=None, rel_tol=1e-3, repeat=1, warmup=0,
+                             compare_reference_golden=False):
     """在同一设备依次运行两个绑定模型，保存原始输出及可追溯的精度报告。"""
     fused_binding = validate_model_binding(case_path, fused_om_path)
     reference_binding = validate_reference_model_binding(case_path, reference_om_path, fused_om_path)
@@ -1227,7 +1277,7 @@ def run_reference_comparison(case_path, fused_om_path, reference_om_path, device
             os.unlink(stale)
     names = model_input_slots(info)
     report = {"schema_version": 1, "run_id": str(time.time_ns()),
-              "golden_source": "extend_pair_device_output", "cpu_golden_used": False, "device_id": device_id,
+              "golden_source": "extend_pair_device_output", "cpu_golden_used": compare_reference_golden, "device_id": device_id,
               "case_sha256": fused_binding["case_sha256"], "source_graph_sha256": fused_binding["fusion"]["source_graph_sha256"],
               "runtime_input_sha256": {name: hashlib.sha256(tensors[name][2]).hexdigest() for name in names},
               "output": {"dtype": DTYPE_NAME[dtype], "shape": shape},
@@ -1269,6 +1319,11 @@ def run_reference_comparison(case_path, fused_om_path, reference_om_path, device
         if len(raw_outputs) == 2:
             report["comparison"] = compare_device_outputs(raw_outputs["fused"], raw_outputs["reference"], dtype, shape, rel_tol)
             report["passed"] = report["comparison"]["passed"]
+        if compare_reference_golden and "reference" in raw_outputs:
+            report["reference_vs_golden"] = compare_device_outputs(raw_outputs["reference"], tensors["y_expect"][2],
+                                                                  dtype, shape, rel_tol)
+            report["cpu_golden_sha256"] = hashlib.sha256(tensors["y_expect"][2]).hexdigest()
+            report["passed"] = report["passed"] and report["reference_vs_golden"]["passed"]
     except (RuntimeError, OSError, SystemExit) as exc:
         report["error"] = str(exc)
     finally:
@@ -1284,12 +1339,13 @@ def run_reference_comparison(case_path, fused_om_path, reference_om_path, device
             json.dump(report, output, indent=2, sort_keys=True, allow_nan=False)
             output.write("\n")
         os.replace(report_path + ".tmp", report_path)
-    print("[%s] fused vs unfused device output; report: %s" % ("PASS" if report["passed"] else "FAIL", report_path))
+    print("[%s] numerical comparison run; report: %s" % ("PASS" if report["passed"] else "FAIL", report_path))
     if "comparison" in report:
-        comparison = report["comparison"]
-        print("  bit mismatches=%d tolerance mismatches=%d max_abs=%s max_rel=%s" %
-              (comparison["bit_mismatch_count"], comparison["tolerance_mismatch_count"],
-               comparison["max_absolute_error"], comparison["max_relative_error"]))
+        print("[%s] FusedMultiConv2d vs ExtendConv2D pair" % ("PASS" if report["comparison"]["passed"] else "FAIL"))
+        print_output_comparison(report["comparison"], "FusedMultiConv2d", "ExtendConv2D pair")
+    if "reference_vs_golden" in report:
+        print("[%s] ExtendConv2D pair vs CPU golden" % ("PASS" if report["reference_vs_golden"]["passed"] else "FAIL"))
+        print_output_comparison(report["reference_vs_golden"], "ExtendConv2D pair", "CPU golden")
     return 0 if report["passed"] else 1
 
 
@@ -1299,7 +1355,11 @@ def _extract_pair_arguments(argv):
     while index < len(argv):
         argument = argv[index]
         flag, separator, inline = argument.partition("=")
-        if flag in ("--reference-om", "--comparison-output"):
+        if flag == "--compare-reference-golden":
+            if flag in options or separator:
+                die("%s is a boolean option and may only be specified once" % flag)
+            options[flag] = True
+        elif flag in ("--reference-om", "--comparison-output"):
             if flag in options:
                 die("duplicate option %s" % flag)
             if separator:
@@ -1315,6 +1375,8 @@ def _extract_pair_arguments(argv):
         index += 1
     if "--comparison-output" in options and "--reference-om" not in options:
         die("--comparison-output requires --reference-om")
+    if "--compare-reference-golden" in options and "--reference-om" not in options:
+        die("--compare-reference-golden requires --reference-om")
     return remaining, options
 
 
@@ -1380,8 +1442,8 @@ def main():
         die("REPEAT 至少是 1")
     if warmup < 0:
         die("WARMUP 不能为负")
-    if rel_tol < 0:
-        die("REL_TOL 不能为负")
+    if not math.isfinite(rel_tol) or rel_tol < 0:
+        die("REL_TOL must be finite and nonnegative")
     if not (0.0 <= ratio_min <= 1.0):
         die("RATIO_MIN 要在 [0,1] 之间，传的是 %g" % ratio_min)
     if repeat < 0:
@@ -1425,7 +1487,8 @@ def main():
         if om_file is None:
             die("--reference-om requires a fused OM")
         return run_reference_comparison(case_path, om_file, pair_options["--reference-om"], device_id,
-                                        pair_options.get("--comparison-output"), rel_tol, repeat, warmup)
+                                        pair_options.get("--comparison-output"), rel_tol, repeat, warmup,
+                                        compare_reference_golden=pair_options.get("--compare-reference-golden", False))
     print("形状（来自 case 文件的 spec）: %s" % info["shape_text"])
     want_raw = tensors["y_expect"][2]
     yElemBytes = 1 if info["outInt8"] else 2
@@ -1731,6 +1794,8 @@ def main():
 
     # ------------------------------------------------------------ 比对
     r = evaluate(got, want, rel_tol, ySentinel)
+    comparison = summarize_output_comparison(got, want, y_dims, y_dtype, rel_tol)
+    print_output_comparison(comparison, "FusedMultiConv2d", "CPU golden")
     nonzero, unwritten, mismatches = r["nonzero"], r["unwritten"], r["mismatches"]
     ratio = r["prec_ok"] / float(r["n"])
 
@@ -1755,7 +1820,7 @@ def main():
                  got[0][mi], want[0][mi]))
     else:
         print("       最大相对误差 0")
-    print("       golden 为 0 的 %d 个元素按绝对误差判" % r["zero_golden"])
+    print("       golden 为 0 的 %d 个元素要求设备输出也为 0" % r["zero_golden"])
     print("       相对误差分布:")
     for k in ["=0", "(0,1e-3]", "(1e-3,1e-2]", "(1e-2,1e-1]", "(1e-1,1]", ">1", "inf(golden=0)"]:
         v = r["hist"][k]
@@ -1854,6 +1919,10 @@ def main():
         acl.aclFinalize()
 
     print()
+    if any(comparison["nonfinite_count"].values()):
+        print("[FAIL] nonfinite output: actual=%d golden=%d" %
+              (comparison["nonfinite_count"]["fused"], comparison["nonfinite_count"]["reference"]))
+        return 1
     if unwritten:
         print("[FAIL] %d 个输出从来没被写过 —— kernel 没跑，或只跑了一部分核" % unwritten)
         return 1

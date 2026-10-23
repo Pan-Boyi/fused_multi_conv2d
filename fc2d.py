@@ -470,7 +470,7 @@ def _compile_models(c, paths, soc, compare_unfused=False, registry=None):
         die("编译验证失败: %s。%s；诊断目录: %s" % (exc, incomplete, audit))
 
 
-def do_run(c, paths, device, extra, compare_unfused=False):
+def do_run(c, paths, device, extra, compare_unfused=False, compare_reference_golden=False):
     runner = os.path.join(HERE, "run_fused_multi_conv2d.py")
     if not os.path.isfile(runner):
         die("找不到 run_fused_multi_conv2d.py")
@@ -479,6 +479,8 @@ def do_run(c, paths, device, extra, compare_unfused=False):
     if not os.path.isdir(paths["omdir"]):
         die("%s 不存在 —— 先跑 --steps om" % paths["omdir"])
     arguments = list(extra)
+    if compare_reference_golden and not compare_unfused:
+        die("--compare-reference-golden requires --compare-unfused")
     if compare_unfused:
         reference_dir = os.path.join(os.path.dirname(paths["omdir"]), "reference")
         references = [] if not os.path.isdir(reference_dir) else [
@@ -488,6 +490,8 @@ def do_run(c, paths, device, extra, compare_unfused=False):
             die("%s 必须只有一个参考 OM；先用 --compare-unfused --steps om 编译" % reference_dir)
         comparison_output = os.path.join(os.path.dirname(paths["bin"]), "comparison", uuid.uuid4().hex)
         arguments += ["--reference-om", references[0], "--comparison-output", comparison_output]
+        if compare_reference_golden:
+            arguments.append('--compare-reference-golden')
     cmd = [sys.executable, runner, paths["bin"], "FusedMultiConv2d", str(device), paths["omdir"]] + arguments
     print("  " + " ".join(cmd))
     return run(cmd)
@@ -503,6 +507,8 @@ def main():
                     help="做哪几步，逗号分隔：check / case / om / run")
     ap.add_argument("--compare-unfused", action="store_true",
                     help="以第二阶段融合前的两个 ExtendConv2D 实板输出为 golden 对比精度")
+    ap.add_argument("--compare-reference-golden", action="store_true",
+                    help="同时将两个 ExtendConv2D 的实板输出与 CPU golden 比较，需配合 --compare-unfused")
     ap.add_argument("--fusion-pass-config", metavar="PATH",
                     help="当前 CANN 的 support_fusion_pass.json；默认从活动 CANN 环境定位")
     ap.add_argument("--l1", type=int, default=1024 * 1024,
@@ -522,6 +528,8 @@ def main():
     ap.add_argument("--run-arg", action="append", default=[],
                     help="原样转给 run_fused_multi_conv2d.py 的参数，可给多次（如 --run-arg --dry-run）")
     args = ap.parse_args()
+    if args.compare_reference_golden and not args.compare_unfused:
+        ap.error("--compare-reference-golden requires --compare-unfused")
 
     if args.sync_shape_header:
         src = args.sync_shape_header
@@ -641,7 +649,8 @@ def main():
                 do_om(c, paths, args.soc, **options)
             if "run" in steps:
                 if args.compare_unfused:
-                    rc = do_run(c, paths, device, extra, compare_unfused=True)
+                    rc = do_run(c, paths, device, extra, compare_unfused=True,
+                                compare_reference_golden=args.compare_reference_golden)
                 else:
                     rc = do_run(c, paths, device, extra)
                 if rc != 0:

@@ -149,13 +149,32 @@ SIGKILL 或机器掉电无法立即执行恢复，下一次 harness 编译会先
 INT8 要求逐位相同；FP16 默认相对误差不超过 `1e-3`，参考值为零时要求实际值也为零，
 全部元素均须通过。该模式不使用 `RATIO_MIN` 放宽通过比例，原有 CPU golden 保留不变。
 
+与 CPU golden 比较和与未融合设备输出比较，两种模式都会打印全量数据中相对误差
+`<= 0.001` 的数量、总数及百分比，并打印前 50 个不一致元素的两侧数值、NCHW 坐标、
+绝对误差、相对误差和是否达标。该固定精度统计独立于 `REL_TOL`；参考值为零时要求输出也为零。
+前 50 个差异按展平顺序选取，包含在容差内但位模式不相同的元素。
+
+如需同时检查两个 ExtendConv2D 与 CPU golden 函数生成的 `y_expect` 是否一致，添加
+`--compare-reference-golden`：
+
+```bash
+python3 run_profile.py --cases fusion_cases.json --only fusion_a16w8 \
+  --compare-unfused --compare-reference-golden --no-msprof --steps push,prof
+```
+
+此开关使用同一次参考模型执行的实际输出，无须重新编译 OM。
+报告额外保存 `reference_vs_golden` 和 CPU golden 摘要，两项比较均通过时整体才通过；
+未开启时，融合前后比较的通过判据仍只使用设备参考输出。
+板侧 runner 同样支持 `--reference-om reference.om --compare-reference-golden`，
+本机 `fc2d.py` 使用同名开关并配合 `--compare-unfused`。
+
 结果自动拉回本地 case 目录的 `comparison_<本次运行标识>/comparison/`：
 
 | 文件 | 内容 |
 | :-- | :-- |
 | `reference.bin` | 两个 ExtendConv2D 的实际输出，作为本次 golden |
 | `fused.bin` | FusedMultiConv2d 的实际输出 |
-| `comparison.json` | 位差数量、超差数量、最大绝对/相对误差、首个超差 NCHW 坐标，以及输入、模型和输出哈希 |
+| `comparison.json` | 位差数量、超差数量、0.001 达标统计、前 50 个差异、最大误差及首个超差坐标，以及输入、模型和输出哈希 |
 
 数值失败仍拉回输出和报告，命令返回失败。单个模型执行失败时保存错误及已完成模型的输出。
 对比模式不启用 profiling，避免把两个模型的执行混入性能统计。

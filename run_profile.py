@@ -362,7 +362,8 @@ def preflight(rt):
 
 
 # ---------------------------------------------------------------- 远端脚本
-def remote_script(rt, case_name, om_name, use_msprof, msprof, expected_binding, reference_binding=None):
+def remote_script(rt, case_name, om_name, use_msprof, msprof, expected_binding, reference_binding=None,
+                  compare_reference_golden=False):
     """Verify this bundle, record the runner RC separately, and return a JSON result.
 
     The profiler may return zero even when its child fails. The application wrapper
@@ -373,6 +374,10 @@ def remote_script(rt, case_name, om_name, use_msprof, msprof, expected_binding, 
         rt.device, shlex.quote(om_name))
     if reference_binding is not None:
         command += " --reference-om reference.om --comparison-output comparison"
+    if compare_reference_golden:
+        if reference_binding is None:
+            raise ValueError("--compare-reference-golden requires --compare-unfused")
+        command += " --compare-reference-golden"
     lines = ["set -o pipefail", "cd %s || exit 1" % shlex.quote(wd)]
     if rt.cann_env:
         lines += ["[ -f %s ] || exit 1; source %s >/dev/null 2>&1" %
@@ -512,14 +517,18 @@ def do_push(rt, c, paths, om_file, reference_om=None):
     print("[OK] 已拷到 %s:%s" % (rt.target, wd))
 
 
-def do_prof(rt, c, paths, om_file, use_msprof, msprof, show_script=False, reference_om=None):
+def do_prof(rt, c, paths, om_file, use_msprof, msprof, show_script=False, reference_om=None,
+            compare_reference_golden=False):
     import run_fused_multi_conv2d as runner
     binding = runner.validate_model_binding(paths["bin"], om_file)
     if reference_om is not None and use_msprof:
         raise RuntimeError("Device reference comparison requires --no-msprof")
+    if compare_reference_golden and reference_om is None:
+        raise RuntimeError("--compare-reference-golden requires --compare-unfused")
     reference_binding = (runner.validate_reference_model_binding(paths["bin"], reference_om, om_file)
                          if reference_om is not None else None)
-    script = remote_script(rt, c["name"], os.path.basename(om_file), use_msprof, msprof, binding, reference_binding)
+    script = remote_script(rt, c["name"], os.path.basename(om_file), use_msprof, msprof, binding,
+                           reference_binding, compare_reference_golden)
     if show_script:
         print("---- 远端将执行 ----\n%s--------------------" % script)
     log_path = os.path.join(os.path.dirname(paths["bin"]), "execution_%s.log" % uuid.uuid4().hex)
@@ -549,7 +558,8 @@ def do_prof(rt, c, paths, om_file, use_msprof, msprof, show_script=False, refere
     if reference_binding is not None:
         state["reference_binding"] = reference_binding
         try:
-            state["comparison_report"] = collect_comparison(rt, c, paths, binding, reference_binding)
+            state["comparison_report"] = collect_comparison(rt, c, paths, binding, reference_binding,
+                                                            compare_reference_golden)
             with open(state["comparison_report"]) as stream:
                 state["comparison_passed"] = json.load(stream)["passed"]
         except (OSError, ValueError, RuntimeError) as exc:
@@ -561,7 +571,7 @@ def do_prof(rt, c, paths, om_file, use_msprof, msprof, show_script=False, refere
     return state
 
 
-def collect_comparison(rt, case, paths, fused_binding, reference_binding):
+def collect_comparison(rt, case, paths, fused_binding, reference_binding, compare_reference_golden=False):
     """拉回本次设备对比输出，核对模型身份、输出摘要和数值报告。"""
     import run_fused_multi_conv2d as runner
     destination = os.path.join(os.path.dirname(paths["bin"]), "comparison_" + uuid.uuid4().hex)
@@ -577,6 +587,8 @@ def collect_comparison(rt, case, paths, fused_binding, reference_binding):
             or report.get("source_graph_sha256") != fused_binding["fusion"]["source_graph_sha256"]
             or report.get("golden_source") != "extend_pair_device_output"):
         raise RuntimeError("Device comparison belongs to a different case/source")
+    if report.get("cpu_golden_used") is not compare_reference_golden:
+        raise RuntimeError("Device comparison did not use the requested CPU golden mode")
     outputs = {}
     for role, binding in (("reference", reference_binding), ("fused", fused_binding)):
         result = report.get("models", {}).get(role, {})
@@ -588,14 +600,30 @@ def collect_comparison(rt, case, paths, fused_binding, reference_binding):
                 raise RuntimeError("Device comparison output hash differs: " + role)
             with open(path, "rb") as stream:
                 outputs[role] = stream.read()
+    expected = reference_binding["output"]
+    passed = False
     if len(outputs) == 2:
-        expected = reference_binding["output"]
         actual = runner.compare_device_outputs(outputs["fused"], outputs["reference"],
                     expected["dtype"], expected["shape"], report["comparison"]["relative_tolerance"])
-        if actual != report.get("comparison") or report.get("passed") != actual["passed"]:
+        if actual != report.get("comparison"):
             raise RuntimeError("Device comparison metrics differ from the retrieved outputs")
-    elif report.get("passed"):
-        raise RuntimeError("Device comparison passed without both outputs")
+        passed = actual["passed"]
+    if compare_reference_golden and "reference" in outputs:
+        golden = runner.load_case(paths["bin"])[0]['y_expect'][2]
+        if report.get("cpu_golden_sha256") != hashlib.sha256(golden).hexdigest():
+            raise RuntimeError("Device CPU golden differs from this case")
+        reference_report = report.get("reference_vs_golden")
+        if not isinstance(reference_report, dict):
+            raise RuntimeError("Device comparison omitted the requested reference/CPU golden result")
+        actual = runner.compare_device_outputs(outputs['reference'], golden, expected['dtype'],
+                                               expected['shape'], reference_report['relative_tolerance'])
+        if actual != reference_report:
+            raise RuntimeError("Reference/CPU golden metrics differ from the retrieved output")
+        passed = passed and actual['passed']
+    elif "reference_vs_golden" in report:
+        raise RuntimeError("Unexpected reference/CPU golden result")
+    if report.get("passed") is not passed:
+        raise RuntimeError("Device comparison aggregate result differs from its numerical results")
     print("[COMPARE] Device reference report: " + report_path)
     return report_path
 
@@ -756,6 +784,8 @@ def main():
                     help="远端只跑功能，不套 msprof；自动跳过 pull/export/parse")
     ap.add_argument("--compare-unfused", action="store_true",
                     help="以第二阶段融合前两个 ExtendConv2D 的设备输出为 golden，需配合 --no-msprof")
+    ap.add_argument("--compare-reference-golden", action="store_true",
+                    help="同时将两个 ExtendConv2D 的设备输出与 CPU golden 比较，需配合 --compare-unfused")
     ap.add_argument("--fusion-pass-config", metavar="PATH",
                     help="当前 CANN 的 support_fusion_pass.json；默认从活动 CANN 环境定位")
     ap.add_argument("--print-remote-script", action="store_true", help="把远端要执行的 bash 打出来")
@@ -764,6 +794,8 @@ def main():
     args = ap.parse_args()
     if args.compare_unfused and not args.no_msprof:
         ap.error("--compare-unfused requires --no-msprof")
+    if args.compare_reference_golden and not args.compare_unfused:
+        ap.error("--compare-reference-golden requires --compare-unfused")
 
     doc, remote_cfg, prof_cfg, cases = load_config(args.config)
     if args.cases:
@@ -862,7 +894,8 @@ def main():
             state = None
             if "prof" in steps:
                 state = do_prof(rt, c, paths, om_file, use_msprof, prof_cfg["msprof"],
-                                args.print_remote_script, reference_om=reference_om)
+                                args.print_remote_script, reference_om=reference_om,
+                                compare_reference_golden=args.compare_reference_golden)
             if {"pull", "export", "parse"} & set(steps):
                 state = load_profile_state(paths, om_file, rt if "pull" in steps else None)
             if "pull" in steps:
