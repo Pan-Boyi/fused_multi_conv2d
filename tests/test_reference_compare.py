@@ -217,6 +217,22 @@ class ReferenceComparison(unittest.TestCase):
         self.assertTrue(all(line[2:] == trace[0][2:] for line in trace))
         self.assertEqual(report['models']['reference']['model_sha256'], runner._file_sha256(str(self.reference)))
 
+    def test_device_execution_and_comparison_without_math_prod(self):
+        original_run = subprocess.run
+        bootstrap = ("import math,runpy,sys;math.__dict__.pop('prod',None);"
+                     "sys.argv=sys.argv[1:];runpy.run_path(sys.argv[0],run_name='__main__')")
+
+        def legacy_python(command, **options):
+            return original_run([command[0], '-c', bootstrap] + command[1:], **options)
+
+        with mock.patch.object(subprocess, 'run', side_effect=legacy_python):
+            result, report = self.run_pair()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertTrue(report['passed'])
+        self.assertEqual(report['comparison']['elements'], len(self.reference_data) // 2)
+        self.assertEqual((self.output / 'reference.bin').read_bytes(), self.reference_data)
+        self.assertEqual((self.output / 'fused.bin').read_bytes(), self.reference_data)
+
     def test_device_difference_fails_and_keeps_both_raw_outputs(self):
         changed = bytearray(self.reference_data)
         changed[-2:] = struct.pack('<e', 8)

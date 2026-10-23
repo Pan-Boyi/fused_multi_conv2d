@@ -42,10 +42,12 @@ om，旧的反而先匹配上」。
 """
 
 import ctypes
+from functools import reduce
 import hashlib
 import json
 import math
 import os
+from operator import mul
 import statistics
 import struct
 import sys
@@ -1095,7 +1097,7 @@ def execute_bound_model(acl, om_path, tensors, input_names, output_dtype, output
             if index.value >= count or ordered_inputs[index.value] is not None:
                 raise RuntimeError("model input names are not a one-to-one mapping")
             ordered_inputs[index.value] = name
-        output_size = math.prod(output_shape) * DTYPE_SIZE[output_dtype]
+        output_size = reduce(mul, output_shape, 1) * DTYPE_SIZE[output_dtype]
         if int(acl.aclmdlGetOutputSizeByIndex(desc, 0)) != output_size:
             raise RuntimeError("model output byte size differs from bound output")
         payloads = []
@@ -1164,7 +1166,7 @@ def compare_device_outputs(fused_raw, reference_raw, output_dtype, output_shape,
         raise ValueError("comparison tolerance must be finite and nonnegative")
     if output_dtype not in (1, 2) or len(fused_raw) != len(reference_raw):
         raise ValueError("comparison requires equally sized fp16 or int8 outputs")
-    count = math.prod(output_shape)
+    count = reduce(mul, output_shape, 1)
     if len(fused_raw) != count * DTYPE_SIZE[output_dtype]:
         raise ValueError("raw output size differs from output shape")
     fused = decode_y(fused_raw, output_dtype == 2)
