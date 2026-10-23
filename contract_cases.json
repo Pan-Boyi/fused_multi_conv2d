@@ -8,7 +8,7 @@
       "cout2": 2,
       "bias": true,
       "enable_relu": [true, false],
-      "fixed_shift_value": [41, 43]
+      "fixed_shift_value": [42, 42]
     },
     {
       "name": "contract_int8_shortpads",
@@ -44,7 +44,7 @@
       "wi": 9,
       "cout2": 2,
       "enable_relu": [true, true],
-      "fixed_shift_value": [29, 42]
+      "fixed_shift_value": [13, 0]
     }
   ]
 }

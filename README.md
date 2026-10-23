@@ -51,18 +51,44 @@ harness 不创建 ExtendConv2D/FusedMultiConv2d 源节点，不依赖 FusedMulti
 二阶段使用 [canndev PR 82567](https://gitcode.com/cann/canndev/pull/82567/diffs)
 的 `ExtendConv2DPairToFusedMultiConv2DFusionPass`，编译时显式打开对应开关。
 
-`om` 步骤包含两次编译，以区分两个阶段：
+`om` 步骤只编译一次模型，同时开启两个 Pass。在同一次 ATC 编译中依次检查：
 
-1. 关闭二阶段 Pass 编译同一份源 ONNX，导出 OM JSON，要求恰好两个 ExtendConv2D，且 y0 直接连接下一节点的 x。这份诊断 OM 留在独立目录，不上传执行。
-2. 开启二阶段 Pass，再编译同一份源 ONNX，要求最终只有一个 FusedMultiConv2d，不残留原卷积、量化或 ReLU 计算节点。最终模型放在原有 `om/` 目录。
-3. 捕获第二次编译的官方 native tiling 返回值，核对真实几何、bias、ReLU、blockDim，以及 fp16/A16W8 实际使用的定标值。私有属性由 CANN 产生，harness 不注入或覆盖。
-4. 全部通过后才写 schema **4** 的绑定，保存 case/OM、源 ONNX、两个阶段图 JSON 和 tiling 的哈希。任一步失败，都不会留下可被上传或执行的绑定。
+1. 第一轮融合后的 GE 图快照中恰好有两个 ExtendConv2D，且 y0 直接连接下一节点的 x。
+2. 同一进程、同一图的后续快照中只有一个 FusedMultiConv2d，不残留独立卷积、量化或 ReLU。
+3. 最终 OM 通过 `atc --mode=1` 导出 JSON，独立确认融合结果和运行输入。此步骤仅导出，不编译模型。
+4. 捕获本次编译的 native tiling，核对真实几何、bias、ReLU、blockDim，以及 FP16/A16W8 使用的定标值。
+5. 全部通过后写 schema **5** 的绑定，记录 case/OM、源 ONNX、两个阶段快照、最终图和 tiling 的哈希。
 
-每次编译在 case 目录创建独立的 `fusion_*` 证据目录，保存两个开关文件、ATC 日志、
-图 JSON、原始 tiling 和 `fusion_verification.json`。旧 schema 1/2/3 的直接构图模型必须重编。
-case ABI 仍为 **8**，原有数据生成、golden、精度阈值及 profiling 步骤保持不变。
+不再关闭二阶段编译 `stage1.om`，因此不会为了观察中间图而编译 ExtendConv2D 内核。
+每次编译在 case 目录创建独立的 `fusion_*` 目录，保存 `fusion_switch.json`、`atc.log`、
+`graphs/`、`model_graph.json`、`tiling_capture/` 和 `fusion_verification.json`。
+失败时保存 `failure_report.json`，保留原始日志和快照，不签发可运行绑定。
+schema 1–4 的模型需要重编；case ABI 仍为 **8**，精度阈值及 profiling 步骤保持不变。
 
-先使用专门的零 padding 小用例检查当前 CANN 包：
+图快照使用官方 `DUMP_GE_GRAPH=2`、`DUMP_GRAPH_LEVEL=1`、`DUMP_GRAPH_FORMAT=ge_proto`、
+`DUMP_GRAPH_PATH` 配置，递归读取 `pid_*` 目录下的 ModelDef protobuf text。
+进程退出后恢复父环境；编译期间清除会覆盖 dump 目录的 `ASCEND_DUMP_PATH` 和 `NPU_COLLECT_PATH`。
+参见 [CANN 图快照配置](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/910/maintenref/envvar/envref_07_0012.html)。
+
+本次核对的 Pass 源码为 canndev `4b47d70a0445542c92f16865d0b6c039e65a2a59`。
+第一阶段为 FP16 设置私有 shift=42，为 FP16×INT8 设置 shift=13；第二阶段传递每层值。
+用例中的 `fixed_shift_value` 是 golden 的预期工作点，不会作为源 ONNX 属性发送：
+
+| 通路 | harness 默认预期 | 实际检查 |
+| :-- | :-- | :-- |
+| FP16 | `[42,42]` | 两项 |
+| A16W8 | `[13,0]` | 第一项 |
+| INT8 / S8F16 | `[0,0]` | 不使用 shift |
+
+显式填写的预期值会保留；若与安装包实际产生的值不同，native tiling 校验失败。
+A16W8 的 CANN 混合 Conv2D 使用定点语义：第一层将 `x × 2^(29−S)` 转为整数后计算，
+S=13 时为 `x × 2^16`。golden 和 CPU 参考按这一契约验证，不把它解释为标准浮点 ONNX Conv。
+新版二阶段支持上下、左右分别对称的 padding，权重重排由原始 CANN 流程完成。
+
+先使用四条小用例检查服务器 A 上的新 CANN 包：
+
+`run_profile.py` 会 source `profile.json.local_cann_env`，该路径必须指向包含上述 Pass 的 CANN。
+编译环境中同时加载当前 ops-nn 算子包的 `set_env`。
 
 ```bash
 python3 run_profile.py profile.json --cases fusion_cases.json \
@@ -75,13 +101,10 @@ python3 run_profile.py profile.json --cases fusion_cases.json \
 `python3 fc2d.py fusion_cases.json --steps check,case`；真实两阶段 OM 和实板结果需要在 A/B 验证。
 测试中的 synthetic OM 和 ACL 桩只验证框架链路，不能作为融合或设备精度证据。
 
-**原始 PR 的约束需要由真实编译确认。** 已提供的 PR 82567 diff 只接受零 padding，
-A16W8 还要求两张 filter 的生产节点都是原始 `RearrangeA16W8WeightFzOp`；这些节点必须由
-CANN 的上游处理生成。该 diff 没有向 FusedMultiConv2d 传递 `fixed_shift_value`，因此原型
-默认 `[0,0]` 不能满足历史 fp16 `42/42`、A16W8 首项 `29` 的契约，tiling 检查会明确失败。
-`fusion_cases.json` 的这两条仍保留非零工作点，用来检查实际安装包是否解决了定标传递。
-纯 fp16 未带 ReLU 的层也可能无法命中一阶段 Fixpipe 融合。harness 保留原用例的语义，
-不修改 padding、定标、ReLU，不伪造权重重排节点，也不退回直接构造融合目标。
+编译失败时，`failure_report.json` 根据本次实际图和 tiling 区分：一阶段未命中、
+二阶段未命中、已融合但尚无 native tiling、已完成 native tiling 的内核编译失败。
+`SetM1Dequant` 仅作为日志诊断记录，不用于单独判断根因。
+若 FP16 层没有 ReLU 等 Fixpipe 运算，是否命中一阶段仍以真实图为准。
 
 ## 上板 + profiling：run_profile.py
 
@@ -101,7 +124,7 @@ python3 run_profile.py profile.json
 | :-- | :-- | :-- |
 | `check` | 本地 | 形状预检 |
 | `case` | 本地 | 生成 `case.bin` |
-| `om` | 本地 | 生成双 Conv ONNX，验证两阶段融合和 native tiling，写 schema-4 binding |
+| `om` | 本地 | 生成双 Conv ONNX，单次编译验证两阶段融合和 native tiling，写 schema-5 binding |
 | `push` | 本地 -> 远端 | 每条 case 一个干净目录,拷 `case.bin`、`.om`、`.om.fc2d.json`、`run_fused_multi_conv2d.py` |
 | `prof` | 远端 | `$MSPROF bash <runner wrapper>`，分别记录 runner 与 profiler 返回码，并找出**本次**新生成的 `PROF_*`。`$MSPROF` 是 `profile.msprof` 给死的绝对路径(缺省 `/var/msprof`),**不搜 PATH** —— 远端那个 ssh 是非交互 shell,读不到 `~/.bashrc` 里 source 的 `set_env.sh`,搜 PATH 会说「没有 msprof」而其实装着。指向 msprof 那个可执行文件本身。 |
 | `pull` | 远端 -> 本地 | 把那个 `PROF_*` 拉回 `prof_out/<json 名>/<case 名>/` |
@@ -155,7 +178,7 @@ python3 run_profile.py profile.json
 
 case.bin 保存逻辑输入、golden 和属性 spec。ONNX 从它派生两个 Conv 的计算、
 逻辑 NCHW 常量权重和必要的 bias/scale 输入。GE 负责布局转换和两阶段融合，
-harness 在写绑定前核对最终图和真实 tiling。运行器在加载 ACL 前校验 schema-4
+harness 在写绑定前核对最终图和真实 tiling。运行器在加载 ACL 前校验 schema-5
 `<model.om>.fc2d.json` 中完整 case 与 OM 的 SHA256 以及融合证据摘要。
 
 ```text
@@ -227,7 +250,7 @@ PROF 或 binding 不匹配时明确失败。`export/parse` 不连接远端。重
 `fixed_shift_value` 为统一的私有 ListInt，默认 `[0,0]`；原型不公开该属性。
 由 CANN 融合及编译阶段产生，harness 只验证 native tiling，不通过 ONNX 属性传入。全 fp16 两项范围 `[0,58]`，
 A16W8 第一项范围 `[0,29]`、第二项不参与计算。旧 `fixed_shift`、`a16w8_shift` 名称不再接受。
-历史数值用例显式保留原有工作点；原型默认零需要按实际输入进行标定，不能直接代替原工作点。
+该零默认属于算子原型；harness 的 golden 默认期望来自第一阶段 Pass：FP16 为 `[42,42]`，A16W8 为 `[13,0]`。
 
 **int8 量化**：一个 golden，精确整数运算 + per-channel VREQ8
 （round-half-to-even + 饱和 + relu），应当逐位相等。当前 case 为了与历史 golden

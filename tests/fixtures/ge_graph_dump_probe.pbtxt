@@ -1,0 +1,295 @@
+graph {
+  name: "dump_probe"
+  input: "x:0"
+  output: "relu2:0"
+  op {
+    name: "x"
+    type: "Data"
+    input: ""
+    attr {
+      key: "_input_name_key"
+      value {
+        list {
+          s: "x"
+        }
+      }
+    }
+    attr {
+      key: "_input_name_value"
+      value {
+        list {
+          i: 0
+        }
+      }
+    }
+    attr {
+      key: "_ir_attr_names"
+      value {
+        list {
+          s: "index"
+        }
+      }
+    }
+    attr {
+      key: "_ir_inputs_key"
+      value {
+        list {
+          s: "x"
+        }
+      }
+    }
+    attr {
+      key: "_ir_inputs_value"
+      value {
+        list {
+          i: 0
+        }
+      }
+    }
+    attr {
+      key: "_ir_outputs_key"
+      value {
+        list {
+          s: "y"
+        }
+      }
+    }
+    attr {
+      key: "_ir_outputs_value"
+      value {
+        list {
+          i: 0
+        }
+      }
+    }
+    attr {
+      key: "_output_name_key"
+      value {
+        list {
+          s: "y"
+        }
+      }
+    }
+    attr {
+      key: "_output_name_value"
+      value {
+        list {
+          i: 0
+        }
+      }
+    }
+    attr {
+      key: "_src_out_peer_index_for_ge_txt_load"
+      value {
+        list {
+          i: -1
+        }
+      }
+    }
+    attr {
+      key: "data_type"
+      value {
+        i: 1
+      }
+    }
+    attr {
+      key: "index"
+      value {
+        i: 0
+      }
+    }
+    has_out_attr: true
+    input_desc {
+      dtype: DT_FLOAT16
+      shape {
+        dim: 1
+        dim: 16
+        dim: 8
+        dim: 8
+      }
+      layout: "NCHW"
+      attr {
+        key: "format_for_int"
+        value {
+          i: 0
+        }
+      }
+      attr {
+        key: "origin_format"
+        value {
+          s: "NCHW"
+        }
+      }
+      attr {
+        key: "origin_format_for_int"
+        value {
+          i: 0
+        }
+      }
+      attr {
+        key: "origin_format_is_set"
+        value {
+          b: true
+        }
+      }
+      attr {
+        key: "origin_shape"
+        value {
+          list {
+            i: 1
+            i: 16
+            i: 8
+            i: 8
+            val_type: VT_LIST_INT
+          }
+        }
+      }
+      attr {
+        key: "origin_shape_initialized"
+        value {
+          b: true
+        }
+      }
+      attr {
+        key: "origin_shape_range"
+        value {
+          list_list_int {
+          }
+        }
+      }
+      attr {
+        key: "placement"
+        value {
+          i: 0
+        }
+      }
+      attr {
+        key: "shape_range"
+        value {
+          list_list_int {
+          }
+        }
+      }
+      device_type: "NPU"
+    }
+    output_desc {
+      dtype: DT_FLOAT16
+      shape {
+        dim: 1
+        dim: 16
+        dim: 8
+        dim: 8
+      }
+      layout: "NCHW"
+      attr {
+        key: "format_for_int"
+        value {
+          i: 0
+        }
+      }
+      attr {
+        key: "origin_data_type"
+        value {
+          s: "DT_FLOAT16"
+        }
+      }
+      attr {
+        key: "origin_format"
+        value {
+          s: "NCHW"
+        }
+      }
+      attr {
+        key: "origin_format_for_int"
+        value {
+          i: 0
+        }
+      }
+      attr {
+        key: "origin_format_is_set"
+        value {
+          b: true
+        }
+      }
+      attr {
+        key: "origin_shape"
+        value {
+          list {
+            i: 1
+            i: 16
+            i: 8
+            i: 8
+            val_type: VT_LIST_INT
+          }
+        }
+      }
+      attr {
+        key: "origin_shape_initialized"
+        value {
+          b: true
+        }
+      }
+      attr {
+        key: "origin_shape_range"
+        value {
+          list_list_int {
+          }
+        }
+      }
+      attr {
+        key: "placement"
+        value {
+          i: 0
+        }
+      }
+      attr {
+        key: "shape_range"
+        value {
+          list_list_int {
+          }
+        }
+      }
+      device_type: "NPU"
+      real_dim_cnt: 4
+    }
+  }
+  op {
+    name: "filter1_Initializer_0"
+    type: "Const"
+  }
+  op {
+    name: "conv1"
+    type: "Conv2D"
+    input: "x:0"
+    input: "filter1_Initializer_0:0"
+    input: ""
+    input: ""
+  }
+  op {
+    name: "relu1"
+    type: "Relu"
+    input: "conv1:0"
+  }
+  op {
+    name: "filter2_Initializer_1"
+    type: "Const"
+  }
+  op {
+    name: "conv2"
+    type: "Conv2D"
+    input: "relu1:0"
+    input: "filter2_Initializer_1:0"
+    input: ""
+    input: ""
+  }
+  op {
+    name: "relu2"
+    type: "Relu"
+    input: "conv2:0"
+  }
+  op {
+    name: "Node_Output"
+    type: "NetOutput"
+    input: "relu2:0"
+  }
+}

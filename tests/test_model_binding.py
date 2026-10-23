@@ -68,7 +68,7 @@ class ModelBinding(unittest.TestCase):
         model, sidecar = self.make_model()
         binding = json.loads(sidecar.read_text())
         self.assertEqual(binding['op_type'], 'FusedMultiConv2d')
-        for old_schema in (1, 2, 3):
+        for old_schema in (1, 2, 3, 4):
             previous = dict(binding, schema_version=old_schema)
             previous.pop('op_type')
             sidecar.write_text(json.dumps(previous))

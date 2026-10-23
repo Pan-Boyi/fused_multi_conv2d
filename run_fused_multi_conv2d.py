@@ -149,10 +149,11 @@ def _valid_fusion_report(report, names):
     expected = {"pass_name": "ExtendConv2DPairToFusedMultiConv2DFusionPass",
                 "stage1_pass_name": "Conv2DFixPipeToExtendConv2DFusionPass",
                 "fused_node_count": 1, "unfused_convolution_count": 0, "input_names": names,
-                "source_conv_count": 2, "stage1_extend_count": 2}
+                "source_conv_count": 2, "stage1_extend_count": 2,
+                "evidence_mode": "single_atc_graph_dump", "compile_count": 1}
     if any(report.get(key) != value for key, value in expected.items()):
         return False
-    for key in ("source_graph_sha256", "stage1_graph_sha256", "model_graph_sha256"):
+    for key in ("source_graph_sha256", "stage1_snapshot_sha256", "stage2_snapshot_sha256", "model_graph_sha256"):
         value = report.get(key)
         if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
             return False
@@ -178,7 +179,7 @@ def write_model_binding(case_path, om_path, expected_case_sha256=None, fusion_re
     names = model_input_slots(info)
     if not _valid_fusion_report(fusion_report, names):
         die("verified production fusion report is required; rebuild through canndev PR 82567")
-    binding = {"schema_version": 4, "op_type": "FusedMultiConv2d", "case_abi": CASE_VERSION,
+    binding = {"schema_version": 5, "op_type": "FusedMultiConv2d", "case_abi": CASE_VERSION,
                "pipeline": "onnx_conv_pair_fusion", "weight_mode": "constant", "model_input_count": len(names),
                "model_input_names": names, "fusion": fusion_report,
                "model_sha256": _file_sha256(om_path), "case_sha256": expected_case_sha256 or case_sha}
@@ -198,7 +199,7 @@ def validate_model_binding(case_path, om_path):
             binding = json.load(stream)
     except (OSError, ValueError) as exc:
         die("missing or invalid case/OM binding %s: %s; regenerate case and OM" % (path, exc))
-    contract = {"schema_version": 4, "op_type": "FusedMultiConv2d", "case_abi": CASE_VERSION, "weight_mode": "constant", "pipeline": "onnx_conv_pair_fusion"}
+    contract = {"schema_version": 5, "op_type": "FusedMultiConv2d", "case_abi": CASE_VERSION, "weight_mode": "constant", "pipeline": "onnx_conv_pair_fusion"}
     if not isinstance(binding, dict) or any(binding.get(k) != v for k, v in contract.items()):
         die("unsupported binding; regenerate OM through the production GE fusion pass")
     info = _binding_spec(case_path)

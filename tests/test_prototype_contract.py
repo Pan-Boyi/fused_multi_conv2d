@@ -34,6 +34,18 @@ class PrototypeContract(unittest.TestCase):
         self.assertEqual([argv[argv.index(k)+1] for k in ('--s1','--s2','--ph1','--pw1','--ph2','--pw2')],
                          ['2','3','0','1','2','0'])
 
+    def test_harness_golden_shift_defaults_follow_pass_and_preserve_explicit_values(self):
+        # These case defaults follow the source Pass; the target operator's
+        # registered private-attribute default remains [0,0].
+        self.assertEqual(fc2d.normalise({},0)['fixed_shift_value'],[42,42])
+        for mode,expected in (('fp16',[42,42]),('both',[42,42]),('a16w8',[13,0]),
+                              ('int8',[0,0]),('s8f16',[0,0])):
+            with self.subTest(mode=mode):
+                self.assertEqual(fc2d.normalise(dict(dtype=mode),0)['fixed_shift_value'],expected)
+                for explicit in ([0,0],[5,7]):
+                    case=fc2d.normalise(dict(dtype=mode,fixed_shift_value=explicit),0)
+                    self.assertEqual(case['fixed_shift_value'],explicit)
+
     def test_unsupported_or_legacy_geometry_and_shifts_are_rejected(self):
         invalid = [dict(strides=[1,2]), dict(strides=[1,2,2,2]), dict(strides=[1,1,2,3]),
                    dict(strides=[0,0,1,1]), dict(pads=[0]*4), dict(pads=[0,1,0,0,0,0,0,0]),
@@ -97,7 +109,7 @@ class PrototypeContract(unittest.TestCase):
             model.write_bytes(b'synthetic model')
             binding_path=write_test_binding(str(path),str(model))
             binding=json.loads(Path(binding_path).read_text())
-            self.assertEqual(binding['schema_version'],4)
+            self.assertEqual(binding['schema_version'],5)
             binding['schema_version']=1
             Path(str(model)+'.fc2d.json').write_text(json.dumps(binding))
             with contextlib.redirect_stdout(io.StringIO()),self.assertRaises(SystemExit):

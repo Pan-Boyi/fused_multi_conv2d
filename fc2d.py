@@ -150,6 +150,10 @@ def normalise(case, index):
             % (index, unknown, ", ".join(sorted(DEFAULTS) + ["name"])))
     out.update(case)
     out["name"] = case.get("name", "case%02d" % index)
+    if "fixed_shift_value" not in case:
+        # These are the source Pass defaults expected by the golden, not ONNX attrs.
+        out["fixed_shift_value"] = list({"fp16": (42, 42), "both": (42, 42),
+                                         "a16w8": (13, 0)}.get(out["dtype"], (0, 0)))
     # s8f16 = int8 进 / fp16 出；a16w8 = fp16 fmap + int8 filters，mid 为 int8。
     # both 只展开 fp16 + int8 这两条（那是「同一形状两条通路都跑一遍」的意思），
     # s8f16 要显式写 —— 它多一个输入，不是前两条的变体。
@@ -333,12 +337,20 @@ def do_om(c, paths, soc):
         for old in omdir.glob(pattern):
             old.unlink()
     audit = Path(tempfile.mkdtemp(prefix="fusion_", dir=str(omdir.parent)))
+    graph_dumps = audit / "graphs"
+    graph_dumps.mkdir()
+    capture = Path(os.environ.get("FC2D_ATC_TILING_CAPTURE", str(audit / "tiling_capture")))
+    cache = audit / "cache"
+    capture.mkdir(parents=True, exist_ok=True)
+    cache.mkdir()
+    names = runner.model_input_slots(spec)
+    phase = "source_generation"
 
     def unchanged():
         if runner._file_sha256(paths["bin"]) != frozen:
-            die("case SHA256 changed during compilation; regenerate case and OM")
+            raise ValueError("case SHA256 changed during compilation; regenerate case and OM")
         if source_sha is not None and runner._file_sha256(paths["onnx"]) != source_sha:
-            die("source ONNX SHA256 changed during compilation; regenerate OM")
+            raise ValueError("source ONNX SHA256 changed during compilation; regenerate OM")
 
     def invoke(command, log):
         # Keep run() as the orchestration seam used by workflow tests.
@@ -346,7 +358,7 @@ def do_om(c, paths, soc):
         rc = run(command, log_path=str(log))
         unchanged()
         if rc != 0:
-            die("ATC 返回 %d；检查已安装 CANN 的两阶段融合 Pass、SoC 及算子注册。产物: %s" % (rc, audit))
+            raise ValueError("ATC returned %d; see %s" % (rc, log))
 
     def dump(model, destination):
         invoke(["atc", "--mode=1", "--om=" + str(model), "--json=" + str(destination)], destination.with_suffix(".log"))
@@ -365,33 +377,29 @@ def do_om(c, paths, soc):
         base = ["atc", "--model=" + paths["onnx"], "--framework=5",
                 "--soc_version=" + soc, "--input_format=NCHW",
                 "--input_shape=" + fc2d_onnx.input_shape_arg(plan),
-                "--op_compiler_cache_mode=disable", "--log=error"]
-        # A diagnostic compilation with stage 2 disabled proves stage 1 produces
-        # a real ExtendConv2D pair. It is never uploaded or executed.
-        stage1_switch, final_switch = audit / "stage1_switch.json", audit / "fusion_switch.json"
-        for path, state in ((stage1_switch, "off"), (final_switch, "on")):
-            path.write_text(json.dumps({"Switch": {"GraphFusion": {fusion.FIRST_PASS_NAME: "on", fusion.PASS_NAME: state}}}, indent=2) + "\n")
-        stage1 = audit / "stage1"
-        invoke(base + ["--fusion_switch_file=" + str(stage1_switch), "--output=" + str(stage1)], audit / "stage1.log")
-        stage1_graph = audit / "stage1_graph.json"
-        first = fusion.check_stage1_graph(dump(stage1.with_suffix(".om"), stage1_graph), names)
+                "--op_compiler_cache_mode=disable", "--log=info"]
+        final_switch = audit / "fusion_switch.json"
+        final_switch.write_text(json.dumps({"Switch": {"GraphFusion": {
+            fusion.FIRST_PASS_NAME: "on", fusion.PASS_NAME: "on"}}}, indent=2) + "\n")
         output = omdir / c["name"]
-        capture = Path(os.environ.get("FC2D_ATC_TILING_CAPTURE", str(audit / "tiling_capture")))
-        cache = audit / "cache"
-        capture.mkdir(parents=True, exist_ok=True)
-        cache.mkdir()
-        with compilation_environment(capture, cache):
-            # Recompile the same two-Conv source with the original second pass on.
+        if any(capture.glob('tiling.*.jsonl')):
+            raise ValueError("tiling capture directory must be empty for this compilation")
+        phase = "model_compilation"
+        with compilation_environment(capture, cache), fusion.graph_dump_environment(graph_dumps):
+            # Both rounds run before kernel compilation in this same ATC process.
             invoke(base + ["--fusion_switch_file=" + str(final_switch), "--output=" + str(output)], audit / "atc.log")
+        phase = "graph_evidence"
+        first = fusion.check_graph_dumps(graph_dumps, names)
         models = list(omdir.glob("*.om"))
         if len(models) != 1:
             raise ValueError("ATC must generate exactly one fresh final OM")
         model_graph = audit / "model_graph.json"
+        phase = "model_export"
         proof = fusion.check_compiled_graph(dump(models[0], model_graph), names)
+        phase = "native_tiling"
         tiling = check_capture(spec, capture)
         proof.update(first, stage1_pass_name=fusion.FIRST_PASS_NAME, pass_name=fusion.PASS_NAME, pass_source=fusion.PR_URL,
                      source_conv_count=2, source_graph_sha256=source_sha,
-                     stage1_graph_sha256=runner._file_sha256(stage1_graph),
                      model_graph_sha256=runner._file_sha256(model_graph), native_tiling=tiling)
         unchanged()
         (audit / "fusion_verification.json").write_text(json.dumps(proof, indent=2) + "\n")
@@ -400,6 +408,13 @@ def do_om(c, paths, soc):
         print("  两阶段融合及真实 tiling 已验证；case/OM binding: %s" % binding)
         print("  融合证据: %s" % audit)
     except (OSError, ValueError) as exc:
+        diagnosis = fusion.diagnose_compilation(graph_dumps, names, capture, audit / "atc.log")
+        diagnosis.update(phase=phase, error=str(exc), source_graph_sha256=source_sha,
+                         case_sha256=frozen)
+        if phase != "model_compilation":
+            diagnosis["observed_stage"] = diagnosis["status"]
+            diagnosis["status"] = phase + "_failed"
+        (audit / "failure_report.json").write_text(json.dumps(diagnosis, indent=2) + "\n")
         die("融合验证失败: %s。未生成可执行绑定；诊断目录: %s" % (exc, audit))
 
 

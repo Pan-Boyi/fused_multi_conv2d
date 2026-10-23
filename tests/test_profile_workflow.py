@@ -18,7 +18,7 @@ import fc2d
 import fc2d_onnx
 import run_profile as profile
 import run_fused_multi_conv2d as runner
-from fusion_test_support import write_test_binding, fake_graph, emit_tiling
+from fusion_test_support import write_test_binding, fake_graph, emit_tiling, emit_graph_dumps
 sys.path.insert(0, str(ROOT / 'tests/stub_ascendcl'))
 import run_stub_test as stub_test
 
@@ -196,10 +196,9 @@ class ProfileWorkflow(unittest.TestCase):
         def synthetic_atc(command, **kwargs):
             if command[0] == 'atc':
                 if '--mode=1' in command:
-                    om = next(arg.split('=',1)[1] for arg in command if arg.startswith('--om='))
                     target = next(arg.split('=',1)[1] for arg in command if arg.startswith('--json='))
                     names = runner.model_input_slots(fc2d.read_spec(self.paths['bin']))
-                    Path(target).write_text(json.dumps(fake_graph(names, Path(om).stem == 'stage1')))
+                    Path(target).write_text(json.dumps(fake_graph(names)))
                     return 0
                 import onnx
                 model_path = next(arg.split('=', 1)[1] for arg in command if arg.startswith('--model='))
@@ -213,11 +212,11 @@ class ProfileWorkflow(unittest.TestCase):
                 switch = next(arg.split('=',1)[1] for arg in command if arg.startswith('--fusion_switch_file='))
                 switches = json.loads(Path(switch).read_text())['Switch']['GraphFusion']
                 self.assertEqual(switches['Conv2DFixPipeToExtendConv2DFusionPass'],'on')
-                self.assertEqual(switches['ExtendConv2DPairToFusedMultiConv2DFusionPass'],
-                                 'off' if Path(prefix).name=='stage1' else 'on')
+                self.assertEqual(switches['ExtendConv2DPairToFusedMultiConv2DFusionPass'],'on')
+                self.assertNotEqual(Path(prefix).name,'stage1')
                 Path(prefix + '.om').write_bytes(b'synthetic ATC result')
-                if Path(prefix).name != 'stage1':
-                    emit_tiling(fc2d.read_spec(self.paths['bin']))
+                emit_graph_dumps(runner.model_input_slots(fc2d.read_spec(self.paths['bin'])))
+                emit_tiling(fc2d.read_spec(self.paths['bin']))
                 return 0
             return original_run(command)
 
@@ -225,7 +224,9 @@ class ProfileWorkflow(unittest.TestCase):
                 mock.patch.object(fc2d, 'run', side_effect=synthetic_atc) as calls:
             rc, output = self.cli(','.join(profile.ALL_STEPS))
         self.assertEqual(rc, 0, output)
-        self.assertTrue(any(call.args[0][0] == 'atc' for call in calls.call_args_list))
+        atc_calls=[call for call in calls.call_args_list if call.args[0][0]=='atc']
+        self.assertEqual(sum('--mode=1' not in call.args[0] for call in atc_calls),1)
+        self.assertEqual(len(atc_calls),2)
         state = profile.load_profile_state(self.paths, str(self.model))
         self.assertEqual(state['device_rc'], 0)
         self.assertEqual(state['summary']['rows'], 2)
