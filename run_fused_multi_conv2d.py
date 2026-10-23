@@ -1227,22 +1227,24 @@ def summarize_output_comparison(actual, reference, output_shape, output_dtype, r
 
 
 def print_output_comparison(summary, actual_label, reference_label):
-    """打印固定 0.001 达标比例及按展平顺序取出的前 50 个差异元素。"""
-    precision = summary["precision_0_001"]
-    print("\n[comparison] %s vs %s" % (actual_label, reference_label))
-    print("  relative error <= 0.001: %d / %d = %.6f%%; zero reference requires exact zero" %
-          (precision["passed_count"], precision["total_count"], precision["pass_percent"]))
-    print("  bit mismatches=%d tolerance mismatches=%d max_abs=%s max_rel=%s" %
-          (summary["bit_mismatch_count"], summary["tolerance_mismatch_count"],
-           summary["max_absolute_error"], summary["max_relative_error"]))
-    samples = summary["mismatch_samples"]
-    print("  first %d mismatches (up to 50; NCHW coordinates):" % len(samples))
-    for sample in samples:
-        coordinate = ",".join(str(value) for value in sample["coordinates"])
-        print("    index=%d NCHW=[%s] %s=%s %s=%s abs_error=%s relative_error=%s precision_0.001=%s" %
-              (sample["flat_index"], coordinate, actual_label, sample["actual"],
-               reference_label, sample["reference"], sample["absolute_error"], sample["relative_error"],
-               "PASS" if sample["precision_0_001_passed"] else "FAIL"))
+    """用六列表格展示前 50 个差异，表后打印全量 0.001 达标百分比。"""
+    headers = ['index', 'position', 'Output', 'Reference', 'Absolute Error', 'Relative Error']
+    rows = []
+    for sample in summary['mismatch_samples']:
+        position = '[' + ','.join(str(value) for value in sample['coordinates']) + ']'
+        numbers = [sample[field] for field in ('actual', 'reference', 'absolute_error', 'relative_error')]
+        rows.append([str(sample['flat_index']), position] + [
+            '%.9g' % value if isinstance(value, (int, float)) else str(value) for value in numbers])
+    widths = [max([len(header)] + [len(row[index]) for row in rows]) for index, header in enumerate(headers)]
+    pattern = ' | '.join(('{:<%d}' if index == 1 else '{:>%d}') % width for index, width in enumerate(widths))
+    print('\n%s vs %s' % (actual_label, reference_label))
+    print(pattern.format(*headers))
+    print('-+-'.join('-' * width for width in widths))
+    for row in rows:
+        print(pattern.format(*row))
+    precision = summary['precision_0_001']
+    print('Precision: %.6f%% (%d / %d, relative error <= 0.001)' %
+          (precision['pass_percent'], precision['passed_count'], precision['total_count']))
 
 
 def compare_device_outputs(fused_raw, reference_raw, output_dtype, output_shape, rel_tol=1e-3):
@@ -1341,10 +1343,8 @@ def run_reference_comparison(case_path, fused_om_path, reference_om_path, device
         os.replace(report_path + ".tmp", report_path)
     print("[%s] numerical comparison run; report: %s" % ("PASS" if report["passed"] else "FAIL", report_path))
     if "comparison" in report:
-        print("[%s] FusedMultiConv2d vs ExtendConv2D pair" % ("PASS" if report["comparison"]["passed"] else "FAIL"))
         print_output_comparison(report["comparison"], "FusedMultiConv2d", "ExtendConv2D pair")
     if "reference_vs_golden" in report:
-        print("[%s] ExtendConv2D pair vs CPU golden" % ("PASS" if report["reference_vs_golden"]["passed"] else "FAIL"))
         print_output_comparison(report["reference_vs_golden"], "ExtendConv2D pair", "CPU golden")
     return 0 if report["passed"] else 1
 
@@ -1799,103 +1799,7 @@ def main():
     nonzero, unwritten, mismatches = r["nonzero"], r["unwritten"], r["mismatches"]
     ratio = r["prec_ok"] / float(r["n"])
 
-    print("\n[fused-conv2d-5102-device] out_elems=%d nonzero=%d golden_nonzero=%d "
-          "unwritten=%d mismatches=%d" % (y_elems, nonzero, gold_nonzero, unwritten, mismatches))
-
-    if mismatches:
-        fb = r["first_bad"]
-        print("first mismatch @ %d: got %.6g (0x%04x), want %.6g (0x%04x) (%s)"
-              "；差 1 个 ULP 的 %d / 共 %d"
-              % (fb, got[0][fb], got[1][fb], want[0][fb], want[1][fb], idx_label(fb, y_dims),
-                 r["off_by_one"], mismatches))
-
-    # ------------------------------------------------------------ 精度
-    print("\n[精度] 相对误差 <= %g 的比例: %d / %d = %.6f%%   (下限 %.6f%%)"
-          % (rel_tol, r["prec_ok"], r["n"], ratio * 100.0, ratio_min * 100.0))
-    mr = r["max_rel"]
-    if r["max_rel_idx"] >= 0:
-        mi = r["max_rel_idx"]
-        print("       最大相对误差 %s @ %d (%s): got %.6g, want %.6g"
-              % ("inf" if mr == float("inf") else "%.6e" % mr, mi, idx_label(mi, y_dims),
-                 got[0][mi], want[0][mi]))
-    else:
-        print("       最大相对误差 0")
-    print("       golden 为 0 的 %d 个元素要求设备输出也为 0" % r["zero_golden"])
-    print("       相对误差分布:")
-    for k in ["=0", "(0,1e-3]", "(1e-3,1e-2]", "(1e-2,1e-1]", "(1e-1,1]", ">1", "inf(golden=0)"]:
-        v = r["hist"][k]
-        if v:
-            print("         %-14s %9d  (%.6f%%)" % (k, v, v * 100.0 / r["n"]))
-    # 这个提醒值得常驻，而且**输出改成 fp16 之后结论反过来了**。
-    #
-    # int8 时代：|golden| <= 100，最小非零差值是 1，所以任何一个 LSB 的偏差相对
-    # 误差都 >= 1e-2，1e-3 的判据等价于逐位相等。
-    #
-    # fp16 时代：1 个 ULP 的相对误差最大只有 2^-10 ≈ 9.77e-4（正规数，尾数 10 位），
-    # **小于 1e-3**。也就是说差 1 个 ULP 的结果照样能通过 1e-3 的判据。
-    # 所以现在这两条判据不再等价，宽严关系是：逐位相等 严于 1e-3。
-    # 真正的判据是 mismatches == 0；达标比例 100% 但 mismatches != 0 就是 [PASS*]。
-    if info["outInt8"]:
-        print("       注: 输出是 int8，判据只有逐位相等 —— 没有 ULP 可言。")
-    else:
-        print("       注: 输出是 fp16，1 个 ULP 的相对误差 <= 2^-10 ≈ 9.77e-4 < %g，" % rel_tol)
-        print("           所以 %g 的判据比逐位相等**宽**：差 1 ULP 也能达标。" % rel_tol)
-        print("           以 mismatches == 0 为准；只达标不逐位相等会报 [PASS*]。")
-
-    if info["outInt8"]:
-        # int8 的输出就是整数，没有"累加器 LSB"或"输出 ULP"可言 —— 判据只有
-        # 逐位相等。差 1 的个数单独报，那是重量化舍入方向不同的表现。
-        offBy1 = sum(1 for i in range(r["n"]) if abs(got[0][i] - want[0][i]) == 1)
-        print("\n[int8] 差 1 的有 %d 个（重量化舍入方向不同的话会集中在这里）" % offBy1)
-        # quant_scale 表编码错的表征：输出大面积贴在 ±127。host tiling 会拒绝缺表，
-        # 但表存在而 scale 位型/bit46 写错仍会跑完，所以专门报一下。
-        satGot = sum(1 for v in got[0] if v == 127 or v == -128)
-        satWant = sum(1 for v in want[0] if v == 127 or v == -128)
-        print("[int8] 饱和（±127/-128）: 设备 %d / %d = %.4f%%   golden %d = %.4f%%"
-              % (satGot, r["n"], satGot * 100.0 / r["n"], satWant, satWant * 100.0 / r["n"]))
-        if satGot > r["n"] // 10 and satWant * 20 < satGot:
-            print("       => 设备侧大面积饱和而 golden 没有 —— 极可能是 per-channel quant_scale 表没传对。")
-            print("          检查 case.bin 里的 q1/q2 表、bit46 和 om 里的输入槽。")
-    elif info["isS8F16"] or info["isA16W8"]:
-        # 这条的出口是 per-channel 反量化，定标不是 2 的幂 —— report_lsb 那套
-        # 「累加器 LSB = 2^-(58-S)」在这里没有意义，报了只会误导。
-        label = "a16w8" if info["isA16W8"] else "s8f16"
-        print("\n[%s] 出口是 per-channel 反量化（VDEQF16），定标来自 dequant_scale2 那张表，" % label)
-        print("        不是 fixed_shift_value 的 2 的幂 —— 所以这里不报累加器 LSB。")
-        if info["isA16W8"]:
-            print("        A16W8 case 使用 可精确表示的缩放 fp16 输入和对应 shift；判据为逐位相等。")
-        else:
-            print("        判据就是逐位相等：golden 的乘累加是精确整数运算，出口按同一张表换算。")
-    else:
-        report_lsb(got, want, r, mismatches, y_dims, shift2)
-    # **四条 dtype 通路都要跑**：上面那几个分支是按出口定标分的，而「错在哪里」
-    # 和出口定标无关。原来它挂在 fp16 那条 else 里，int8 根本走不到。
-    if mismatches:
-        report_error_map(got, want, y_dims)
-    report_ratio(got, want, r["n"])
-    if info["outInt8"]:
-        # int8 没有 y_exact，但抽样一样有用 —— 打整数就行。
-        print("\n[抽样] 32 个点，跨通道跨空间铺开   (idx  c/h/w   got | y_expect)")
-        plane = y_dims[2] * y_dims[3]
-        step = max(1, r["n"] // 32) | 1
-        while step > 1 and plane % step == 0:
-            step += 2
-        for j in range(32):
-            i = (j * step) % r["n"]
-            mark = "" if got[0][i] == want[0][i] else "   <- 不符"
-            print("   %7d %-14s %5d | %5d%s" % (i, idx_label(i, y_dims), got[0][i], want[0][i], mark))
-    if "y_exact" in tensors:
-        exact = decode_f16(tensors["y_exact"][2])
-        report_vs_exact(got, exact, r["n"])
-        # 拿真值反推定标。和 y_expect 比没意义 —— 那是按（可能错的）模型算出来的。
-        probe_acc_scale(got, exact, r["n"], shift2, y_dims)
-        print_sample(got, want, exact, r["n"], y_dims)
-    # 版本 4 的 header 没有 probe 这一位了 —— 恒等权重那套探针是运行时输入，
-    # 要用直接改 gen_case 生成的权重即可，不需要在文件格式里留一个字段。
-    # report_idmap 保留着，等哪天真要再探时直接调。
-
-    # 设备原始输出落盘。默认**关**：板子那台机器上的文件多半传不出来，存了也是垃圾。
-    # 真要离线分析再 FC2D_DUMP=<路径> 打开。分析所需的结论上面几段已经在设备上算完了。
+    # 设置 FC2D_DUMP 保存设备原始输出。
     dump_path = os.environ.get("FC2D_DUMP", "")
     if (not dry_run) and dump_path and dump_path != "-":
         dump_raw(dump_path, out.raw[:y_bytes], "设备输出 (%s NCHW [1,%d,%d,%d])"

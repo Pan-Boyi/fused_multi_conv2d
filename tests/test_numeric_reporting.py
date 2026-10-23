@@ -19,6 +19,15 @@ import run_profile as profile
 import test_reference_compare as reference_tests
 
 
+def comparison_table(text):
+    """提取控制台表头和数据行，忽略对齐空格与边框。"""
+    rows = [tuple(cell.strip() for cell in line.strip().strip('|').split('|'))
+            for line in text.splitlines() if '|' in line]
+    headers = [row for row in rows if row[0] == 'index']
+    points = [row for row in rows if row[0].isdigit()]
+    return headers, points
+
+
 class NumericSummary(unittest.TestCase):
     def test_first_fifty_differences_do_not_truncate_full_output_statistics(self):
         reference = struct.pack('<64e', *([1] * 64))
@@ -39,10 +48,19 @@ class NumericSummary(unittest.TestCase):
                                         pass_percent=0))
         with contextlib.redirect_stdout(io.StringIO()) as output:
             runner.print_output_comparison(report, 'actual', 'reference')
-        self.assertIn('first 50 mismatches', output.getvalue())
-        self.assertIn('index=49 ', output.getvalue())
-        self.assertNotIn('index=50 ', output.getvalue())
-        self.assertIn('0 / 64', output.getvalue())
+        text = output.getvalue()
+        headers, points = comparison_table(text)
+        self.assertEqual(headers, [('index', 'position', 'Output', 'Reference',
+                                    'Absolute Error', 'Relative Error')])
+        self.assertEqual(len(points), 50)
+        self.assertEqual([int(point[0]) for point in points], list(range(50)))
+        self.assertEqual(points[-1][1].replace(' ', ''), '[0,1,2,1]')
+        self.assertEqual([float(value) for value in points[-1][2:]], [2, 1, 1, 1])
+        self.assertRegex(text.strip().splitlines()[-1],
+                         r'^Precision: 0\.000000% \(0\s*/\s*64, relative error\s*<=\s*0\.001\)$')
+        for old_fragment in ('index=', 'NCHW=', 'bit mismatches=', 'max_abs=',
+                             'first 50 mismatches', 'precision_0.001='):
+            self.assertNotIn(old_fragment, text)
 
     def test_fixed_precision_statistics_are_independent_of_configured_tolerance(self):
         reference = struct.pack('<3e', 1, -1, 1)
@@ -84,6 +102,26 @@ class NumericSummary(unittest.TestCase):
         self.assertEqual(samples[6]['reference'], 'inf')
         self.assertEqual(samples[7]['fused'], 'nan')
         json.dumps(report, allow_nan=False)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            runner.print_output_comparison(report, 'actual', 'reference')
+        _, points = comparison_table(output.getvalue())
+        printed = {int(point[0]): point for point in points}
+        self.assertEqual(printed[2][-1], 'inf')
+        self.assertTrue(printed[3][2].startswith('-0'))
+        self.assertEqual(printed[6][2:4], ('inf', 'inf'))
+        self.assertEqual(printed[7][2:4], ('nan', 'nan'))
+
+    def test_identical_outputs_still_print_table_header_and_final_precision(self):
+        raw = struct.pack('<2e', 1, -2)
+        report = runner.compare_device_outputs(raw, raw, 1, [2])
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            runner.print_output_comparison(report, 'actual', 'reference')
+        text = output.getvalue()
+        headers, points = comparison_table(text)
+        self.assertEqual(len(headers), 1)
+        self.assertEqual(points, [])
+        self.assertRegex(text.strip().splitlines()[-1],
+                         r'^Precision: 100\.000000% \(2\s*/\s*2, relative error\s*<=\s*0\.001\)$')
 
     def test_integer_diagnostics_preserve_exact_comparison(self):
         report = runner.compare_device_outputs(struct.pack('4b', -128, -2, 0, 126),
@@ -107,12 +145,14 @@ class NumericSummary(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as output:
             runner.print_output_comparison(report, 'actual_test', 'reference_test')
         text = output.getvalue()
-        self.assertIn('actual_test', text)
-        self.assertIn('reference_test', text)
-        self.assertIn('0.001', text)
-        self.assertIn('2', text)
-        self.assertIn('-3', text)
-        self.assertIn('-2', text)
+        title = text.strip().splitlines()[0]
+        self.assertIn('actual_test', title)
+        self.assertIn('reference_test', title)
+        headers, points = comparison_table(text)
+        self.assertEqual(len(headers), 1)
+        self.assertEqual([float(value) for value in points[0][2:]], [2, 1, 1, 1])
+        self.assertEqual([float(value) for value in points[1][2:]], [-3, -2, 1, 0.5])
+        self.assertIn('0.001', text.strip().splitlines()[-1])
 
 
 class NumericalDeviceDiagnostics(unittest.TestCase):
@@ -200,8 +240,13 @@ class NumericalDeviceDiagnostics(unittest.TestCase):
                 self.assertIn('relative error <= 0.001', result.stdout)
                 self.assertIn('0.5', result.stdout)
                 self.assertIn('golden', result.stdout)
-                self.assertIn('first 30 mismatches', result.stdout)
-                self.assertIn('10 / 40', result.stdout)
+                headers, points = comparison_table(result.stdout)
+                self.assertEqual(len(headers), 1)
+                self.assertEqual(len(points), 30)
+                self.assertRegex(result.stdout,
+                                 r'Precision: 25\.000000% \(10\s*/\s*40, relative error <= 0\.001\)')
+                self.assertNotIn('first 30 mismatches', result.stdout)
+                self.assertNotIn('index=', result.stdout)
 
     def test_reference_golden_flag_reaches_remote_runner_and_downloaded_report(self):
         remote, paths = self.local_remote(), self.profile_paths()

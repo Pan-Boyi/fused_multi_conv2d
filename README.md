@@ -150,8 +150,10 @@ INT8 要求逐位相同；FP16 默认相对误差不超过 `1e-3`，参考值为
 全部元素均须通过。该模式不使用 `RATIO_MIN` 放宽通过比例，原有 CPU golden 保留不变。
 
 与 CPU golden 比较和与未融合设备输出比较，两种模式都会打印全量数据中相对误差
-`<= 0.001` 的数量、总数及百分比，并打印前 50 个不一致元素的两侧数值、NCHW 坐标、
-绝对误差、相对误差和是否达标。该固定精度统计独立于 `REL_TOL`；参考值为零时要求输出也为零。
+`<= 0.001` 的数量、总数及百分比。前 50 个差异统一使用六列表格：
+`index | position | Output | Reference | Absolute Error | Relative Error`，
+其中 position 为 NCHW 坐标，表后打印总 `Precision` 百分比。
+该固定精度统计独立于 `REL_TOL`；参考值为零时要求输出也为零。
 前 50 个差异按展平顺序选取，包含在容差内但位模式不相同的元素。
 
 如需同时检查两个 ExtendConv2D 与 CPU golden 函数生成的 `y_expect` 是否一致，添加
@@ -431,8 +433,8 @@ bash tests/stub_ascendcl/run_stub_test.sh --case-dir out/profile/base_int8
 不是我们能控制的，而运行器只有「名字取不到就按 IR 顺序猜」这一条退路，
 靠逐项字节数校验兜底。
 
-桩的 `aclmdlExecute` 把 `case.bin` 里的 `y_expect` 拷进输出缓冲，所以比对、诊断、
-抽样那几段也会真的跑一遍。**它不验数值正确性** —— 那只能靠板子；它验的是
+桩的 `aclmdlExecute` 把 `case.bin` 里的 `y_expect` 拷进输出缓冲，所以比对和表格报告
+也会真的跑一遍。**它不验数值正确性** —— 那只能靠板子；它验的是
 「这段代码会不会崩、分支走得对不对、字节数核对管不管用」。
 
 `--out-root` 支持 `out/<case>/` 和 `out/<config>/<case>/`。每个完整 case 目录
