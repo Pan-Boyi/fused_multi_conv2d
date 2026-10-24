@@ -1279,6 +1279,7 @@ def run_reference_comparison(case_path, fused_om_path, reference_om_path, device
             os.unlink(stale)
     names = model_input_slots(info)
     report = {"schema_version": 1, "run_id": str(time.time_ns()),
+              "warmup": warmup, "repeat": repeat,
               "golden_source": "extend_pair_device_output", "cpu_golden_used": compare_reference_golden, "device_id": device_id,
               "case_sha256": fused_binding["case_sha256"], "source_graph_sha256": fused_binding["fusion"]["source_graph_sha256"],
               "runtime_input_sha256": {name: hashlib.sha256(tensors[name][2]).hexdigest() for name in names},

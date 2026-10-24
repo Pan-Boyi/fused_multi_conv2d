@@ -179,7 +179,7 @@ python3 run_profile.py --cases fusion_cases.json --only fusion_a16w8 \
 | `comparison.json` | 位差数量、超差数量、0.001 达标统计、前 50 个差异、最大误差及首个超差坐标，以及输入、模型和输出哈希 |
 
 数值失败仍拉回输出和报告，命令返回失败。单个模型执行失败时保存错误及已完成模型的输出。
-对比模式不启用 profiling，避免把两个模型的执行混入性能统计。
+上述精度对比模式不启用 profiling；性能对比使用下节的独立开关。
 
 只重新编译两个模型可使用 `--steps om`；已有成对模型时可使用 `--steps push,prof`。
 本机直接执行使用 `fc2d.py ... --compare-unfused --steps case,om,run`，或给板侧 runner 传入：
@@ -188,6 +188,39 @@ python3 run_profile.py --cases fusion_cases.json --only fusion_a16w8 \
 python3 run_fused_multi_conv2d.py case.bin FusedMultiConv2d 0 fused.om \
   --reference-om reference.om --comparison-output comparison
 ```
+
+## 对比融合前后上板耗时
+
+添加 `--compare-performance`，在同一块设备上执行两个 ExtendConv2D 和一个
+FusedMultiConv2d，并使用 msprof 的算子耗时比较性能：
+
+```bash
+python3 run_profile.py --cases fusion_cases.json \
+  --compare-performance --keep-going \
+  --steps check,case,om,push,prof,pull,export,parse
+```
+
+此开关自动生成并运行融合、未融合两份 OM，同时检查输出精度，不需要额外添加
+`--compare-unfused`。已有成对模型时可从 `push` 开始；本地已有本次 profiling 数据时，
+可仅执行 `--compare-performance --steps parse`。性能模式要求启用 profiling，
+不与 `--no-msprof` 一起使用。
+
+两份模型在同一个 profiling 进程内依次执行。统计排除 `remote.warmup` 次预热和用于检查
+输出完整性的额外执行，仅保留 `remote.repeat` 次正式执行。每次未融合执行的耗时为
+两个 ExtendConv2D 算子耗时之和，最终分别取正式执行的中位数。
+
+结果使用简洁表格展示：
+
+| Case | Shape | Fused (us) | Extend total (us) | Saved (us) | Improvement (%) |
+| :-- | :-- | --: | --: | --: | --: |
+| 用例名 | 输入及两层卷积形状 | 融合耗时 | 两个 Extend 耗时之和 | 未融合 − 融合 | 节省耗时 / 未融合耗时 × 100 |
+
+精度检查或上板执行失败的用例不进入性能结果。这里比较的是设备算子耗时，
+包含算子内部搬运，不计模型加载、主机调用和算子之外的输入输出拷贝。
+汇总同时保存为 `out/<配置名>/performance_comparison.json` 和
+`performance_comparison.csv`；配置了 `outdir` 时保存在该目录。
+表中形状取自本次模型绑定的 `case.bin`，JSON 保留完整 case 参数；恢复解析时使用
+采集时记录的预热和正式执行次数。
 
 ## 上板 + profiling：run_profile.py
 

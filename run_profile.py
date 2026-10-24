@@ -518,10 +518,12 @@ def do_push(rt, c, paths, om_file, reference_om=None):
 
 
 def do_prof(rt, c, paths, om_file, use_msprof, msprof, show_script=False, reference_om=None,
-            compare_reference_golden=False):
+            compare_reference_golden=False, compare_performance=False):
     import run_fused_multi_conv2d as runner
     binding = runner.validate_model_binding(paths["bin"], om_file)
-    if reference_om is not None and use_msprof:
+    if compare_performance and (reference_om is None or not use_msprof):
+        raise RuntimeError("Performance comparison requires paired models and msprof")
+    if reference_om is not None and use_msprof and not compare_performance:
         raise RuntimeError("Device reference comparison requires --no-msprof")
     if compare_reference_golden and reference_om is None:
         raise RuntimeError("--compare-reference-golden requires --compare-unfused")
@@ -535,6 +537,10 @@ def do_prof(rt, c, paths, om_file, use_msprof, msprof, show_script=False, refere
     state = dict(schema_version=1, binding=binding, remote_identity=remote_identity(rt),
                  prof=None, device_rc=None, profiler_rc=None, collection_rc=None,
                  execution_log=log_path, local_prof=None)
+    if compare_performance:
+        state.update(compare_performance=True,
+                     profiling_execution={"warmup": rt.warmup, "repeat": rt.repeat,
+                                          "execution_count_per_model": rt.warmup + rt.repeat + 1})
     save_profile_state(paths, state)  # A failed new run must not leave an old PROF usable.
     rc, out = rt.ssh("bash -s", stdin_script=script, capture=True)
     with open(log_path, "w") as stream:
@@ -562,6 +568,8 @@ def do_prof(rt, c, paths, om_file, use_msprof, msprof, show_script=False, refere
                                                             compare_reference_golden)
             with open(state["comparison_report"]) as stream:
                 state["comparison_passed"] = json.load(stream)["passed"]
+            if compare_performance:
+                state["comparison_sha256"] = runner._file_sha256(state["comparison_report"])
         except (OSError, ValueError, RuntimeError) as exc:
             state["comparison_error"] = str(exc)
             state["collection_rc"] = 2
@@ -716,6 +724,90 @@ def parse_summary(csv_path, columns):
     return stat
 
 
+def validate_performance_state(paths, om_file, reference_om, state):
+    """核对两份模型、精度报告和本次实际执行轮数。"""
+    import run_fused_multi_conv2d as runner
+    if state.get("compare_performance") is not True or reference_om is None:
+        raise RuntimeError("No paired performance capture; run --compare-performance --steps prof first")
+    binding = runner.validate_model_binding(paths["bin"], om_file)
+    reference = runner.validate_reference_model_binding(paths["bin"], reference_om, om_file)
+    if state.get("binding") != binding or state.get("reference_binding") != reference:
+        raise RuntimeError("Performance capture belongs to different paired models")
+    execution = state.get("profiling_execution", {})
+    warmup, repeat = execution.get("warmup"), execution.get("repeat")
+    if type(warmup) is not int or warmup < 0 or type(repeat) is not int or repeat < 1:
+        raise RuntimeError("Performance capture has invalid warmup/repeat")
+    count = warmup + repeat + 1
+    if execution.get("execution_count_per_model") != count:
+        raise RuntimeError("Performance execution count differs from warmup/repeat")
+    report_path = state.get("comparison_report")
+    if not report_path or runner._file_sha256(report_path) != state.get("comparison_sha256"):
+        raise RuntimeError("Performance precision report is missing or changed")
+    with open(report_path) as stream:
+        report = json.load(stream)
+    if (report.get("warmup") != warmup or report.get("repeat") != repeat or
+            report.get("case_sha256") != binding["case_sha256"] or
+            report.get("source_graph_sha256") != binding["fusion"]["source_graph_sha256"]):
+        raise RuntimeError("Device report differs from the captured execution")
+    for role, model in (("fused", binding), ("reference", reference)):
+        result = report.get("models", {}).get(role, {})
+        if (result.get("model_sha256") != model["model_sha256"] or
+                result.get("execution_count") != count or len(result.get("durations_us", [])) != repeat):
+            raise RuntimeError("Device execution count or model differs: " + role)
+    return report, execution
+
+
+def parse_performance_profile(case, paths, om_file, reference_om, state):
+    """读取已通过精度对比的三类设备任务，计算逐轮耗时差。"""
+    import fc2d_performance as performance
+    report, execution = validate_performance_state(paths, om_file, reference_om, state)
+    if execution_failed(state) or report.get("passed") is not True:
+        raise RuntimeError("Failed device execution or numerical comparison cannot enter performance results")
+    expected_nodes = {"fused": state["binding"]["fusion"].get("fused_node_name"),
+                      "extend": state["reference_binding"]["reference"].get("stage1_nodes")}
+    if not expected_nodes["fused"] or not expected_nodes["extend"]:
+        raise RuntimeError("Model bindings lack profiling node names; regenerate both OMs")
+    result = performance.parse_profile_csv(find_op_summary(state["local_prof"]), execution["warmup"],
+                                           execution["repeat"], expected_nodes=expected_nodes)
+    spec = fc2d.read_spec(paths["bin"])
+    measured_case = {key: spec[key] for key in ("n", "ci", "hi", "wi", "cout1", "cout2")}
+    measured_case.update(dtype=("fp16", "int8", "s8f16", "a16w8")[spec["dtype_mode"]],
+                         kernel=[spec["kh"], spec["kw"], spec["kh2"] or spec["kh"], spec["kw2"] or spec["kw"]],
+                         strides=[spec["s1"]] * 2 + [spec["s2"]] * 2,
+                         pads=[spec["ph1"]] * 2 + [spec["pw1"]] * 2 + [spec["ph2"]] * 2 + [spec["pw2"]] * 2)
+    result.update(case=case["name"], shape=performance.format_case_shape(measured_case), case_spec=spec,
+                  case_sha256=state["binding"]["case_sha256"], comparison_run_id=report["run_id"],
+                  models={role: entry["model_sha256"] for role, entry in report["models"].items()})
+    return result
+
+
+def save_performance_results(out_root, rows, display=True):
+    """保存当前批次的设备性能结果，并打印一张对比表。"""
+    import fc2d_performance as performance
+    os.makedirs(out_root, exist_ok=True)
+    json_path = os.path.join(out_root, "performance_comparison.json")
+    with open(json_path + ".tmp", "w") as stream:
+        json.dump({"schema_version": 1, "source": "msprof_op_summary", "units": "us", "cases": rows},
+                  stream, indent=2, sort_keys=True)
+        stream.write("\n")
+    os.replace(json_path + ".tmp", json_path)
+    csv_path = os.path.join(out_root, "performance_comparison.csv")
+    columns = ["case", "shape", "fused_us", "extend_total_us", "saved_us", "improvement_percent"]
+    with open(csv_path + ".tmp", "w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(csv_path + ".tmp", csv_path)
+    if not display:
+        return
+    if rows:
+        print("\n" + performance.render_performance_table(rows))
+        print("Device time: median; Saved = Extend total - Fused; Improvement = Saved / Extend total * 100%")
+    else:
+        print("[PERF] No validated device performance results")
+    print("[PERF] Results: %s ; %s" % (json_path, csv_path))
+
+
 # ---------------------------------------------------------------- 配置
 def load_cases(raw):
     """把 json 里的 cases 数组归一化 + 展开 dtype: both。"""
@@ -784,6 +876,8 @@ def main():
                     help="远端只跑功能，不套 msprof；自动跳过 pull/export/parse")
     ap.add_argument("--compare-unfused", action="store_true",
                     help="以第二阶段融合前两个 ExtendConv2D 的设备输出为 golden，需配合 --no-msprof")
+    ap.add_argument("--compare-performance", action="store_true",
+                    help="上板采集 Fused 与两个 Extend 的设备耗时，自动生成参考模型并校验精度")
     ap.add_argument("--compare-reference-golden", action="store_true",
                     help="同时将两个 ExtendConv2D 的设备输出与 CPU golden 比较，需配合 --compare-unfused")
     ap.add_argument("--fusion-pass-config", metavar="PATH",
@@ -792,12 +886,18 @@ def main():
     ap.add_argument("--list", action="store_true", help="只列出会做哪些")
     ap.add_argument("--keep-going", action="store_true", help="某条失败了继续做下一条")
     args = ap.parse_args()
-    if args.compare_unfused and not args.no_msprof:
+    if args.compare_performance:
+        args.compare_unfused = True
+        if args.no_msprof:
+            ap.error("--compare-performance requires msprof; do not use --no-msprof")
+    if args.compare_unfused and not args.no_msprof and not args.compare_performance:
         ap.error("--compare-unfused requires --no-msprof")
     if args.compare_reference_golden and not args.compare_unfused:
         ap.error("--compare-reference-golden requires --compare-unfused")
 
     doc, remote_cfg, prof_cfg, cases = load_config(args.config)
+    if args.compare_performance and not prof_cfg["enabled"]:
+        ap.error("--compare-performance requires profile.enabled=true")
     if args.cases:
         # cases.json 那种只有形状清单、没有 remote 段的文件，用这条把它接进来。
         if not os.path.isfile(args.cases):
@@ -862,7 +962,9 @@ def main():
     if "om" in steps:
         source_env(doc.get("local_cann_env", ""))
 
-    failed, stats = [], {}
+    failed, stats, performance_rows = [], {}, []
+    if args.compare_performance and "parse" in steps:
+        save_performance_results(out_root, [], display=False)
     for c in cases:
         paths = {
             "bin": os.path.join(out_root, c["name"], "case.bin"),
@@ -895,9 +997,12 @@ def main():
             if "prof" in steps:
                 state = do_prof(rt, c, paths, om_file, use_msprof, prof_cfg["msprof"],
                                 args.print_remote_script, reference_om=reference_om,
-                                compare_reference_golden=args.compare_reference_golden)
+                                compare_reference_golden=args.compare_reference_golden,
+                                compare_performance=args.compare_performance)
             if {"pull", "export", "parse"} & set(steps):
                 state = load_profile_state(paths, om_file, rt if "pull" in steps else None)
+                if args.compare_performance:
+                    validate_performance_state(paths, om_file, reference_om, state)
             if "pull" in steps:
                 state["local_prof"] = do_pull(rt, c, state["prof"], prof_root)
                 save_profile_state(paths, state)
@@ -908,12 +1013,17 @@ def main():
                 if "export" in steps:
                     do_export(local_prof, prof_cfg["tbe_work_test_suit"])
                 if "parse" in steps:
-                    parsed = parse_summary(find_op_summary(local_prof), prof_cfg["columns"])
-                    state["summary"] = parsed
+                    if args.compare_performance:
+                        result = parse_performance_profile(c, paths, om_file, reference_om, state)
+                        state["performance"] = result
+                        performance_rows.append(result)
+                    else:
+                        parsed = parse_summary(find_op_summary(local_prof), prof_cfg["columns"])
+                        state["summary"] = parsed
+                        # Failed runs may be inspected, but never enter performance comparisons.
+                        if not execution_failed(state):
+                            stats[c["name"]] = parsed
                     save_profile_state(paths, state)
-                    # Failed runs may be inspected, but never enter performance comparisons.
-                    if not execution_failed(state):
-                        stats[c["name"]] = parsed
             if state is not None and execution_failed(state):
                 raise RuntimeError("Execution failed (device RC=%s, profiler RC=%s, collection RC=%s, ssh RC=%s); log: %s" %
                                    (state["device_rc"], state["profiler_rc"], state["collection_rc"],
@@ -925,6 +1035,10 @@ def main():
                 print("    （加 --keep-going 可以跳过失败的继续做下一条）")
                 break
 
+    if args.compare_performance and "parse" in steps:
+        save_performance_results(out_root, performance_rows)
+    elif args.compare_performance and "prof" in steps and not failed:
+        print("[PERF] Device capture complete; run --compare-performance --steps pull,export,parse for timings")
     if stats:
         cols = prof_cfg["columns"]
         step("横向对比（每列取 REPEAT 次里的最小值，单位 us）")
