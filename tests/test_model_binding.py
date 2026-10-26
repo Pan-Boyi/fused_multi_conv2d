@@ -61,11 +61,11 @@ class ModelBinding(unittest.TestCase):
     def test_binding_accepts_known_tiling_layouts_only(self):
         model, sidecar = self.make_model()
         binding = json.loads(sidecar.read_text())
-        for size in (312, 316):
+        for size in (312, 320):
             binding['fusion']['native_tiling']['tiling_data_bytes'] = size
             sidecar.write_text(json.dumps(binding))
             self.assertEqual(runner.validate_model_binding(str(self.case), str(model)), binding)
-        for size in (308, 313, 315, 317, 320):
+        for size in (308, 313, 315, 316, 317, 319, 321, 324):
             binding['fusion']['native_tiling']['tiling_data_bytes'] = size
             sidecar.write_text(json.dumps(binding))
             with self.subTest(size=size):

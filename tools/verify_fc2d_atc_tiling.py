@@ -16,8 +16,8 @@ import fc2d
 import run_fused_multi_conv2d as runner
 
 TAIL_FIELDS = ('blockDim', 'fixedShift1', 'fixedShift2', 'hasBias1', 'hasBias2', 'relu1', 'relu2')
-# The second-layer L0C stride adds one uint32 after l0cStride; keep frozen models readable.
-TILING_FIELD_COUNTS = {312: 78, 316: 79}
+# The new 79-field layout includes four trailing bytes for native 8-byte alignment.
+TILING_FIELD_COUNTS = {312: 78, 320: 79}
 
 
 def check_tiling(spec, record):
@@ -45,8 +45,8 @@ def check_tiling(spec, record):
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError('native tiling_data must be a hexadecimal byte string') from exc
     if len(data) not in TILING_FIELD_COUNTS:
-        raise ValueError('unsupported tiling ABI: expected 312 or 316 bytes, received %d' % len(data))
-    words = struct.unpack('<%dI' % TILING_FIELD_COUNTS[len(data)], data)
+        raise ValueError('unsupported tiling ABI: expected 312 or 320 bytes, received %d' % len(data))
+    words = struct.unpack_from('<%dI' % TILING_FIELD_COUNTS[len(data)], data)
     geometry = tuple(spec[key] for key in ('n', 'ci', 'hi', 'wi', 'cout1', 'cout2'))
     if words[:6] != geometry:
         raise ValueError('native tiling belongs to a different case geometry')

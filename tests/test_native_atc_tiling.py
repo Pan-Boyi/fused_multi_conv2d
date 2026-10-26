@@ -77,10 +77,10 @@ class NativeTilingCapture(unittest.TestCase):
             record['result']['tiling_data'] = struct.pack('<78I', *words).hex()
             old = tool.check_tiling(spec, record)
             words.insert(53, 24576)
-            record['result']['tiling_data'] = struct.pack('<79I', *words).hex()
+            record['result']['tiling_data'] = (struct.pack('<79I', *words) + b'\xa5' * 4).hex()
             with self.subTest(mode=mode):
                 new = tool.check_tiling(spec, record)
-                self.assertEqual(new['tiling_data_bytes'], 316)
+                self.assertEqual(new['tiling_data_bytes'], 320)
                 self.assertEqual(new['fields']['l0cStride2'], 24576)
                 self.assertEqual(old['fields']['l0cStride2'], 0)
                 for name in tool.TAIL_FIELDS + ('l0cStride', 'w1Stage', 'w2Stage'):
@@ -90,7 +90,7 @@ class NativeTilingCapture(unittest.TestCase):
 
     def test_unknown_nearby_tiling_sizes_are_rejected(self):
         spec, record = self.corrected('fp16')
-        for size in (308, 313, 315, 317, 320):
+        for size in (308, 313, 315, 316, 317, 319, 321, 324):
             malformed = copy.deepcopy(record)
             malformed['result']['tiling_data'] = '00' * size
             with self.subTest(size=size), self.assertRaisesRegex(ValueError, 'tiling ABI'):

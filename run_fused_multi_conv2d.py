@@ -165,7 +165,7 @@ def _valid_fusion_report(report, names):
         if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
             return False
     tiling = report.get("native_tiling")
-    if not isinstance(tiling, dict) or tiling.get("tiling_data_bytes") not in (312, 316):
+    if not isinstance(tiling, dict) or tiling.get("tiling_data_bytes") not in (312, 320):
         return False
     digest = tiling.get("tiling_data_sha256")
     if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
