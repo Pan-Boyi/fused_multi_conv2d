@@ -7,6 +7,16 @@ import re
 import statistics
 
 
+PIPELINE_COLUMNS = (
+    ("cube", ("mac_exe_time(us)", "cube_exe_time(us)", "aic_mac_time(us)")),
+    ("scalar", ("scalar_exe_time(us)", "aic_scalar_time(us)")),
+    ("mte1", ("mte1_exe_time(us)", "aic_mte1_time(us)")),
+    ("mte2", ("mte2_exe_time(us)", "aic_mte2_time(us)")),
+    ("mte3", ("mte3_exe_time(us)",)),
+    ("fixpipe", ("fixpipe_time(us)", "aic_fixpipe_time(us)")),
+)
+
+
 def _column_key(value):
     return re.sub(r"[^a-z0-9]", "", str(value).lower())
 
@@ -129,11 +139,63 @@ def _order_extend_pair(operators, timestamp):
     return extend
 
 
-def parse_profile_rows(rows, warmup, repeat, expected_nodes=None):
+def _pipeline_number(value, metric, name):
+    """解析指定算子的流水耗时，缺失值保留为空。"""
+    if value is None or str(value).strip().lower() in ("", "n/a", "na", "-"):
+        return None
+    label = "%s pipeline duration for operator %s" % (metric, name)
+    result = _number(value, label)
+    if result < 0:
+        raise ValueError("invalid %s: %r" % (label, value))
+    return result
+
+
+def _complete_median(samples):
+    """仅在全部采样齐全时计算中位数。"""
+    return None if any(value is None for value in samples) else statistics.median(samples)
+
+
+def _pipeline_operator(label, name, tasks, rows, columns):
+    """按已选执行轮次汇总一个算子的各条流水。"""
+    samples = {metric: [_pipeline_number(rows[task["row"]].get(column), metric, name)
+                        for task in tasks] if column else [None] * len(tasks)
+               for metric, column in columns.items()}
+    return {"label": label, "name": name,
+            "total_us": statistics.median([task["duration_us"] for task in tasks]),
+            "pipeline_us": {metric: _complete_median(values) for metric, values in samples.items()},
+            "samples": samples}
+
+
+def _pipeline_details(rows, operators, fused, extend, selected, extend_us):
+    """汇总三个算子，并逐轮相加得到两个 Extend 的流水总耗时。"""
+    columns = list(dict.fromkeys(column for row in rows for column in row))
+    pipeline_columns = {metric: _find_column(columns, aliases) for metric, aliases in PIPELINE_COLUMNS}
+    result = [_pipeline_operator("FusedMultiConv2d", fused, operators["fused"][fused][selected],
+                                 rows, pipeline_columns)]
+    result.extend(_pipeline_operator("ExtendConv2D[%d]" % (index + 1), name,
+                                    operators["extend"][name][selected], rows, pipeline_columns)
+                  for index, name in enumerate(extend))
+    pair_samples = {}
+    for metric in pipeline_columns:
+        pair_samples[metric] = [None if first is None or second is None else
+                                _pipeline_number(first + second, metric, " + ".join(extend))
+                                for first, second in zip(result[1]["samples"][metric],
+                                                         result[2]["samples"][metric])]
+    result.append({"label": "2 x ExtendConv2D", "name": extend, "total_us": extend_us,
+                   "pipeline_us": {metric: _complete_median(values)
+                                   for metric, values in pair_samples.items()},
+                   "samples": pair_samples})
+    return {"units": "us", "method": "median_of_per_execution_pipeline_durations",
+            "pair_method": "sum_per_execution_before_median", "columns": pipeline_columns,
+            "operators": result}
+
+
+def parse_profile_rows(rows, warmup, repeat, expected_nodes=None, pipeline_details=False):
     """排除预热和末次写出探针，逐轮相加两个 Extend，再分别取中位数。"""
     if type(warmup) is not int or warmup < 0 or type(repeat) is not int or repeat < 1:
         raise ValueError("warmup must be nonnegative and repeat must be positive integers")
-    tasks, duration, timestamp = _profile_tasks(list(rows), expected_nodes)
+    rows = list(rows)
+    tasks, duration, timestamp = _profile_tasks(rows, expected_nodes)
     execution_count = warmup + repeat + 1
     operators = _group_tasks(tasks, execution_count, timestamp)
     extend = _order_extend_pair(operators, timestamp)
@@ -148,7 +210,7 @@ def parse_profile_rows(rows, warmup, repeat, expected_nodes=None):
     extend_us = _number(statistics.median(totals), "median Extend duration", positive=True)
     saved_us = extend_us - fused_us
     improvement = _number(100.0 * (saved_us / extend_us), "improvement percentage")
-    return {"schema_version": 1, "source": "msprof_op_summary", "units": "us",
+    result = {"schema_version": 1, "source": "msprof_op_summary", "units": "us",
             "method": "median_of_per_execution_device_durations", "duration_column": duration,
             "ordering": "task_timestamp" if timestamp else "csv_order_per_operator",
             "warmup": warmup, "repeat": repeat, "write_probe_executions": 1,
@@ -158,6 +220,9 @@ def parse_profile_rows(rows, warmup, repeat, expected_nodes=None):
                         "extend_total_us": totals},
             "fused_us": fused_us, "extend_total_us": extend_us, "saved_us": saved_us,
             "improvement_percent": improvement}
+    if pipeline_details:
+        result["pipeline_details"] = _pipeline_details(rows, operators, fused, extend, selected, extend_us)
+    return result
 
 
 def sha256_file(path):
@@ -169,13 +234,14 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
-def parse_profile_csv(path, warmup, repeat, expected_nodes=None):
+def parse_profile_csv(path, warmup, repeat, expected_nodes=None, pipeline_details=False):
     """读取 msprof 导出文件，并在指标中绑定原始 CSV 的 SHA256。"""
     with open(path, "r", encoding="utf-8-sig", newline="") as source:
         reader = csv.DictReader(source)
         if reader.fieldnames is None:
             raise ValueError("op_summary has no CSV header")
-        result = parse_profile_rows(reader, warmup, repeat, expected_nodes=expected_nodes)
+        result = parse_profile_rows(reader, warmup, repeat, expected_nodes=expected_nodes,
+                                    pipeline_details=pipeline_details)
     result["op_summary_sha256"] = sha256_file(path)
     return result
 
@@ -211,3 +277,22 @@ def render_performance_table(rows):
                           for index, value in enumerate(values))
     return "\n".join([line(headers), "-+-".join("-" * width for width in widths)] +
                      [line(row) for row in data])
+
+
+def render_pipeline_table(result):
+    """逐算子展示采样中位数，缺失的流水指标保留为 N/A。"""
+    headers = ("Operator", "Total (us)", "Cube (us)", "Scalar (us)", "MTE1 (us)",
+               "MTE2 (us)", "MTE3 (us)", "Fixpipe (us)")
+    data = []
+    for operator in result["pipeline_details"]["operators"]:
+        values = [operator["total_us"]] + [operator["pipeline_us"][metric]
+                                         for metric, _ in PIPELINE_COLUMNS]
+        data.append([operator["label"]] + ["N/A" if value is None else "%.3f" % value for value in values])
+    widths = [max(len(header), max((len(row[index]) for row in data), default=0))
+              for index, header in enumerate(headers)]
+    def line(values):
+        return " | ".join(value.ljust(widths[index]) if index == 0 else value.rjust(widths[index])
+                          for index, value in enumerate(values))
+    return "\n".join([line(headers), "-+-".join("-" * width for width in widths)] +
+                     [line(row) for row in data] +
+                     ["Pipeline times may overlap and need not sum to Total. N/A: unavailable or incomplete."])

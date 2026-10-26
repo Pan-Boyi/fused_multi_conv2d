@@ -757,8 +757,8 @@ def validate_performance_state(paths, om_file, reference_om, state):
     return report, execution
 
 
-def parse_performance_profile(case, paths, om_file, reference_om, state):
-    """读取已通过精度对比的三类设备任务，计算逐轮耗时差。"""
+def parse_performance_profile(case, paths, om_file, reference_om, state, pipeline_details=False):
+    """读取通过精度对比的设备任务；pipeline_details 控制是否汇总各流水耗时。"""
     import fc2d_performance as performance
     report, execution = validate_performance_state(paths, om_file, reference_om, state)
     if execution_failed(state) or report.get("passed") is not True:
@@ -768,7 +768,8 @@ def parse_performance_profile(case, paths, om_file, reference_om, state):
     if not expected_nodes["fused"] or not expected_nodes["extend"]:
         raise RuntimeError("Model bindings lack profiling node names; regenerate both OMs")
     result = performance.parse_profile_csv(find_op_summary(state["local_prof"]), execution["warmup"],
-                                           execution["repeat"], expected_nodes=expected_nodes)
+                                           execution["repeat"], expected_nodes=expected_nodes,
+                                           pipeline_details=pipeline_details)
     spec = fc2d.read_spec(paths["bin"])
     measured_case = {key: spec[key] for key in ("n", "ci", "hi", "wi", "cout1", "cout2")}
     measured_case.update(dtype=("fp16", "int8", "s8f16", "a16w8")[spec["dtype_mode"]],
@@ -878,6 +879,8 @@ def main():
                     help="以第二阶段融合前两个 ExtendConv2D 的设备输出为 golden，需配合 --no-msprof")
     ap.add_argument("--compare-performance", action="store_true",
                     help="上板采集 Fused 与两个 Extend 的设备耗时，自动生成参考模型并校验精度")
+    ap.add_argument("--pipeline-details", action="store_true",
+                    help="打印 Fused 和两层 Extend 的各流水耗时，自动启用 --compare-performance")
     ap.add_argument("--compare-reference-golden", action="store_true",
                     help="同时将两个 ExtendConv2D 的设备输出与 CPU golden 比较，需配合 --compare-unfused")
     ap.add_argument("--fusion-pass-config", metavar="PATH",
@@ -886,6 +889,8 @@ def main():
     ap.add_argument("--list", action="store_true", help="只列出会做哪些")
     ap.add_argument("--keep-going", action="store_true", help="某条失败了继续做下一条")
     args = ap.parse_args()
+    if args.pipeline_details:
+        args.compare_performance = True
     if args.compare_performance:
         args.compare_unfused = True
         if args.no_msprof:
@@ -1014,9 +1019,14 @@ def main():
                     do_export(local_prof, prof_cfg["tbe_work_test_suit"])
                 if "parse" in steps:
                     if args.compare_performance:
-                        result = parse_performance_profile(c, paths, om_file, reference_om, state)
+                        result = parse_performance_profile(c, paths, om_file, reference_om, state,
+                                                           pipeline_details=args.pipeline_details)
                         state["performance"] = result
                         performance_rows.append(result)
+                        if args.pipeline_details:
+                            import fc2d_performance as performance
+                            print("\n[PIPELINE] %s | %s" % (result["case"], result["shape"]))
+                            print(performance.render_pipeline_table(result))
                     else:
                         parsed = parse_summary(find_op_summary(local_prof), prof_cfg["columns"])
                         state["summary"] = parsed

@@ -222,6 +222,22 @@ python3 run_profile.py --cases fusion_cases.json \
 表中形状取自本次模型绑定的 `case.bin`，JSON 保留完整 case 参数；恢复解析时使用
 采集时记录的预热和正式执行次数。
 
+添加 `--pipeline-details` 可查看同一用例中 Fused、第一层 Extend、第二层 Extend
+及两层 Extend 合计的流水耗时。该开关自动启用 `--compare-performance`：
+
+```bash
+python3 run_profile.py --cases fusion_cases.json --only fusion_a16w8 \
+  --pipeline-details --steps check,case,om,push,prof,pull,export,parse
+```
+
+每个用例打印 `Total、Cube、Scalar、MTE1、MTE2、MTE3、Fixpipe`，单位为微秒。
+数据来自 `op_summary.csv`，Cube 对应 `mac_exe_time(us)`，同时支持 `aic_mac_time(us)`
+等 AIC 耗时列；AIV 指标不会混入该表。统计使用相同的正式执行轮次，
+排除预热和末次写出探针后取中位数；两层 Extend 的每项合计先逐轮相加再取中位数。
+流水之间可以重叠，各项相加不等于 Total。未采集或不完整的流水数据显示 `N/A`。
+流水指标及各轮样本保存在 `performance_comparison.json` 的 `pipeline_details` 中。
+已有成对模型的 profiling 数据时，可使用同一开关加 `--steps parse` 重新解析，无需上板重跑。
+
 ## 上板 + profiling：run_profile.py
 
 `fc2d.py` 假设你在同一台机器上出 `.om` 又跑。真实情况常常是两台：一台有 CANN 和
