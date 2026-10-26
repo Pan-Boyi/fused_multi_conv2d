@@ -164,6 +164,7 @@ struct FlatGeom {
     int l0bElems;        // L0B 总元素容量。
     int l0cElems;        // L0C 总累加元素容量。
     int l0cStride;       // 第一层 L0C 交替槽元素跨距（0 为单槽）。
+    int l0cStride2;      // 第二层 L0C 交替槽元素跨距（0 为单槽）。
     int w1Stage;         // 第一层权重 L1 策略（0 完整区，1 环形区）。
     int w2Stage;         // 第二层权重 L1 策略（0 完整区，1 环形区）。
     int fmAddr;          // 输入 L1 字节地址。
@@ -238,6 +239,7 @@ struct FlatGeom {
     X(l0bElems, l0bElems)               \
     X(l0cElems, l0cElems)               \
     X(l0cStride, l0cStride)             \
+    X(l0cStride2, l0cStride2)           \
     X(w1Stage, w1Stage)                 \
     X(w2Stage, w2Stage)                 \
     X(fmAddr, fmAddr)                   \
@@ -343,7 +345,7 @@ FC2D_GEOM_FN void MakeBandLite(const FlatGeom& geometry, int rowBand, int column
 
 namespace FusedMultiConv2dShape {
 
-#define FC2D_GEOM_REV "geom13"
+#define FC2D_GEOM_REV "geom14"
 
 constexpr int L0B_BYTES = 64 * 1024;
 constexpr int L0B_SLOT_BYTES = L0B_BYTES / 2;
@@ -357,6 +359,8 @@ constexpr int FIX_L1_COST_FACTOR = 290;
 constexpr int FIX_GM_COST_FACTOR = 105;
 constexpr int FIX_GM_REQUEST_COST_X2 = 19;
 constexpr int SCALAR_TILE_COST = 420;
+constexpr int SCALAR_K_COST = 256;
+constexpr int SCALAR_WEIGHT_SEGMENT_COST = 64;
 constexpr int SCALAR_BASE_COST = 4000;
 
 // 根据输入宽度选择默认偏置宽度；elemBytes 为输入元素字节数。
@@ -515,6 +519,7 @@ struct ConvTilingGeometry {
     int l0bElements;                // 共享 L0B 元素容量
     int l0cElements;                // 共享 L0C 累加元素容量
     int l0cSlotStride;              // 第一层 L0C 槽跨度，单位元素
+    int l0cSlotStride2;             // 第二层 L0C 槽跨度，单位元素
     int weightRing1;                // 第一层权重循环搬运开关
     int weightRing2;                // 第二层权重循环搬运开关
     int inputBufferElements;        // L1 输入缓冲元素数
@@ -553,8 +558,8 @@ struct ComputeTileChoice {
 
 // 选择 K 步长及 M 上限；reductionLength/kAlignment 为归约长度/粒度，inputBytes/weightBytes 为元素宽度，
 // outputChannels 为输出通道数，positions 为待划分的位置数。
-inline ComputeTileChoice PickTileK(int reductionLength, int kAlignment, int inputBytes, int outputChannels,
-                                   int positions, int weightBytes)
+inline ComputeTileChoice PickCompactMTile(int reductionLength, int kAlignment, int inputBytes, int outputChannels,
+                                          int positions, int weightBytes)
 {
     ComputeTileChoice best;
     best.tileK = 0;
@@ -650,6 +655,73 @@ inline bool PickL0bChunks(int outputChannels, int reductionLength, int weightByt
     return PickL0bChunksIn(outputChannels, reductionLength, weightBytes, tileK, L0B_BYTES, segmentCount, segmentK);
 }
 
+// 估算一层分块的计算、搬运和调度代价；tiles 为实际 M 划分，tileK 为 K 步长，
+// reductionLength/inputBytes/outputChannels/weightBytes 为归约及数据宽度，segmentCount 为权重段数，
+// pingPong/weightRing 为缓冲策略，outputToGm 指示最终写出。
+inline long long EstimateComputeTileCost(const TileSpec& tiles, int tileK, int reductionLength, int inputBytes,
+                                         int outputChannels, int weightBytes, int segmentCount, bool pingPong,
+                                         bool outputToGm, bool weightRing)
+{
+    long long alignedPositions = 0;
+    for (int tileIndex = 0; tileIndex < tiles.n; ++tileIndex) {
+        alignedPositions += Align(TileRows(tiles, tileIndex), MMAD_M0);
+    }
+    const int alignedChannels = Align(outputChannels, MMAD_M0);
+    const int cubeKFactor = inputBytes == 2 ? 16 : 32;
+    const long long dispatches = (long long)tiles.n * (reductionLength / tileK);
+    const long long weightLoads = segmentCount == 1 ? 1 : tiles.n;
+    const long long featureCost = alignedPositions * reductionLength * inputBytes / MTE1_COST_FACTOR;
+    const long long weightCost = weightLoads * alignedChannels * reductionLength * weightBytes / MTE1_COST_FACTOR;
+    const long long cubeCost = alignedPositions / MMAD_M0 * (alignedChannels / MMAD_M0) *
+                               (reductionLength / cubeKFactor);
+    const long long fixCost = outputToGm ? (long long)tiles.n * alignedChannels * FIX_GM_REQUEST_COST_X2 / 2 :
+                                           alignedPositions * alignedChannels * 4 / FIX_L1_COST_FACTOR;
+    // L0B ping/pong 允许后续权重搬运与计算重叠；单槽则单独计入权重搬运。
+    const long long operandCost = featureCost + (pingPong ? weightCost : 0);
+    const long long pipelineCost = (cubeCost > operandCost ? cubeCost : operandCost) + (pingPong ? 0 : weightCost);
+    const long long ringCost = weightRing ?
+                                   weightLoads * alignedChannels * reductionLength * weightBytes / MTE2_COST_FACTOR :
+                                   0;
+    return pipelineCost + ringCost + fixCost + (long long)tiles.n * SCALAR_TILE_COST + dispatches * SCALAR_K_COST +
+           weightLoads * segmentCount * SCALAR_WEIGHT_SEGMENT_COST;
+}
+
+// 联合选择 M/K 分块；归约、元素宽度及通道决定容量，positions 为位置数，
+// outputToGm 指示最终输出，weightRing 指示权重需从 GM 循环搬运。
+inline ComputeTileChoice PickComputeTile(int reductionLength, int kAlignment, int inputBytes, int outputChannels,
+                                         int positions, int weightBytes, bool outputToGm, bool weightRing)
+{
+    ComputeTileChoice best{};
+    long long bestCost = 0;
+    if (reductionLength <= 0 || kAlignment <= 0 || outputChannels <= 0 || positions <= 0 || weightBytes <= 0) {
+        return best;
+    }
+    const int accumulatorLimit = L0C_ELEMS / Align(outputChannels, MMAD_M0);
+    const int weightKLimit = L0B_BYTES / (Align(outputChannels, MMAD_M0) * weightBytes);
+    for (int tileK = kAlignment; tileK <= MinI(reductionLength, weightKLimit); tileK += kAlignment) {
+        if ((reductionLength % tileK) != 0) {
+            continue;
+        }
+        const int operandLimit = L0A_SLOT_BYTES / (tileK * inputBytes);
+        const int maxPositions = MinI(MinI(operandLimit, accumulatorLimit) / MMAD_M0 * MMAD_M0, positions);
+        const TileSpec tiles = MakeTileSpec(positions, maxPositions, 1);
+        int segmentCount = 0, segmentK = 0, pingPong = 0;
+        if (tiles.n == 0 ||
+            !PickL0bChunks(outputChannels, reductionLength, weightBytes, tileK, segmentCount, segmentK, pingPong)) {
+            continue;
+        }
+        // 逐块计算 16 对齐开销，并计入 K 循环、权重重搬及输出请求，避免只追求较少 M 块。
+        const long long cost = EstimateComputeTileCost(tiles, tileK, reductionLength, inputBytes, outputChannels,
+                                                       weightBytes, segmentCount, pingPong != 0, outputToGm,
+                                                       weightRing);
+        if (!best.valid || cost < bestCost || (cost == bestCost && tileK > best.tileK)) {
+            best = {tileK, maxPositions, tiles.n, true};
+            bestCost = cost;
+        }
+    }
+    return best;
+}
+
 // 写入 kernel 共用参数；geometry 为推导结果，chunksPerCore 为每核任务上限，flat 接收扁平字段。
 inline void Flatten(const ConvTilingGeometry& geometry, int chunksPerCore, FlatGeom& flat)
 {
@@ -709,6 +781,7 @@ inline void Flatten(const ConvTilingGeometry& geometry, int chunksPerCore, FlatG
     flat.l0bElems = geometry.l0bElements;
     flat.l0cElems = geometry.l0cElements;
     flat.l0cStride = geometry.l0cSlotStride;
+    flat.l0cStride2 = geometry.l0cSlotStride2;
     flat.w1Stage = geometry.weightRing1;
     flat.w2Stage = geometry.weightRing2;
 
@@ -858,11 +931,11 @@ inline int SelectComputeTiles(const ConvTilingInputs& inputs, int mRunMax, ConvT
         Align(inputs.outputChannels2, MMAD_M0) * kBlock2 * weightBytes > L0B_BYTES) {
         return RJ_L0B;
     }
-    const ComputeTileChoice tileChoice1 = PickTileK(geometry.reductionLength1, kBlock1, inputs.inputElementBytes,
-                                                    inputs.outputChannels1, geometry.intermediatePositionsMax,
-                                                    weightBytes);
-    const ComputeTileChoice tileChoice2 = PickTileK(geometry.reductionLength2, kBlock2, MidElemBytes(inputs),
-                                                    inputs.outputChannels2, mRunMax, weightBytes);
+    const ComputeTileChoice tileChoice1 = PickCompactMTile(geometry.reductionLength1, kBlock1, inputs.inputElementBytes,
+                                                           inputs.outputChannels1, geometry.intermediatePositionsMax,
+                                                           weightBytes);
+    const ComputeTileChoice tileChoice2 = PickCompactMTile(geometry.reductionLength2, kBlock2, MidElemBytes(inputs),
+                                                           inputs.outputChannels2, mRunMax, weightBytes);
     if (!tileChoice1.valid || !tileChoice2.valid) {
         return RJ_TILE_K;
     }
@@ -943,9 +1016,10 @@ inline int ConfigureAccumulatorBuffers(const ConvTilingInputs& inputs, ConvTilin
     if (MaxI(l0c1, l0c2) > L0C_ELEMS) {
         return RJ_L0C;
     }
-    // 第一层能容纳两份累加结果时启用 ping/pong，第二层仍复用 L0C 起始地址。
+    // 各层独立判断能否容纳两份累加结果，两层执行阶段复用同一片 L0C。
     geometry.l0cSlotStride = (2 * l0c1 <= L0C_ELEMS) ? l0c1 : 0;
-    geometry.l0cElements = MaxI(geometry.l0cSlotStride + l0c1, l0c2);
+    geometry.l0cSlotStride2 = (2 * l0c2 <= L0C_ELEMS) ? l0c2 : 0;
+    geometry.l0cElements = MaxI(geometry.l0cSlotStride + l0c1, geometry.l0cSlotStride2 + l0c2);
     return inputs.outputChannels1 > BT_SLOT_ELEMS || inputs.outputChannels2 > BT_SLOT_ELEMS ? RJ_BT : RJ_OK;
 }
 
@@ -1011,6 +1085,36 @@ inline int DeriveWith(const ConvTilingInputs& inputs, int hb, int nwseg, int l1B
     geometry.inputImageElements = inputs.inputChannels * inputs.inputHeight * inputs.inputWidth;
     geometry.outputImageElements = inputs.outputChannels2 * geometry.outputHeight2 * geometry.outputWidth2;
     return RJ_OK;
+}
+
+// 在已选行带内优化 M/K 分块；inputs/l1Budget 为配置及容量，失败时保留 geometry 的原可行方案。
+inline void RefineComputeTiles(const ConvTilingInputs& inputs, int l1Budget, ConvTilingGeometry& geometry)
+{
+    ConvTilingGeometry refined = geometry;
+    const int outputPositions = geometry.widthSegmentCount == 1 ? geometry.bandHeight * geometry.outputWidth2 :
+                                                                  geometry.segmentWidth;
+    const auto first = PickComputeTile(geometry.reductionLength1, MaxI(geometry.inputC0, geometry.weightC0),
+                                       inputs.inputElementBytes, inputs.outputChannels1,
+                                       geometry.intermediatePositionsMax, WeightElemBytes(inputs), false,
+                                       geometry.weightRing1 != 0);
+    const auto second = PickComputeTile(geometry.reductionLength2, MaxI(geometry.intermediateC0, geometry.weightC0),
+                                        MidElemBytes(inputs), inputs.outputChannels2, outputPositions,
+                                        WeightElemBytes(inputs), true, geometry.weightRing2 != 0);
+    if (!first.valid || !second.valid) {
+        return;
+    }
+    refined.tileK1 = first.tileK;
+    refined.tileMMax1 = first.maxPositions;
+    refined.tileK2 = second.tileK;
+    refined.tileMMax2 = second.maxPositions;
+    if (SelectWeightSegments(inputs, refined) != RJ_OK ||
+        ValidateBandTiles(inputs, outputPositions, refined) != RJ_OK ||
+        ConfigureOperandBuffers(inputs, refined) != RJ_OK || ConfigureAccumulatorBuffers(inputs, refined) != RJ_OK ||
+        SelectL1WeightLayout(inputs, l1Budget, refined) != RJ_OK || refined.weightRing1 > geometry.weightRing1 ||
+        refined.weightRing2 > geometry.weightRing2) {
+        return;
+    }
+    geometry = refined;
 }
 
 struct BandCost {
@@ -1309,7 +1413,7 @@ inline SplitBandChoice SearchSplitBands(const ConvTilingInputs& inputs, int outp
 }
 
 // 搜索行带高和列段数；inputs 为输入，aicNum/l1Budget 为资源，geometry 接收最终可执行几何。
-inline int PickHb(const ConvTilingInputs& inputs, int aicNum, int l1Budget, ConvTilingGeometry& geometry)
+inline int PickBandGeometry(const ConvTilingInputs& inputs, int aicNum, int l1Budget, ConvTilingGeometry& geometry)
 {
     if (aicNum <= 0) {
         aicNum = 1;
@@ -1336,6 +1440,16 @@ inline int PickHb(const ConvTilingInputs& inputs, int aicNum, int l1Budget, Conv
         return DeriveWith(inputs, splitChoice.height, splitChoice.segments, l1Budget, geometry);
     }
     return rowChoice.height == 0 ? rowChoice.firstReject : DeriveWith(inputs, rowChoice.height, 1, l1Budget, geometry);
+}
+
+// 先确定行带和列段，再优化内部计算分块；inputs/aicNum/l1Budget 为输入及资源，geometry 接收结果。
+inline int PickHb(const ConvTilingInputs& inputs, int aicNum, int l1Budget, ConvTilingGeometry& geometry)
+{
+    const int status = PickBandGeometry(inputs, aicNum, l1Budget, geometry);
+    if (status == RJ_OK) {
+        RefineComputeTiles(inputs, l1Budget, geometry);
+    }
+    return status;
 }
 
 } // namespace FusedMultiConv2dShape

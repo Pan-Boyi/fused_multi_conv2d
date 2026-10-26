@@ -16,9 +16,8 @@ import fc2d
 import run_fused_multi_conv2d as runner
 
 TAIL_FIELDS = ('blockDim', 'fixedShift1', 'fixedShift2', 'hasBias1', 'hasBias2', 'relu1', 'relu2')
-# Current FusedMultiConv2dTilingData consists of 78 uint32 fields. An ABI change must
-# update this check, rather than silently decoding a different structure.
-TILING_BYTES = 312
+# The second-layer L0C stride adds one uint32 after l0cStride; keep frozen models readable.
+TILING_FIELD_COUNTS = {312: 78, 316: 79}
 
 
 def check_tiling(spec, record):
@@ -45,9 +44,9 @@ def check_tiling(spec, record):
         data = bytes.fromhex(result['tiling_data'])
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError('native tiling_data must be a hexadecimal byte string') from exc
-    if len(data) != TILING_BYTES:
-        raise ValueError('unsupported tiling ABI: expected %d bytes, received %d' % (TILING_BYTES, len(data)))
-    words = struct.unpack('<78I', data)
+    if len(data) not in TILING_FIELD_COUNTS:
+        raise ValueError('unsupported tiling ABI: expected 312 or 316 bytes, received %d' % len(data))
+    words = struct.unpack('<%dI' % TILING_FIELD_COUNTS[len(data)], data)
     geometry = tuple(spec[key] for key in ('n', 'ci', 'hi', 'wi', 'cout1', 'cout2'))
     if words[:6] != geometry:
         raise ValueError('native tiling belongs to a different case geometry')
@@ -55,6 +54,9 @@ def check_tiling(spec, record):
     if all(key in spec for key in geometry_fields) and words[6:16] != tuple(spec[key] for key in geometry_fields):
         raise ValueError('native tiling geometry differs from case kernel/stride/padding')
     tail = dict(zip(TAIL_FIELDS, words[-7:]))
+    stage_offset = 54 if len(words) == 79 else 53
+    tail.update(l0cStride=words[52], l0cStride2=words[53] if len(words) == 79 else 0,
+                w1Stage=words[stage_offset], w2Stage=words[stage_offset + 1])
     expected = {'hasBias1': int(bool(spec['bias'])),
                 'hasBias2': int(bool(spec['bias'])), 'relu1': int(bool(spec['relu1'])),
                 'relu2': int(bool(spec['relu2']))}

@@ -67,6 +67,35 @@ class NativeTilingCapture(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'fixedShift1'):
             tool.check_tiling(spec,record)
 
+    def test_second_l0c_stride_layout_preserves_shifted_fields(self):
+        for mode in ('fp16', 'a16w8'):
+            spec, record = self.corrected(mode)
+            words = list(struct.unpack('<78I', bytes.fromhex(record['result']['tiling_data'])))
+            words[52:55] = [16384, 1, 0]
+            words[-4:] = [1, 1, 0, 1]
+            spec.update(bias=1, relu1=0, relu2=1)
+            record['result']['tiling_data'] = struct.pack('<78I', *words).hex()
+            old = tool.check_tiling(spec, record)
+            words.insert(53, 24576)
+            record['result']['tiling_data'] = struct.pack('<79I', *words).hex()
+            with self.subTest(mode=mode):
+                new = tool.check_tiling(spec, record)
+                self.assertEqual(new['tiling_data_bytes'], 316)
+                self.assertEqual(new['fields']['l0cStride2'], 24576)
+                self.assertEqual(old['fields']['l0cStride2'], 0)
+                for name in tool.TAIL_FIELDS + ('l0cStride', 'w1Stage', 'w2Stage'):
+                    self.assertEqual(new['fields'][name], old['fields'][name])
+                self.assertEqual(new['fields']['w1Stage'], 1)
+                self.assertEqual(new['fields']['w2Stage'], 0)
+
+    def test_unknown_nearby_tiling_sizes_are_rejected(self):
+        spec, record = self.corrected('fp16')
+        for size in (308, 313, 315, 317, 320):
+            malformed = copy.deepcopy(record)
+            malformed['result']['tiling_data'] = '00' * size
+            with self.subTest(size=size), self.assertRaisesRegex(ValueError, 'tiling ABI'):
+                tool.check_tiling(spec, malformed)
+
     def test_rejects_old_string_contract_wrong_enum_types_and_nonzero_codes(self):
         spec, good = self.corrected('fp16')
         for name, old in (('data_format','NCHW'),('round_mode','rint'),('pad_mode','SPECIFIC')):

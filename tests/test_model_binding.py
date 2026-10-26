@@ -58,6 +58,19 @@ class ModelBinding(unittest.TestCase):
         self.assertEqual(binding['weight_mode'], 'constant')
         self.assertEqual(binding, json.loads(sidecar.read_text()))
 
+    def test_binding_accepts_known_tiling_layouts_only(self):
+        model, sidecar = self.make_model()
+        binding = json.loads(sidecar.read_text())
+        for size in (312, 316):
+            binding['fusion']['native_tiling']['tiling_data_bytes'] = size
+            sidecar.write_text(json.dumps(binding))
+            self.assertEqual(runner.validate_model_binding(str(self.case), str(model)), binding)
+        for size in (308, 313, 315, 317, 320):
+            binding['fusion']['native_tiling']['tiling_data_bytes'] = size
+            sidecar.write_text(json.dumps(binding))
+            with self.subTest(size=size):
+                self.assert_rejected(self.case, model)
+
     def test_missing_binding_or_changed_model_is_rejected(self):
         model, sidecar = self.make_model()
         model.write_bytes(model.read_bytes() + b'changed')
