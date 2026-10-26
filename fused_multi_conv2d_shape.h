@@ -561,6 +561,7 @@ inline ComputeTileChoice PickTileK(int reductionLength, int kAlignment, int inpu
     best.maxPositions = 0;
     best.tileCount = 0;
     best.valid = false;
+    bool bestPingPong = false;
     if (reductionLength <= 0 || kAlignment <= 0 || outputChannels <= 0 || positions <= 0 || weightBytes <= 0) {
         return best;
     }
@@ -568,6 +569,7 @@ inline ComputeTileChoice PickTileK(int reductionLength, int kAlignment, int inpu
     const int accumulatorLimit = L0C_ELEMS / Align(outputChannels, MMAD_M0);
 
     const int weightKLimit = L0B_BYTES / (Align(outputChannels, MMAD_M0) * weightBytes);
+    const int pingPongKLimit = L0B_SLOT_BYTES / (Align(outputChannels, MMAD_M0) * weightBytes);
     for (int tileK = kAlignment; tileK <= reductionLength; tileK += kAlignment) {
         if ((reductionLength % tileK) != 0) {
             continue;
@@ -590,11 +592,16 @@ inline ComputeTileChoice PickTileK(int reductionLength, int kAlignment, int inpu
             continue;
         }
 
-        if (!best.valid || tileCount < best.tileCount || (tileCount == best.tileCount && tileK > best.tileK)) {
+        // M 分块数相同时，非整套常驻权重优先保留 L0B ping/pong，再选择较大的 K。
+        const bool pingPong = reductionLength > weightKLimit && tileK <= pingPongKLimit;
+        if (!best.valid || tileCount < best.tileCount ||
+            (tileCount == best.tileCount &&
+             ((pingPong && !bestPingPong) || (pingPong == bestPingPong && tileK > best.tileK)))) {
             best.tileK = tileK;
             best.maxPositions = maxPositions;
             best.tileCount = tileCount;
             best.valid = true;
+            bestPingPong = pingPong;
         }
     }
     return best;
@@ -628,6 +635,13 @@ inline bool PickL0bChunksIn(int outputChannels, int reductionLength, int weightB
 inline bool PickL0bChunks(int outputChannels, int reductionLength, int weightBytes, int tileK, int& segmentCount,
                           int& segmentK, int& pingPong)
 {
+    // 整套权重能放入 L0B 时只搬入一次，无需为 ping/pong 拆段。
+    if ((long long)Align(outputChannels, MMAD_M0) * reductionLength * weightBytes <= L0B_BYTES) {
+        segmentCount = 1;
+        segmentK = reductionLength;
+        pingPong = 0;
+        return true;
+    }
     if (PickL0bChunksIn(outputChannels, reductionLength, weightBytes, tileK, L0B_SLOT_BYTES, segmentCount, segmentK)) {
         pingPong = 1;
         return true;
@@ -859,8 +873,8 @@ inline int SelectComputeTiles(const ConvTilingInputs& inputs, int mRunMax, ConvT
     return RJ_OK;
 }
 
-// 配置权重段和 L0B 复用；nwseg 为候选列段数，inputs/geometry 为卷积配置及分块结果。
-inline int SelectWeightSegments(const ConvTilingInputs& inputs, int nwseg, ConvTilingGeometry& geometry)
+// 配置权重段和 L0B 复用；inputs/geometry 为卷积配置及分块结果。
+inline int SelectWeightSegments(const ConvTilingInputs& inputs, ConvTilingGeometry& geometry)
 {
     const int weightBytes = WeightElemBytes(inputs);
     if (!PickL0bChunks(inputs.outputChannels1, geometry.reductionLength1, weightBytes, geometry.tileK1,
@@ -868,15 +882,6 @@ inline int SelectWeightSegments(const ConvTilingInputs& inputs, int nwseg, ConvT
         !PickL0bChunks(inputs.outputChannels2, geometry.reductionLength2, weightBytes, geometry.tileK2,
                        geometry.weightSegmentCount2, geometry.weightSegmentK2, geometry.l0bPingPong2)) {
         return RJ_L0B;
-    }
-    if (nwseg > 1 && geometry.l0bPingPong1 != 0) {
-        int segmentCount = 0, segmentK = 0;
-        if (PickL0bChunksIn(inputs.outputChannels1, geometry.reductionLength1, weightBytes, geometry.tileK1, L0B_BYTES,
-                            segmentCount, segmentK) &&
-            segmentCount == 1) {
-            geometry.weightSegmentCount1 = segmentCount;
-            geometry.weightSegmentK1 = segmentK;
-        }
     }
     if (geometry.weightSegmentCount1 == 1) {
         geometry.l0bPingPong1 = 0;
@@ -996,7 +1001,7 @@ inline int DeriveWith(const ConvTilingInputs& inputs, int hb, int nwseg, int l1B
     }
     const int mRunMax = (geometry.widthSegmentCount == 1) ? (hb * geometry.outputWidth2) : geometry.segmentWidth;
     if ((status = SelectComputeTiles(inputs, mRunMax, geometry)) != RJ_OK ||
-        (status = SelectWeightSegments(inputs, nwseg, geometry)) != RJ_OK ||
+        (status = SelectWeightSegments(inputs, geometry)) != RJ_OK ||
         (status = ValidateBandTiles(inputs, mRunMax, geometry)) != RJ_OK ||
         (status = ConfigureOperandBuffers(inputs, geometry)) != RJ_OK ||
         (status = ConfigureAccumulatorBuffers(inputs, geometry)) != RJ_OK ||
