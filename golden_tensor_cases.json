@@ -1,0 +1,20 @@
+{
+  "cases": [
+    {
+      "name": "golden_a16w8",
+      "input": {"shape": [1, 32, 8, 9], "dtype": "fp16"},
+      "kernels": [
+        {"shape": [64, 32, 3, 3], "dtype": "int8"},
+        {"shape": [2, 64, 3, 3], "dtype": "int8"}
+      ],
+      "output": {"dtype": "fp16"},
+      "attrs": {
+        "strides": [1, 1, 1, 1],
+        "pads": [0, 0, 0, 0, 0, 0, 0, 0],
+        "enable_relu": [true, true],
+        "bias_mask": [true, true],
+        "fixed_shift_value": [13, 0]
+      }
+    }
+  ]
+}

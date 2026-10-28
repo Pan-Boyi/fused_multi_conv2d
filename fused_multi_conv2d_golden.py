@@ -78,6 +78,148 @@ def read_case(path):
     return info, tensors
 
 
+def _json_object(value, name, fields, required=()):
+    """检查 JSON 对象的字段范围和必填字段。"""
+    if not isinstance(value, dict):
+        raise ValueError("%s must be an object" % name)
+    unknown = sorted(set(value) - set(fields))
+    if unknown:
+        raise ValueError("Unknown %s fields: %s" % (name, ", ".join(unknown)))
+    missing = sorted(set(required) - set(value))
+    if missing:
+        raise ValueError("Missing %s fields: %s" % (name, ", ".join(missing)))
+    return value
+
+
+def _json_shape(value, name):
+    """校验四维逻辑形状，每个维度使用正整数。"""
+    if (not isinstance(value, list) or len(value) != 4 or
+            any(type(item) is not int or not 0 < item <= INT32_MAX for item in value)):
+        raise ValueError("%s must contain four positive integers" % name)
+    return value
+
+
+def _json_dtype(value, name):
+    """统一 JSON 中 fp16、float16 和 int8 的写法。"""
+    aliases = {"fp16": "fp16", "float16": "fp16", "int8": "int8"}
+    if not isinstance(value, str) or value.lower() not in aliases:
+        raise ValueError("Unsupported %s: %r; expected fp16, float16 or int8" % (name, value))
+    return aliases[value.lower()]
+
+
+def _json_int_list(value, name, length, minimum=0):
+    """校验逐层整型属性的长度和范围。"""
+    if (not isinstance(value, list) or len(value) != length or
+            any(type(item) is not int or not minimum <= item <= INT32_MAX for item in value)):
+        raise ValueError("%s requires %d integers in [%d, %d]" %
+                         (name, length, minimum, INT32_MAX))
+    return value
+
+
+def _json_default_attrs(attrs):
+    """拒绝当前 golden 未实现的格式、膨胀和分组等配置。"""
+    enum_defaults = {"data_format": "NCHW", "round_mode": "rint", "pad_mode": "SPECIFIC"}
+    for name, default in enum_defaults.items():
+        values = attrs.get(name, [0, 0])
+        if (not isinstance(values, list) or len(values) != 2 or
+                any(not ((type(item) is int and item == 0) or
+                         (isinstance(item, str) and item.lower() == default.lower()))
+                    for item in values)):
+            raise ValueError("attrs.%s supports only [0, 0] (%s for both layers)" % (name, default))
+    defaults = {"dilations": [1] * 8, "groups": [1, 1], "offset_x": [0, 0]}
+    for name, default in defaults.items():
+        values = _json_int_list(attrs.get(name, default), "attrs." + name, len(default))
+        if values != default:
+            raise ValueError("attrs.%s supports only %s" % (name, default))
+    hf32 = attrs.get("enable_hf32", [False, False])
+    if (not isinstance(hf32, list) or len(hf32) != 2 or
+            any(type(item) is not bool or item for item in hf32)):
+        raise ValueError("attrs.enable_hf32 supports only [false, false]")
+
+
+def _json_tensor_attrs(attrs):
+    """将可配置属性映射成原输入生成器的逐层参数。"""
+    fields = ("strides", "pads", "enable_relu", "bias_mask", "fixed_shift_value",
+              "data_format", "round_mode", "pad_mode", "dilations", "groups",
+              "offset_x", "enable_hf32")
+    _json_object(attrs, "attrs", fields)
+    _json_default_attrs(attrs)
+    strides = _json_int_list(attrs.get("strides", [1] * 4), "attrs.strides", 4, 1)
+    pads = _json_int_list(attrs.get("pads", [0] * 8), "attrs.pads", 8)
+    if strides[0] != strides[1] or strides[2] != strides[3]:
+        raise ValueError("attrs.strides requires equal H/W strides within each convolution")
+    if any(pads[index] != pads[index + 1] for index in range(0, 8, 2)):
+        raise ValueError("attrs.pads requires symmetric padding on each axis")
+    relu = attrs.get("enable_relu", [True, True])
+    if (not isinstance(relu, list) or len(relu) != 2 or
+            any(type(item) not in (bool, int) or item not in (0, 1) for item in relu)):
+        raise ValueError("attrs.enable_relu requires two bool values or integer modes 0/1")
+    mask = attrs.get("bias_mask", [False, False])
+    if (not isinstance(mask, list) or len(mask) != 2 or
+            any(type(item) is not bool for item in mask)):
+        raise ValueError("attrs.bias_mask requires two bool values")
+    mapped = dict(strides=strides, pads=pads, enable_relu=relu, bias=any(mask))
+    if "fixed_shift_value" in attrs:
+        shifts = _json_int_list(attrs["fixed_shift_value"], "attrs.fixed_shift_value", 2)
+        if any(item > 58 for item in shifts):
+            raise ValueError("attrs.fixed_shift_value requires two integers in [0, 58]")
+        mapped["fixed_shift_value"] = shifts
+    return mapped, mask
+
+
+def _json_tensor_case(raw):
+    """按 NCHW 输入和 OIHW 双权重描述推导原生成器参数及输出形状。"""
+    _json_object(raw, "case", ("name", "input", "kernels", "output", "attrs"),
+                 ("input", "kernels", "output"))
+    input_desc = _json_object(raw["input"], "input", ("shape", "dtype"), ("shape", "dtype"))
+    output_desc = _json_object(raw["output"], "output", ("shape", "dtype"), ("dtype",))
+    kernels = raw["kernels"]
+    if not isinstance(kernels, list) or len(kernels) != 2:
+        raise ValueError("kernels must contain exactly two kernel objects")
+    kernel_shapes, kernel_dtypes = [], []
+    for index, kernel in enumerate(kernels):
+        name = "kernels[%d]" % index
+        _json_object(kernel, name, ("shape", "dtype"), ("shape", "dtype"))
+        kernel_shapes.append(_json_shape(kernel["shape"], name + ".shape"))
+        kernel_dtypes.append(_json_dtype(kernel["dtype"], name + ".dtype"))
+    input_shape = _json_shape(input_desc["shape"], "input.shape")
+    if kernel_shapes[0][1] != input_shape[1] or kernel_shapes[1][1] != kernel_shapes[0][0]:
+        raise ValueError("Kernel input channels must match input channels and the preceding kernel output")
+    if kernel_dtypes[0] != kernel_dtypes[1]:
+        raise ValueError("Both kernels must have the same dtype")
+    signature = (_json_dtype(input_desc["dtype"], "input.dtype"), kernel_dtypes[0],
+                 _json_dtype(output_desc["dtype"], "output.dtype"))
+    modes = {("fp16", "fp16", "fp16"): "fp16", ("int8", "int8", "int8"): "int8",
+             ("int8", "int8", "fp16"): "s8f16", ("fp16", "int8", "fp16"): "a16w8"}
+    if signature not in modes:
+        raise ValueError("Unsupported input/kernel/output dtype combination: %s" % (signature,))
+    mapped, mask = _json_tensor_attrs(raw.get("attrs", {}))
+    mapped.update(dtype=modes[signature], n=input_shape[0], ci=input_shape[1],
+                  hi=input_shape[2], wi=input_shape[3], cout1=kernel_shapes[0][0],
+                  cout2=kernel_shapes[1][0], kernel=kernel_shapes[0][2:] + kernel_shapes[1][2:])
+    if "name" in raw:
+        if not isinstance(raw["name"], str) or not raw["name"]:
+            raise ValueError("name must be a nonempty string")
+        mapped["name"] = raw["name"]
+    _json_output_shape(input_shape, kernel_shapes, output_desc, mapped)
+    return mapped, mask
+
+
+def _json_output_shape(input_shape, kernels, output_desc, case):
+    """按两层卷积公式推导空间尺寸并校验可选的输出形状。"""
+    height, width = input_shape[2:]
+    for index, kernel in enumerate(kernels):
+        top, bottom, left, right = case["pads"][index * 4:index * 4 + 4]
+        stride_h, stride_w = case["strides"][index * 2:index * 2 + 2]
+        height = (height + top + bottom - kernel[2]) // stride_h + 1
+        width = (width + left + right - kernel[3]) // stride_w + 1
+        if min(height, width) <= 0:
+            raise ValueError("Convolution %d has an empty output" % (index + 1))
+    expected = [input_shape[0], kernels[1][0], height, width]
+    if "shape" in output_desc and _json_shape(output_desc["shape"], "output.shape") != expected:
+        raise ValueError("output.shape does not match inferred shape %s" % expected)
+
+
 def _select_json_case(document, only):
     """沿用 harness 的参数默认值和 both 展开规则，选择一条 JSON 用例。"""
     import fc2d
@@ -92,8 +234,13 @@ def _select_json_case(document, only):
     for index, raw in enumerate(raw_cases):
         if not isinstance(raw, dict):
             raise ValueError("Each JSON case must be an object")
+        mask = None
+        if any(field in raw for field in ("input", "kernels", "output", "attrs")):
+            raw, mask = _json_tensor_case(raw)
         with contextlib.redirect_stdout(sys.stderr):
             case = fc2d.normalise(raw, index)
+        if mask is not None:
+            case["_bias_mask"] = mask
         if case["dtype"] == "both":
             for dtype in ("fp16", "int8"):
                 variant = dict(case, dtype=dtype, name=case["name"] + "_" + dtype)
@@ -126,7 +273,13 @@ def read_json_case(path, only=None):
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         if process.returncode:
             raise ValueError("JSON input generation failed:\n%s" % process.stdout)
-        return read_case(case_path)
+        info, tensors = read_case(case_path)
+    for index, enabled in enumerate(case.get("_bias_mask", [True, True])):
+        name = "bias%d" % (index + 1)
+        if not enabled and name in tensors:
+            dtype, dims, raw = tensors[name]
+            tensors[name] = (dtype, dims, bytes(len(raw)))
+    return info, tensors
 
 
 def _tensor(tensors, name, dtype, shape=None):

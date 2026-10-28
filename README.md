@@ -73,19 +73,67 @@ python3 fused_multi_conv2d_golden.py out/fusion_cases/fusion_a16w8/case.bin \
   --output y_python.bin --workspace-mb 64
 ```
 
-独立脚本也可直接读取 JSON：
+独立脚本也可按输入、两张卷积核及输出的数据类型直接读取 JSON，示例见
+`golden_tensor_cases.json`：
 
 ```bash
-python3 fused_multi_conv2d_golden.py fusion_cases.json \
-  --only fusion_a16w8 --output y_python.bin
+python3 fused_multi_conv2d_golden.py golden_tensor_cases.json \
+  --only golden_a16w8 --output y_python.bin
 ```
 
-JSON 支持单条用例对象、用例数组及 `{"cases": [...]}`，字段和默认值沿用现有 harness。
-单条用例可省略 `--only`；多条用例需要指定名称。`dtype: "both"` 展开成
-`<name>_fp16`、`<name>_int8`，通过展开后的名称选择。
+```json
+{
+  "name": "golden_a16w8",
+  "input": {"shape": [1, 32, 8, 9], "dtype": "fp16"},
+  "kernels": [
+    {"shape": [64, 32, 3, 3], "dtype": "int8"},
+    {"shape": [2, 64, 3, 3], "dtype": "int8"}
+  ],
+  "output": {"dtype": "fp16"},
+  "attrs": {
+    "strides": [1, 1, 1, 1],
+    "pads": [0, 0, 0, 0, 0, 0, 0, 0],
+    "enable_relu": [true, true],
+    "bias_mask": [true, true],
+    "fixed_shift_value": [13, 0]
+  }
+}
+```
+
+`input.shape` 为 `[N,C,H,W]`；每张 `kernels[i].shape` 为 `[Cout,Cin,Kh,Kw]`，
+第二层 `Cin` 必须等于第一层 `Cout`。dtype 支持 `fp16`（或 `float16`）和 `int8`，
+忽略大小写，两张卷积核的 dtype 必须相同。输出形状自动推导；也可填写 `output.shape`
+校验期望形状。根据 dtype 组合自动选择现有四种通路：
+
+| input.dtype | 两张 kernel.dtype | output.dtype | 通路 |
+| --- | --- | --- | --- |
+| fp16 | fp16 | fp16 | FP16 |
+| int8 | int8 | int8 | INT8 |
+| int8 | int8 | fp16 | S8F16 |
+| fp16 | int8 | fp16 | A16W8 |
+
+`attrs` 可省略，各项默认值及含义如下：
+
+| 属性 | 默认值 | 含义 |
+| --- | --- | --- |
+| strides | `[1,1,1,1]` | `[H1,W1,H2,W2]`，每层 H/W 相等。 |
+| pads | `[0,0,0,0,0,0,0,0]` | `[上1,下1,左1,右1,上2,下2,左2,右2]`，每层上下、左右分别对称。 |
+| enable_relu | `[true,true]` | 每层 ReLU 开关，也接受 0/1。 |
+| bias_mask | `[false,false]` | 每层 bias 开关，支持独立使能。 |
+| fixed_shift_value | FP16 `[42,42]`；A16W8 `[13,0]`；其余 `[0,0]` | 沿用现有 CPU 定点模型。 |
+
+`dilations`、`groups`、`offset_x`、`enable_hf32` 仅支持默认值：分别为八个 1、
+`[1,1]`、`[0,0]`、`[false,false]`。`data_format`、`round_mode`、`pad_mode` 仅支持
+`[0,0]`，也接受对应的默认名称列表 `["NCHW","NCHW"]`、`["rint","rint"]`、
+`["SPECIFIC","SPECIFIC"]`。其他配置会明确报错。
+
+JSON 支持单条用例对象、用例数组及 `{"cases": [...]}`。单条可省略 `--only`，多条需要
+指定名称。旧 flat JSON 格式仍可读取，其中 `dtype: "both"` 按原规则展开为
+`<name>_fp16`、`<name>_int8`。
 
 JSON 模式仅在临时目录中调用现有输入生成器，再由 Python 计算参考；输入生成器缺失或源码
 更新时需要 `g++` 编译。原 `case.bin` 输入方式、case/OM 产物及上板验证流程保持不变。
+新张量描述格式仅用于独立 golden 入口；`fc2d.py` 和 `run_profile.py` 继续使用原 JSON 格式。
 
 原有精度阈值、前 50 个差异表格及总 Precision 百分比保持不变。
 
