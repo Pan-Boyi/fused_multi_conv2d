@@ -73,6 +73,20 @@ python3 fused_multi_conv2d_golden.py out/fusion_cases/fusion_a16w8/case.bin \
   --output y_python.bin --workspace-mb 64
 ```
 
+独立脚本也可直接读取 JSON：
+
+```bash
+python3 fused_multi_conv2d_golden.py fusion_cases.json \
+  --only fusion_a16w8 --output y_python.bin
+```
+
+JSON 支持单条用例对象、用例数组及 `{"cases": [...]}`，字段和默认值沿用现有 harness。
+单条用例可省略 `--only`；多条用例需要指定名称。`dtype: "both"` 展开成
+`<name>_fp16`、`<name>_int8`，通过展开后的名称选择。
+
+JSON 模式仅在临时目录中调用现有输入生成器，再由 Python 计算参考；输入生成器缺失或源码
+更新时需要 `g++` 编译。原 `case.bin` 输入方式、case/OM 产物及上板验证流程保持不变。
+
 原有精度阈值、前 50 个差异表格及总 Precision 百分比保持不变。
 
 ## 两阶段融合验证

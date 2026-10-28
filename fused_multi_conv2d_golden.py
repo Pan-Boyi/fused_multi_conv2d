@@ -1,11 +1,15 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-"""从 case.bin 的真实输入计算两层卷积参考，不读取已有的 golden 张量。"""
+"""从 case.bin 或 JSON 用例描述计算两层卷积参考。"""
 
 import argparse
+import contextlib
 import json
 import math
 import os
 import struct
+import subprocess
+import sys
+import tempfile
 
 import numpy as np
 
@@ -72,6 +76,57 @@ def read_case(path):
     if offset != len(blob):
         raise ValueError("Unexpected bytes after case tensors")
     return info, tensors
+
+
+def _select_json_case(document, only):
+    """沿用 harness 的参数默认值和 both 展开规则，选择一条 JSON 用例。"""
+    import fc2d
+
+    if isinstance(document, dict):
+        raw_cases = document.get("cases", [document])
+    else:
+        raw_cases = document
+    if not isinstance(raw_cases, list) or not raw_cases:
+        raise ValueError("JSON must contain a case object or a nonempty cases array")
+    cases = []
+    for index, raw in enumerate(raw_cases):
+        if not isinstance(raw, dict):
+            raise ValueError("Each JSON case must be an object")
+        with contextlib.redirect_stdout(sys.stderr):
+            case = fc2d.normalise(raw, index)
+        if case["dtype"] == "both":
+            for dtype in ("fp16", "int8"):
+                variant = dict(case, dtype=dtype, name=case["name"] + "_" + dtype)
+                cases.append(variant)
+        else:
+            cases.append(case)
+    names = [case["name"] for case in cases]
+    if len(names) != len(set(names)):
+        raise ValueError("JSON case names must be unique")
+    if only is not None:
+        cases = [case for case in cases if case["name"] == only]
+        if not cases:
+            raise ValueError("Unknown JSON case: %s" % only)
+    if len(cases) != 1:
+        raise ValueError("JSON contains multiple cases; select one with --only NAME")
+    return cases[0]
+
+
+def read_json_case(path, only=None):
+    """在临时目录生成 JSON 用例的确定性输入，不调用原验证流程。"""
+    import fc2d
+
+    with open(path, encoding="utf-8") as source:
+        case = _select_json_case(json.load(source), only)
+    with contextlib.redirect_stdout(sys.stderr):
+        fc2d.ensure_tool("gen_case")
+    with tempfile.TemporaryDirectory(prefix="fc2d-golden-json-") as directory:
+        case_path = os.path.join(directory, "case.bin")
+        process = subprocess.run(fc2d.gen_case_argv(case, case_path),
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if process.returncode:
+            raise ValueError("JSON input generation failed:\n%s" % process.stdout)
+        return read_case(case_path)
 
 
 def _tensor(tensors, name, dtype, shape=None):
@@ -265,12 +320,21 @@ def compute_golden(info, tensors, workspace_mb=64):
 def main(argv=None):
     """独立读取用例并输出 NCHW golden 原始数据。"""
     parser = argparse.ArgumentParser(description="Compute FusedMultiConv2d CPU golden from case inputs")
-    parser.add_argument("case", help="ABI 8 case.bin path")
+    parser.add_argument("case", help="ABI 8 case.bin or JSON case description path")
+    parser.add_argument("--only", help="Select one JSON case by name")
     parser.add_argument("--output", required=True, help="Raw NCHW y_expect output path")
     parser.add_argument("--exact-output", help="Raw NCHW y_exact output path, FP16 only")
     parser.add_argument("--workspace-mb", type=float, default=64, help="Convolution patch workspace in MiB")
     args = parser.parse_args(argv)
-    info, tensors = read_case(args.case)
+    if args.case.lower().endswith(".json"):
+        try:
+            info, tensors = read_json_case(args.case, args.only)
+        except (OSError, ValueError, RuntimeError) as exc:
+            parser.error(str(exc))
+    else:
+        if args.only is not None:
+            parser.error("--only is supported only for JSON input")
+        info, tensors = read_case(args.case)
     result = compute_golden(info, tensors, args.workspace_mb)
     if args.exact_output and "y_exact" not in result:
         parser.error("--exact-output is supported only for FP16 cases")
@@ -278,7 +342,7 @@ def main(argv=None):
     if args.exact_output:
         outputs.append(("y_exact", args.exact_output))
     if os.path.abspath(args.case) in [os.path.abspath(path) for _, path in outputs]:
-        parser.error("Output path must not overwrite the case file")
+        parser.error("Output path must not overwrite the input file")
     for name, path in outputs:
         with open(path, "wb") as target:
             target.write(result[name][2])
