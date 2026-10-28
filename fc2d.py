@@ -31,6 +31,7 @@ fused_multi_conv2d 上板验证的总驱动 —— **改一个 json 就能换形
 这一整类失败不存在了。）
 """
 import argparse
+import hashlib
 import json
 import re
 import os
@@ -38,6 +39,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -308,13 +310,72 @@ def do_check(c, l1):
 
 
 # ---------------------------------------------------------------- 三个步骤
+def write_python_golden(case_path):
+    """从实际输入重算参考，替换用例中的输出及统计，返回来源信息。"""
+    import fused_multi_conv2d_golden as golden
+    import run_fused_multi_conv2d as runner
+
+    info, tensors = golden.read_case(case_path)
+    result = golden.compute_golden(info, tensors)
+    with open(case_path, "rb") as source:
+        blob = bytearray(source.read())
+    count = struct.unpack_from("<I", blob, 12)[0]
+    offset, replaced = HDR_LEN, set()
+    for _ in range(count):
+        record = struct.unpack_from(runner.REC_FMT, blob, offset)
+        offset += runner.REC_LEN
+        name = record[0].rstrip(b"\0").decode("ascii")
+        if name in result and name != "stats":
+            dtype, shape, raw = result[name]
+            if (dtype, shape, len(raw)) != (record[1], list(record[3:3 + record[2]]), record[-1]):
+                raise ValueError("Python golden output descriptor differs: %s" % name)
+            blob[offset:offset + len(raw)] = raw
+            replaced.add(name)
+        offset += record[-1]
+    outputs = {name: value for name, value in result.items() if name != "stats"}
+    if replaced != set(outputs):
+        raise ValueError("Case is missing Python golden output records")
+    struct.pack_into("<QQ", blob, 16, result["stats"]["nonzero"], result["stats"]["sat"])
+    with open(case_path, "wb") as destination:
+        destination.write(blob)
+    with open(golden.__file__, "rb") as source:
+        implementation_sha = hashlib.sha256(source.read()).hexdigest()
+    return {"schema_version": 1, "generator": "python", "implementation": os.path.basename(golden.__file__),
+            "implementation_sha256": implementation_sha, "case_sha256": hashlib.sha256(blob).hexdigest(),
+            "outputs": {name: {"dtype": value[0], "shape": value[1],
+                               "sha256": hashlib.sha256(value[2]).hexdigest(),
+                               "matches_cpp": value[2] == tensors[name][2]}
+                        for name, value in outputs.items()}, "stats": result["stats"]}
+
+
 def do_case(c, paths):
+    try:
+        import fused_multi_conv2d_golden  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError("Python golden requires NumPy on the case-generation host") from exc
     ensure_tool("gen_case")
-    argv = gen_case_argv(c, paths["bin"])
-    print("  " + " ".join(argv[1:]))
-    rc = run(argv)
-    if rc != 0:
-        die("gen_case 失败（%s）" % c["name"])
+    output_path = os.fspath(paths["bin"])
+    directory = os.path.dirname(os.path.abspath(output_path))
+    os.makedirs(directory, exist_ok=True)
+    descriptor, staged = tempfile.mkstemp(prefix=".case-python-", suffix=".bin", dir=directory)
+    os.close(descriptor)
+    try:
+        argv = gen_case_argv(c, staged)
+        print("  " + " ".join(argv[1:]))
+        if run(argv) != 0:
+            die("gen_case 失败（%s）" % c["name"])
+        report = write_python_golden(staged)
+        with open(staged + ".golden.json", "w") as destination:
+            json.dump(report, destination, indent=2)
+            destination.write("\n")
+        os.replace(staged, output_path)
+        os.replace(staged + ".golden.json", output_path + ".golden.json")
+        print("  [GOLDEN] Python reference written to %s; report: %s.golden.json" %
+              (output_path, output_path))
+    finally:
+        for path in (staged, staged + ".golden.json"):
+            if os.path.exists(path):
+                os.remove(path)
 
 
 def do_om(c, paths, soc, compare_unfused=False, fusion_pass_config=None):

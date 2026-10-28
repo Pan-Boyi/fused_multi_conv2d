@@ -32,6 +32,49 @@ python3 fc2d.py cases.json --steps run
 
 产物默认在 `out/<json 名>/<case 名>/`：`case.bin`（输入 + golden）、`.onnx`、`om/*.om`、`om/*.om.fc2d.json`。
 
+## Python golden
+
+`fc2d.py` 和 `run_profile.py` 的 `case` 步骤默认使用
+`fused_multi_conv2d_golden.py` 计算最终参考输出。生成端需要 NumPy；板侧仍只读取
+`case.bin` 中的参考数据，无须安装 NumPy。
+
+现有 C++ 生成器保留随机输入、量化表选择及定标工作点检查。随后 Python 从实际的
+`x`、逻辑 NCHW filter、bias 和逐通道 scale 独立重算两层输出，替换 `y_expect`、
+FP16 的 `y_exact` 及输出统计。已有参考数据不参与 Python 计算，shift 和 scale 不变。
+`case.bin.golden.json` 记录 Python 脚本、完整用例和输出的 SHA256，以及与原 C++ 参考的比较结果。
+
+| 通路 | Python 参考计算 |
+| --- | --- |
+| FP16 | double 卷积累加；卷积和 bias 分别按 `2^(58-S)` 最近偶数舍入，限幅 int32 后反定标为 FP16；中间结果为 FP16。 |
+| INT8 | 精确整数卷积，按逐通道 scale 重定标、最近偶数舍入及 INT8 饱和；中间结果为 INT8。 |
+| INT8→FP16 | 第一层同 INT8，第二层先将 int32 转为 float32，再乘逐通道反量化系数并转换为 FP16。 |
+| A16W8 | 按 `x × 2^(29-S1)` 恢复现有用例的精确 INT8 输入网格，再执行整数卷积、INT8 中间结果及 FP16 出口。 |
+
+量化和反量化系数均按原参考清除 float32 的低 13 位尾数，ReLU 保持原有负零语义。
+A16W8 沿用现有 CPU golden 的输入范围：恢复后的值必须为 `[-128,127]` 内的整数。
+FP16 的 `y_exact` 也沿用原实现，使用第一层定点 FP16 中间结果，仅在第二层出口省略定点落格。
+
+上板验证命令保持不变，重新执行包含 `case` 的流程即可使用 Python golden：
+
+```bash
+python3 run_profile.py --cases fusion_cases.json --only fusion_a16w8 \
+  --steps check,case,om,push,prof --no-msprof
+
+# 同时比较两个 ExtendConv2D 与 Python golden
+python3 run_profile.py --cases fusion_cases.json --only fusion_a16w8 \
+  --steps check,case,om,push,prof --no-msprof \
+  --compare-unfused --compare-reference-golden
+```
+
+也可从已有用例独立导出 NCHW 参考数据，不需要 CANN、设备或 C++ 编译器：
+
+```bash
+python3 fused_multi_conv2d_golden.py out/fusion_cases/fusion_a16w8/case.bin \
+  --output y_python.bin --workspace-mb 64
+```
+
+原有精度阈值、前 50 个差异表格及总 Precision 百分比保持不变。
+
 ## 两阶段融合验证
 
 源 ONNX 只构造两个连续的 `Conv`，两张 filter 保存真实 NCHW 形状并作为 initializer。
