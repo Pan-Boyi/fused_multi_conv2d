@@ -74,7 +74,7 @@ python3 fused_multi_conv2d_golden.py out/fusion_cases/fusion_a16w8/case.bin \
 ```
 
 独立脚本也可按输入、两张卷积核及输出的数据类型直接读取 JSON，示例见
-`golden_tensor_cases.json`：
+`golden_tensor_cases.json`；只需复制脚本和 JSON 到任意目录，并安装 NumPy：
 
 ```bash
 python3 fused_multi_conv2d_golden.py golden_tensor_cases.json \
@@ -131,8 +131,9 @@ JSON 支持单条用例对象、用例数组及 `{"cases": [...]}`。单条可�
 指定名称。旧 flat JSON 格式仍可读取，其中 `dtype: "both"` 按原规则展开为
 `<name>_fp16`、`<name>_int8`。
 
-JSON 模式仅在临时目录中调用现有输入生成器，再由 Python 计算参考；输入生成器缺失或源码
-更新时需要 `g++` 编译。原 `case.bin` 输入方式、case/OM 产物及上板验证流程保持不变。
+JSON 模式在脚本内部生成确定性输入、bias 和 scale，再计算参考，无需 `fc2d.py`、
+其他本地 Python 文件、C++ 生成器、编译器或 CANN；生成数据和参考结果沿用原生成器的规则。
+原 `case.bin` 输入方式、case/OM 产物及上板验证流程保持不变。
 新张量描述格式仅用于独立 golden 入口；`fc2d.py` 和 `run_profile.py` 继续使用原 JSON 格式。
 
 原有精度阈值、前 50 个差异表格及总 Precision 百分比保持不变。

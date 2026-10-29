@@ -2,14 +2,10 @@
 """从 case.bin 或 JSON 用例描述计算两层卷积参考。"""
 
 import argparse
-import contextlib
 import json
 import math
 import os
 import struct
-import subprocess
-import sys
-import tempfile
 
 import numpy as np
 
@@ -138,7 +134,7 @@ def _json_default_attrs(attrs):
 
 
 def _json_tensor_attrs(attrs):
-    """将可配置属性映射成原输入生成器的逐层参数。"""
+    """将可配置属性映射成两层卷积的计算参数。"""
     fields = ("strides", "pads", "enable_relu", "bias_mask", "fixed_shift_value",
               "data_format", "round_mode", "pad_mode", "dilations", "groups",
               "offset_x", "enable_hf32")
@@ -168,7 +164,7 @@ def _json_tensor_attrs(attrs):
 
 
 def _json_tensor_case(raw):
-    """按 NCHW 输入和 OIHW 双权重描述推导原生成器参数及输出形状。"""
+    """按 NCHW 输入和 OIHW 双权重描述推导计算参数及输出形状。"""
     _json_object(raw, "case", ("name", "input", "kernels", "output", "attrs"),
                  ("input", "kernels", "output"))
     input_desc = _json_object(raw["input"], "input", ("shape", "dtype"), ("shape", "dtype"))
@@ -220,10 +216,43 @@ def _json_output_shape(input_shape, kernels, output_desc, case):
         raise ValueError("output.shape does not match inferred shape %s" % expected)
 
 
-def _select_json_case(document, only):
-    """沿用 harness 的参数默认值和 both 展开规则，选择一条 JSON 用例。"""
-    import fc2d
+def _normalise_json_case(raw, index):
+    """补全旧格式的默认参数，并校验两层卷积的形状和定标范围。"""
+    defaults = dict(dtype="fp16", n=1, ci=32, hi=288, wi=112, cout1=64, cout2=96,
+                    kernel=[3, 3], strides=[1] * 4, pads=[0] * 8, bias=False,
+                    enable_relu=[True, True], fixed_shift_value=None,
+                    data_format=[0, 0], round_mode=[0, 0], pad_mode=[0, 0])
+    _json_object(raw, "case", tuple(defaults) + ("name",))
+    case = dict(defaults, **raw)
+    case["name"] = raw.get("name", "case%02d" % index)
+    if not isinstance(case["name"], str) or not case["name"]:
+        raise ValueError("name must be a nonempty string")
+    mode = case["dtype"]
+    if mode not in ("fp16", "int8", "s8f16", "a16w8", "both"):
+        raise ValueError("dtype must be fp16, int8, s8f16, a16w8 or both")
+    if "fixed_shift_value" not in raw:
+        case["fixed_shift_value"] = list({"fp16": (42, 42), "both": (42, 42),
+                                          "a16w8": (13, 0)}.get(mode, (0, 0)))
+    _json_shape([case[key] for key in ("n", "ci", "hi", "wi")], "input.shape")
+    _json_int_list([case["cout1"], case["cout2"]], "output channels", 2, 1)
+    kernel = case["kernel"]
+    if not isinstance(kernel, list) or len(kernel) not in (2, 4):
+        raise ValueError("kernel requires [Kh,Kw] or [Kh1,Kw1,Kh2,Kw2]")
+    case["kernel"] = _json_int_list(kernel, "kernel", len(kernel), 1) * (2 if len(kernel) == 2 else 1)
+    if type(case["bias"]) not in (bool, int) or case["bias"] not in (0, 1):
+        raise ValueError("bias must be a bool or integer 0/1")
+    attrs = {key: case[key] for key in ("strides", "pads", "enable_relu", "fixed_shift_value",
+                                      "data_format", "round_mode", "pad_mode")}
+    attrs["bias_mask"] = [bool(case["bias"])] * 2
+    mapped, _ = _json_tensor_attrs(attrs)
+    case.update(mapped)
+    if mode == "a16w8" and case["fixed_shift_value"][0] > 29:
+        raise ValueError("A16W8 fixed_shift_value[0] must be in [0, 29]")
+    return case
 
+
+def _select_json_case(document, only):
+    """按原默认参数和 both 展开规则，选择一条 JSON 用例。"""
     if isinstance(document, dict):
         raw_cases = document.get("cases", [document])
     else:
@@ -237,8 +266,7 @@ def _select_json_case(document, only):
         mask = None
         if any(field in raw for field in ("input", "kernels", "output", "attrs")):
             raw, mask = _json_tensor_case(raw)
-        with contextlib.redirect_stdout(sys.stderr):
-            case = fc2d.normalise(raw, index)
+        case = _normalise_json_case(raw, index)
         if mask is not None:
             case["_bias_mask"] = mask
         if case["dtype"] == "both":
@@ -259,21 +287,13 @@ def _select_json_case(document, only):
     return cases[0]
 
 
-def read_json_case(path, only=None):
-    """在临时目录生成 JSON 用例的确定性输入，不调用原验证流程。"""
-    import fc2d
-
+def read_json_case(path, only=None, workspace_mb=64):
+    """仅用 Python 和 NumPy 生成 JSON 用例的确定性输入。"""
     with open(path, encoding="utf-8") as source:
         case = _select_json_case(json.load(source), only)
-    with contextlib.redirect_stdout(sys.stderr):
-        fc2d.ensure_tool("gen_case")
-    with tempfile.TemporaryDirectory(prefix="fc2d-golden-json-") as directory:
-        case_path = os.path.join(directory, "case.bin")
-        process = subprocess.run(fc2d.gen_case_argv(case, case_path),
-                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        if process.returncode:
-            raise ValueError("JSON input generation failed:\n%s" % process.stdout)
-        info, tensors = read_case(case_path)
+    if not math.isfinite(workspace_mb) or workspace_mb <= 0:
+        raise ValueError("workspace_mb must be positive and finite")
+    info, tensors = _generate_json_inputs(case, workspace_mb)
     for index, enabled in enumerate(case.get("_bias_mask", [True, True])):
         name = "bias%d" % (index + 1)
         if not enabled and name in tensors:
@@ -470,6 +490,190 @@ def compute_golden(info, tensors, workspace_mb=64):
     return result
 
 
+def _json_random_values(shape, salt, half=False):
+    """按原 Mix64 序列生成逻辑张量，固定分块限制随机数临时空间。"""
+    values = np.empty(_element_count(shape), dtype=np.float16 if half else np.int8)
+    for start in range(0, values.size, 1024 * 1024):
+        stop = min(start + 1024 * 1024, values.size)
+        mixed = np.arange(start, stop, dtype=np.uint64)
+        mixed += np.uint64(salt + 0x9e3779b97f4a7c15)
+        mixed = (mixed ^ (mixed >> np.uint64(30))) * np.uint64(0xbf58476d1ce4e5b9)
+        mixed = (mixed ^ (mixed >> np.uint64(27))) * np.uint64(0x94d049bb133111eb)
+        mixed ^= mixed >> np.uint64(31)
+        if half:
+            grid = (mixed % np.uint64(512)).astype(np.int16) - 256
+            values[start:stop] = grid.astype(np.float32) / np.float32(256)
+        else:
+            values[start:stop] = (mixed % np.uint64(201)).astype(np.int16) - 100
+    return values.reshape(shape)
+
+
+def _json_tensor_record(dtype, values):
+    """将生成值保存为兼容 case.bin 的小端逻辑张量记录。"""
+    values = np.asarray(values, dtype=NUMPY_DTYPES[dtype])
+    return dtype, list(values.shape), values.tobytes()
+
+
+def _json_generation_info(case):
+    """由规范化 JSON 参数构造 ABI 8 形状信息，并检查通道对齐。"""
+    mode = {"fp16": 0, "int8": 1, "s8f16": 2, "a16w8": 3}[case["dtype"]]
+    info = dict.fromkeys(SPEC_KEYS, 0)
+    info.update({name: case[name] for name in ("n", "ci", "hi", "wi", "cout1", "cout2")})
+    info.update(kh=case["kernel"][0], kw=case["kernel"][1],
+                kh2=case["kernel"][2], kw2=case["kernel"][3],
+                s1=case["strides"][0], s2=case["strides"][2],
+                ph1=case["pads"][0], pw1=case["pads"][2],
+                ph2=case["pads"][4], pw2=case["pads"][6],
+                bias=int(bool(case["bias"])), relu1=int(bool(case["enable_relu"][0])),
+                relu2=int(bool(case["enable_relu"][1])),
+                shift1=case["fixed_shift_value"][0], shift2=case["fixed_shift_value"][1],
+                elem_bytes=2 if mode in (0, 3) else 1,
+                out_fp16=int(mode in (2, 3)), dtype_mode=mode)
+    x_alignment = 16 if info["elem_bytes"] == 2 else 32
+    weight_alignment = 16 if mode == 0 else 32
+    if info["ci"] % x_alignment or info["ci"] % weight_alignment or info["cout1"] % weight_alignment:
+        raise ValueError("Input and intermediate channels do not meet tensor alignment requirements")
+    height, width = info["hi"], info["wi"]
+    for layer in (1, 2):
+        kernel_height = info["kh"] if layer == 1 else info["kh2"]
+        kernel_width = info["kw"] if layer == 1 else info["kw2"]
+        height = (height + 2 * info["ph%d" % layer] - kernel_height) // info["s%d" % layer] + 1
+        width = (width + 2 * info["pw%d" % layer] - kernel_width) // info["s%d" % layer] + 1
+        if min(height, width) <= 0:
+            raise ValueError("Convolution %d has an empty output" % layer)
+    info.update(ho2=height, wo2=width)
+    return info
+
+
+def _json_effective_scale(values):
+    """按硬件表项精度清除 float32 scale 的低 13 位尾数。"""
+    bits = np.asarray(values, dtype=np.float32).view(np.uint32) & np.uint32(0xffffe000)
+    return bits.view(np.float32)
+
+
+def _json_pick_scale(accumulators):
+    """根据整个 batch 的累加峰值选择原生成器相同的 int8 scale。"""
+    peak = int(np.max(np.abs(accumulators.astype(np.int64))))
+    scale = np.float32(1) if peak == 0 else np.float32(127) / np.float32(peak)
+    return _json_effective_scale(scale)
+
+
+def _json_scale_record(values, quantized=False):
+    """编码逐通道 scale；重量化表额外设置有符号饱和 bit 46。"""
+    bits = np.asarray(values, dtype=np.float32).view(np.uint32).astype(np.uint64)
+    if quantized:
+        bits |= np.uint64(1 << 46)
+    return _json_tensor_record(ACL_UINT64, bits)
+
+
+def _json_safe_exponent(input_values, weights, bias, stride, pad_height, pad_width, workspace_mb):
+    """以绝对乘积和加 bias 为部分和上界，求最大安全定标指数。"""
+    absolute_sum = _conv(np.abs(input_values), np.abs(weights), stride,
+                         pad_height, pad_width, workspace_mb)
+    absolute_sum += np.abs(bias.astype(np.float64))[None, :, None, None]
+    peak = float(np.max(absolute_sum))
+    if peak <= 0:
+        return 58
+    exponent = 0
+    while exponent < 58 and math.ldexp(peak, exponent + 1) < 2147483000.0:
+        exponent += 1
+    return exponent
+
+
+def _json_fp16_inputs(info, tensors, arrays, workspace_mb):
+    """生成两层 FP16 定点结果、安全指数，并保留原工作点自检。"""
+    inputs, weight1, bias1, weight2, bias2 = arrays
+    acc1 = _conv(inputs, weight1, info["s1"], info["ph1"], info["pw1"], workspace_mb)
+    info["safe_f1"] = _json_safe_exponent(inputs, weight1, bias1, info["s1"],
+                                         info["ph1"], info["pw1"], workspace_mb)
+    mid_bits, _ = _fixed_epilogue(acc1, bias1, info["shift1"], info["relu1"])
+    mid = mid_bits.view(np.float16)
+    acc2 = _conv(mid, weight2, info["s2"], info["ph2"], info["pw2"], workspace_mb)
+    info["safe_f2"] = _json_safe_exponent(mid, weight2, bias2, info["s2"],
+                                         info["ph2"], info["pw2"], workspace_mb)
+    output, _ = _fixed_epilogue(acc2, bias2, info["shift2"], info["relu2"])
+    exact = _exact_epilogue(acc2, bias2, info["relu2"])
+    expected_values = output.view(np.float16).astype(np.float64)
+    exact_values = exact.view(np.float16).astype(np.float64)
+    denominator = np.where(np.abs(exact_values) > 1e-6, np.abs(exact_values), 1.0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        bad = np.count_nonzero(np.abs(expected_values - exact_values) / denominator > 1e-2)
+    if bad * 1000 > output.size:
+        raise ValueError("FP16 fixed-point and exact golden disagree; choose valid fixed_shift_value")
+    tensors["y_expect"] = _result_tensor(output)
+    tensors["y_exact"] = _result_tensor(exact)
+
+
+def _json_integer_inputs(info, tensors, arrays, workspace_mb):
+    """按精确整数卷积选择量化表，支持 int8、s8f16 和 A16W8。"""
+    inputs, weight1, bias1, weight2, bias2 = arrays
+    acc1 = _conv(inputs, weight1, info["s1"], info["ph1"], info["pw1"], workspace_mb)
+    acc1 = (acc1 + bias1[None, :, None, None]).astype(np.int32)
+    scale1 = _json_pick_scale(acc1)
+    scale1_channels = np.full(info["cout1"], scale1, dtype=np.float32)
+    tensors["quant_scale1"] = _json_scale_record(scale1_channels, True)
+    mid = _requantize(acc1, scale1_channels[None, :, None, None], info["relu1"])
+    acc2 = _conv(mid, weight2, info["s2"], info["ph2"], info["pw2"], workspace_mb)
+    acc2 = (acc2 + bias2[None, :, None, None]).astype(np.int32)
+    if info["dtype_mode"] == 1:
+        scale2 = np.full(info["cout2"], _json_pick_scale(acc2), dtype=np.float32)
+        tensors["quant_scale2"] = _json_scale_record(scale2, True)
+        output = _requantize(acc2, scale2[None, :, None, None], info["relu2"])
+    else:
+        peak = np.max(np.abs(acc2.astype(np.int64)), axis=(0, 2, 3))
+        base = np.ones(info["cout2"], dtype=np.float32)
+        np.divide(np.float32(8), peak.astype(np.float32), out=base, where=peak != 0)
+        factor = np.float32(1) + np.float32(0.05) * (np.arange(info["cout2"]) % 7).astype(np.float32)
+        scale2 = _json_effective_scale(base * factor)
+        tensors["dequant_scale2"] = _json_scale_record(scale2)
+        output = _dequantize(acc2, scale2[None, :, None, None], info["relu2"])
+    tensors["y_expect"] = _result_tensor(output)
+
+
+def _generate_json_inputs(case, workspace_mb=64):
+    """直接从 JSON 参数生成原 C++ 序列的输入和参考，不依赖编译器。"""
+    if not math.isfinite(workspace_mb) or workspace_mb <= 0:
+        raise ValueError("workspace_mb must be positive and finite")
+    info = _json_generation_info(case)
+    mode = info["dtype_mode"]
+    shapes = [(info["n"], info["ci"], info["hi"], info["wi"]),
+              (info["cout1"], info["ci"], info["kh"], info["kw"]),
+              (info["cout2"], info["cout1"], info["kh2"], info["kw2"])]
+    salts = (0x41, 0x42, 0x43) if mode == 0 else (0x11, 0x22, 0x33)
+    inputs, weight1, weight2 = [_json_random_values(shape, salt, mode == 0)
+                                for shape, salt in zip(shapes, salts)]
+    if mode == 3:
+        multiple = 1 << max(0, 5 - info["shift1"])
+        integers = inputs.astype(np.int16)
+        inputs = (np.sign(integers) * (np.abs(integers) // multiple) * multiple).astype(np.int8)
+        scaled = np.ldexp(inputs.astype(np.float32), info["shift1"] - 29)
+        half = scaled.astype(np.float16)
+        if not np.all(half.astype(np.float32) == scaled):
+            raise ValueError("A16W8 exact golden requires representable scaled inputs")
+        input_record = _json_tensor_record(ACL_FLOAT16, half)
+    else:
+        input_record = _json_tensor_record(ACL_FLOAT16 if mode == 0 else ACL_INT8, inputs)
+    bias_dtype = np.float16 if mode == 0 else np.int32
+    bias1 = np.zeros(info["cout1"], dtype=bias_dtype)
+    bias2 = np.zeros(info["cout2"], dtype=bias_dtype)
+    if info["bias"]:
+        for layer, bias in enumerate((bias1, bias2)):
+            grid = np.arange(bias.size, dtype=np.int64) - bias.size // 2
+            bias[:] = grid.astype(np.float32) / np.float32(64) if mode == 0 else grid * (137 if layer == 0 else 91)
+    weight_dtype = ACL_FLOAT16 if mode == 0 else ACL_INT8
+    tensors = {"x": input_record, "filter1": _json_tensor_record(weight_dtype, weight1),
+               "filter2": _json_tensor_record(weight_dtype, weight2),
+               "bias1": _json_tensor_record(ACL_FLOAT16 if mode == 0 else ACL_INT32, bias1),
+               "bias2": _json_tensor_record(ACL_FLOAT16 if mode == 0 else ACL_INT32, bias2)}
+    arrays = inputs, weight1, bias1, weight2, bias2
+    if mode == 0:
+        _json_fp16_inputs(info, tensors, arrays, workspace_mb)
+    else:
+        _json_integer_inputs(info, tensors, arrays, workspace_mb)
+    tensors["w1_nchw"] = tensors["filter1"]
+    return info, tensors
+
+
 def main(argv=None):
     """独立读取用例并输出 NCHW golden 原始数据。"""
     parser = argparse.ArgumentParser(description="Compute FusedMultiConv2d CPU golden from case inputs")
@@ -481,7 +685,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.case.lower().endswith(".json"):
         try:
-            info, tensors = read_json_case(args.case, args.only)
+            info, tensors = read_json_case(args.case, args.only, args.workspace_mb)
         except (OSError, ValueError, RuntimeError) as exc:
             parser.error(str(exc))
     else:
