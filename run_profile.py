@@ -793,12 +793,20 @@ def save_performance_results(out_root, rows, display=True):
         stream.write("\n")
     os.replace(json_path + ".tmp", json_path)
     csv_path = os.path.join(out_root, "performance_comparison.csv")
-    columns = ["case", "shape", "fused_us", "extend_total_us", "saved_us", "improvement_percent"]
+    has_pipeline = any(row.get("pipeline_details") for row in rows)
+    columns = performance.performance_csv_columns(has_pipeline)
     with open(csv_path + ".tmp", "w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=columns, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(performance.performance_csv_row(row) for row in rows)
     os.replace(csv_path + ".tmp", csv_path)
+    samples_path = os.path.join(out_root, "pipeline_samples.csv")
+    with open(samples_path + ".tmp", "w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=performance.PIPELINE_SAMPLE_COLUMNS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerows(performance.pipeline_sample_rows(row))
+    os.replace(samples_path + ".tmp", samples_path)
     if not display:
         return
     if rows:
@@ -807,6 +815,8 @@ def save_performance_results(out_root, rows, display=True):
     else:
         print("[PERF] No validated device performance results")
     print("[PERF] Results: %s ; %s" % (json_path, csv_path))
+    if has_pipeline:
+        print("[PERF] Pipeline samples: %s" % samples_path)
 
 
 # ---------------------------------------------------------------- 配置

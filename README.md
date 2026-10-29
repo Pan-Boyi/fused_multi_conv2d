@@ -341,6 +341,17 @@ python3 run_profile.py --cases fusion_cases.json --only fusion_a16w8 \
 排除预热和末次写出探针后取中位数；两层 Extend 的每项合计先逐轮相加再取中位数。
 流水之间可以重叠，各项相加不等于 Total。未采集或不完整的流水数据显示 `N/A`。
 流水指标及各轮样本保存在 `performance_comparison.json` 的 `pipeline_details` 中。
+同时，`performance_comparison.csv` 保留原有列，并追加第一、第二层 Extend 总耗时
+（`extend1_us`、`extend2_us`），以及 `fused`、`extend1`、`extend2`、`extend_total`
+各自的 `cube_us`、`scalar_us`、`mte1_us`、`mte2_us`、`mte3_us`、`fixpipe_us` 中位数列。
+列名以角色为前缀，例如 `fused_scalar_us`、`extend_total_mte2_us`。
+
+同目录的 `pipeline_samples.csv` 保存每个用例、每个角色、每轮正式执行的 Total 和六条流水耗时，
+包含 `case`、`shape`、`operator`、`op_name`、`sample_index`、`total_us` 及上述六个流水列。
+`operator` 使用上述四种角色，`op_name` 记录图中节点名称，`sample_index` 从 1 开始，
+不含预热和写出探针。CSV 中缺失指标留空，实际测得的 0 保留为 0；耗时单位均为微秒。
+去掉 `--only` 即可批跑所有用例，加入 `--keep-going` 可在失败后继续。
+每次解析覆盖当前批次的 CSV；未启用流水明细时，汇总仍为原有六列，逐轮文件仅保留表头。
 已有成对模型的 profiling 数据时，可使用同一开关加 `--steps parse` 重新解析，无需上板重跑。
 
 ## 上板 + profiling：run_profile.py

@@ -15,6 +15,52 @@ PIPELINE_COLUMNS = (
     ("mte3", ("mte3_exe_time(us)",)),
     ("fixpipe", ("fixpipe_time(us)", "aic_fixpipe_time(us)")),
 )
+PERFORMANCE_CSV_COLUMNS = ("case", "shape", "fused_us", "extend_total_us", "saved_us", "improvement_percent")
+PIPELINE_ROLES = (("fused", "FusedMultiConv2d"), ("extend1", "ExtendConv2D[1]"),
+                  ("extend2", "ExtendConv2D[2]"), ("extend_total", "2 x ExtendConv2D"))
+PIPELINE_SAMPLE_COLUMNS = ("case", "shape", "operator", "op_name", "sample_index", "total_us") + tuple(
+    metric + "_us" for metric, _ in PIPELINE_COLUMNS)
+
+
+def performance_csv_columns(include_pipeline=False):
+    """有流水明细时，在原性能列后追加两层耗时及各流水中位数列。"""
+    if not include_pipeline:
+        return PERFORMANCE_CSV_COLUMNS
+    return PERFORMANCE_CSV_COLUMNS + ("extend1_us", "extend2_us") + tuple(
+        role + "_" + metric + "_us" for role, _ in PIPELINE_ROLES for metric, _ in PIPELINE_COLUMNS)
+
+
+def performance_csv_row(result):
+    """将已统计的流水中位数展平为 CSV 行，保留原结果。"""
+    row = dict(result)
+    if not result.get("pipeline_details"):
+        return row
+    operators = {operator["label"]: operator for operator in result["pipeline_details"]["operators"]}
+    for role, label in PIPELINE_ROLES:
+        operator = operators[label]
+        if role in ("extend1", "extend2"):
+            row[role + "_us"] = operator["total_us"]
+        row.update((role + "_" + metric + "_us", operator["pipeline_us"][metric])
+                   for metric, _ in PIPELINE_COLUMNS)
+    return row
+
+
+def pipeline_sample_rows(result):
+    """逐算子导出正式执行轮次的原始耗时，轮次从 1 开始。"""
+    if not result.get("pipeline_details"):
+        return
+    operators = {operator["label"]: operator for operator in result["pipeline_details"]["operators"]}
+    samples = result["samples"]
+    total_samples = (samples["fused_us"], samples["extend_layer_us"][0],
+                     samples["extend_layer_us"][1], samples["extend_total_us"])
+    for (role, label), totals in zip(PIPELINE_ROLES, total_samples):
+        operator = operators[label]
+        name = " + ".join(operator["name"]) if isinstance(operator["name"], list) else operator["name"]
+        for index, total in enumerate(totals):
+            row = {"case": result["case"], "shape": result["shape"], "operator": role,
+                   "op_name": name, "sample_index": index + 1, "total_us": total}
+            row.update((metric + "_us", operator["samples"][metric][index]) for metric, _ in PIPELINE_COLUMNS)
+            yield row
 
 
 def _column_key(value):
